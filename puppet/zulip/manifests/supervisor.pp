@@ -12,31 +12,14 @@ class zulip::supervisor {
   }
 
   $conf_dir = $zulip::common::supervisor_conf_dir
-  # lint:ignore:quoted_booleans
-  $should_purge = $facts['leave_supervisor'] != 'true'
-  # lint:endignore
   file { $conf_dir:
     ensure  => directory,
     require => Package['supervisor'],
     owner   => 'root',
     group   => 'root',
-    purge   => $should_purge,
+    purge   => true,
     recurse => true,
     notify  => Service[$supervisor_service],
-  }
-
-  # These files were moved from /etc/supervisor/conf.d/ into a zulip/
-  # subdirectory in 2020-10 in version 4.0; these lines can be removed
-  # in Zulip version 5.0 and later.
-  file { [
-    "${system_conf_dir}/cron.conf",
-    "${system_conf_dir}/nginx.conf",
-    "${system_conf_dir}/smokescreen.conf",
-    "${system_conf_dir}/thumbor.conf",
-    "${system_conf_dir}/zulip.conf",
-    "${system_conf_dir}/zulip_db.conf",
-    ]:
-    ensure => absent,
   }
 
   # In the docker environment, we don't want/need supervisor to be
@@ -97,6 +80,7 @@ class zulip::supervisor {
     }
   }
 
+  $file_descriptor_limit = zulipconf('application_server', 'service_file_descriptor_limit', 40000)
   file { $zulip::common::supervisor_conf_file:
     ensure  => file,
     require => Package[supervisor],

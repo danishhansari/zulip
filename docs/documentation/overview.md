@@ -12,11 +12,11 @@ Zulip has three major documentation systems:
   might look at when deciding whether to use Zulip. We don't expect
   to ever have more than about 10 pages written using this system.
 
-- **User-facing documentation**: Our scalable system for documenting
-  Zulip's huge collection of specific features without a lot of
-  overhead or duplicated code/syntax, written in Markdown. We have
-  several hundred pages written using this system. There are 3
-  branches of this documentation:
+- **User-facing documentation**: Zulip uses a scalable system for
+  documenting Zulip's integrations and REST API, without a lot of
+  overhead or duplicated code/syntax, written in Markdown. Zulip's
+  help center uses [@astro/starlight](https://starlight.astro.build/),
+  with most of the content written in MDX.
   - [Help center documentation](#help-center-documentation)
     (with a target audience of individual Zulip users)
   - [Integrations documentation](#integrations-documentation)
@@ -31,7 +31,7 @@ These three systems are documented in detail.
 What you are reading right now is part of the collection of
 documentation targeted at developers and people running their own
 Zulip servers. These docs are written in
-[CommonMark Markdown](https://commonmark.org/) with a small bit of rST.
+[CommonMark Markdown](https://commonmark.org/).
 We've chosen Markdown because it is
 [easy to write](https://commonmark.org/help/). The source for Zulip's
 developer documentation is at `docs/` in the Zulip Git repository, and
@@ -46,7 +46,7 @@ for every pull request, accessible from a "Details" link in the
 to submit a screenshot with any pull request modifying documentation
 to help make reviews efficient.
 
-If you want to build the developer documentation locally (e.g. to test
+If you want to build the developer documentation locally (e.g., to test
 your changes), the dependencies are automatically installed as part of
 Zulip development environment provisioning, and you can build the
 documentation using:
@@ -58,11 +58,11 @@ documentation using:
 and then opening `http://127.0.0.1:9991/docs/index.html` in your
 browser. The raw files are available at
 `file:///path/to/zulip/docs/_build/html/index.html` in your browser
-(so you can also use e.g. `firefox docs/_build/html/index.html` from
-the root of your Zulip checkout).
+(so you can also use, for example, `firefox docs/_build/html/index.html`
+from the root of your Zulip checkout).
 
 If you are adding a new page to the table of contents, you will want
-to modify `docs/index.rst` and run `make clean` before `make html`, so
+to modify `docs/index.md` and run `make clean` before `make html`, so
 that other docs besides your new one also get the new entry in the
 table of contents.
 
@@ -71,11 +71,10 @@ and looking at the content on the GitHub web UI, since GitHub renders
 Markdown, though that won't be as faithful as the `make html`
 approach or the preview build.
 
-When editing dependencies for the Zulip documentation, you should edit
-`requirements/docs.in` and then run `tools/update-locked-requirements`
-which updates docs.txt file (which is used by ReadTheDocs to build the
-Zulip developer documentation, without installing all of Zulip's
-dependencies).
+We manage Python requirements for the documentation build in the `docs` uv
+[group](https://docs.astral.sh/uv/concepts/projects/dependencies/#dependency-groups),
+which is used by our ReadTheDocs build configuration in
+[`.readthedocs.yaml`](https://docs.readthedocs.com/platform/stable/config-file/v2.html).
 
 ## Core website documentation
 
@@ -91,10 +90,15 @@ important elements of the product clearly.
 
 ## User-facing documentation
 
-All of these systems use a common Markdown-based framework with
-various extensions for macros and variable interpolation,
+Zulip's API and integrations documentation use a common Markdown-based
+framework with various extensions for macros and variable interpolation,
 (`render_markdown_path` in the code), designed to make it convenient
 to do the things one does a lot in each type of documentation.
+
+Zulip's help center is built with [@astro/starlight](https://starlight.astro.build/).
+Starlight is a full-featured documentation theme built on top of the
+[Astro](https://astro.build/) framework. Astro is a web framework designed
+for content driven websites.
 
 ### Help center documentation
 
@@ -107,7 +111,7 @@ See our guide on [writing help center articles](helpcenter.md).
 
 ### Integrations documentation
 
-Zulip's [integrations documentation](https://zulip.com/integrations)
+Zulip's [integrations documentation](https://zulip.com/integrations/)
 is user-facing documentation explaining to end users how to set up each
 of Zulip's more than 100 integrations. There is a detailed [guide on
 documenting integrations](integrations.md), including style guidelines

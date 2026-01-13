@@ -1,17 +1,18 @@
 # vim:fenc=utf-8
-from typing import Dict, List, Optional, Protocol
+from typing import Protocol
 
 from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
 from zerver.lib.exceptions import UnsupportedWebhookEventTypeError
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_bool, check_int, check_string, to_wild_value
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_bool, check_int, check_string
 from zerver.lib.webhooks.common import (
+    OptionalUserSpecifiedTopicStr,
     check_send_webhook_message,
-    get_http_headers_from_filename,
-    validate_extract_webhook_http_header,
+    default_fixture_to_headers,
+    get_event_header,
 )
 from zerver.lib.webhooks.git import (
     TOPIC_WITH_BRANCH_TEMPLATE,
@@ -22,10 +23,11 @@ from zerver.lib.webhooks.git import (
     get_pull_request_event_message,
     get_push_commits_event_message,
     get_release_event_message,
+    is_branch_name_notifiable,
 )
 from zerver.models import UserProfile
 
-fixture_to_headers = get_http_headers_from_filename("HTTP_X_GOGS_EVENT")
+fixture_to_headers = default_fixture_to_headers("HTTP_X_GOGS_EVENT")
 
 
 def get_issue_url(repo_url: str, issue_nr: int) -> str:
@@ -45,19 +47,17 @@ def format_push_event(payload: WildValue) -> str:
     )
 
 
-def _transform_commits_list_to_common_format(commits: WildValue) -> List[Dict[str, str]]:
-    new_commits_list = []
-    for commit in commits:
-        new_commits_list.append(
-            {
-                "name": commit["author"]["username"].tame(check_string)
-                or commit["author"]["name"].tame(check_string).split()[0],
-                "sha": commit["id"].tame(check_string),
-                "url": commit["url"].tame(check_string),
-                "message": commit["message"].tame(check_string),
-            }
-        )
-    return new_commits_list
+def _transform_commits_list_to_common_format(commits: WildValue) -> list[dict[str, str]]:
+    return [
+        {
+            "name": commit["author"]["username"].tame(check_string)
+            or commit["author"]["name"].tame(check_string).split()[0],
+            "sha": commit["id"].tame(check_string),
+            "url": commit["url"].tame(check_string),
+            "message": commit["message"].tame(check_string),
+        }
+        for commit in commits
+    ]
 
 
 def format_new_branch_event(payload: WildValue) -> str:
@@ -81,9 +81,17 @@ def format_pull_request_event(payload: WildValue, include_title: bool = False) -
         action = payload["action"].tame(check_string)
     url = payload["pull_request"]["html_url"].tame(check_string)
     number = payload["pull_request"]["number"].tame(check_int)
-    target_branch = payload["pull_request"]["head_branch"].tame(check_string)
-    base_branch = payload["pull_request"]["base_branch"].tame(check_string)
+    target_branch = None
+    base_branch = None
+    if action != "edited":
+        target_branch = payload["pull_request"]["head_branch"].tame(check_string)
+        base_branch = payload["pull_request"]["base_branch"].tame(check_string)
     title = payload["pull_request"]["title"].tame(check_string) if include_title else None
+    stringified_assignee = (
+        payload["pull_request"]["assignee"]["login"].tame(check_string)
+        if payload["action"] and payload["pull_request"]["assignee"]
+        else None
+    )
 
     return get_pull_request_event_message(
         user_name=user_name,
@@ -93,20 +101,24 @@ def format_pull_request_event(payload: WildValue, include_title: bool = False) -
         target_branch=target_branch,
         base_branch=base_branch,
         title=title,
+        assignee_updated=stringified_assignee,
     )
 
 
 def format_issues_event(payload: WildValue, include_title: bool = False) -> str:
     issue_nr = payload["issue"]["number"].tame(check_int)
     assignee = payload["issue"]["assignee"]
+    stringified_assignee = assignee["login"].tame(check_string) if assignee else None
+    action = payload["action"].tame(check_string)
     return get_issue_event_message(
-        payload["sender"]["login"].tame(check_string),
-        payload["action"].tame(check_string),
-        get_issue_url(payload["repository"]["html_url"].tame(check_string), issue_nr),
-        issue_nr,
-        payload["issue"]["body"].tame(check_string),
-        assignee=assignee["login"].tame(check_string) if assignee else None,
+        user_name=payload["sender"]["login"].tame(check_string),
+        action=payload["action"].tame(check_string),
+        url=get_issue_url(payload["repository"]["html_url"].tame(check_string), issue_nr),
+        number=issue_nr,
+        message=payload["issue"]["body"].tame(check_string),
+        assignee=stringified_assignee,
         title=payload["issue"]["title"].tame(check_string) if include_title else None,
+        assignee_updated=stringified_assignee if action == "assigned" else None,
     )
 
 
@@ -122,13 +134,13 @@ def format_issue_comment_event(payload: WildValue, include_title: bool = False) 
     action += "({}) on".format(comment["html_url"].tame(check_string))
 
     return get_issue_event_message(
-        payload["sender"]["login"].tame(check_string),
-        action,
-        get_issue_url(
+        user_name=payload["sender"]["login"].tame(check_string),
+        action=action,
+        url=get_issue_url(
             payload["repository"]["html_url"].tame(check_string), issue["number"].tame(check_int)
         ),
-        issue["number"].tame(check_int),
-        comment["body"].tame(check_string),
+        number=issue["number"].tame(check_int),
+        message=comment["body"].tame(check_string),
         title=issue["title"].tame(check_string) if include_title else None,
     )
 
@@ -149,13 +161,14 @@ ALL_EVENT_TYPES = ["issue_comment", "issues", "create", "pull_request", "push", 
 
 
 @webhook_view("Gogs", all_event_types=ALL_EVENT_TYPES)
-@has_request_variables
+@typed_endpoint
 def api_gogs_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
-    branches: Optional[str] = REQ(default=None),
-    user_specified_topic: Optional[str] = REQ("topic", default=None),
+    *,
+    payload: JsonBodyPayload[WildValue],
+    branches: str | None = None,
+    user_specified_topic: OptionalUserSpecifiedTopicStr = None,
 ) -> HttpResponse:
     return gogs_webhook_main(
         "Gogs",
@@ -170,8 +183,7 @@ def api_gogs_webhook(
 
 
 class FormatPullRequestEvent(Protocol):
-    def __call__(self, payload: WildValue, include_title: bool) -> str:
-        ...
+    def __call__(self, payload: WildValue, include_title: bool) -> str: ...
 
 
 def gogs_webhook_main(
@@ -181,23 +193,23 @@ def gogs_webhook_main(
     request: HttpRequest,
     user_profile: UserProfile,
     payload: WildValue,
-    branches: Optional[str],
-    user_specified_topic: Optional[str],
+    branches: str | None,
+    user_specified_topic: str | None,
 ) -> HttpResponse:
     repo = payload["repository"]["name"].tame(check_string)
-    event = validate_extract_webhook_http_header(request, http_header_name, integration_name)
+    event = get_event_header(request, http_header_name, integration_name)
     if event == "push":
         branch = payload["ref"].tame(check_string).replace("refs/heads/", "")
-        if branches is not None and branch not in branches.split(","):
+        if not is_branch_name_notifiable(branch, branches):
             return json_success(request)
         body = format_push_event(payload)
-        topic = TOPIC_WITH_BRANCH_TEMPLATE.format(
+        topic_name = TOPIC_WITH_BRANCH_TEMPLATE.format(
             repo=repo,
             branch=branch,
         )
     elif event == "create":
         body = format_new_branch_event(payload)
-        topic = TOPIC_WITH_BRANCH_TEMPLATE.format(
+        topic_name = TOPIC_WITH_BRANCH_TEMPLATE.format(
             repo=repo,
             branch=payload["ref"].tame(check_string),
         )
@@ -206,7 +218,7 @@ def gogs_webhook_main(
             payload,
             include_title=user_specified_topic is not None,
         )
-        topic = TOPIC_WITH_PR_OR_ISSUE_INFO_TEMPLATE.format(
+        topic_name = TOPIC_WITH_PR_OR_ISSUE_INFO_TEMPLATE.format(
             repo=repo,
             type="PR",
             id=payload["pull_request"]["id"].tame(check_int),
@@ -217,7 +229,7 @@ def gogs_webhook_main(
             payload,
             include_title=user_specified_topic is not None,
         )
-        topic = TOPIC_WITH_PR_OR_ISSUE_INFO_TEMPLATE.format(
+        topic_name = TOPIC_WITH_PR_OR_ISSUE_INFO_TEMPLATE.format(
             repo=repo,
             type="issue",
             id=payload["issue"]["number"].tame(check_int),
@@ -228,7 +240,7 @@ def gogs_webhook_main(
             payload,
             include_title=user_specified_topic is not None,
         )
-        topic = TOPIC_WITH_PR_OR_ISSUE_INFO_TEMPLATE.format(
+        topic_name = TOPIC_WITH_PR_OR_ISSUE_INFO_TEMPLATE.format(
             repo=repo,
             type="issue",
             id=payload["issue"]["number"].tame(check_int),
@@ -239,7 +251,7 @@ def gogs_webhook_main(
             payload,
             include_title=user_specified_topic is not None,
         )
-        topic = TOPIC_WITH_RELEASE_TEMPLATE.format(
+        topic_name = TOPIC_WITH_RELEASE_TEMPLATE.format(
             repo=repo,
             tag=payload["release"]["tag_name"].tame(check_string),
             title=payload["release"]["name"].tame(check_string),
@@ -248,5 +260,5 @@ def gogs_webhook_main(
     else:
         raise UnsupportedWebhookEventTypeError(event)
 
-    check_send_webhook_message(request, user_profile, topic, body, event)
+    check_send_webhook_message(request, user_profile, topic_name, body, event)
     return json_success(request)

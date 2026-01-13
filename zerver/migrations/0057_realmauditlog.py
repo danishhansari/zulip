@@ -2,7 +2,7 @@
 import django.db.models.deletion
 from django.conf import settings
 from django.db import migrations, models
-from django.db.backends.postgresql.schema import BaseDatabaseSchemaEditor
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 from django.db.migrations.state import StateApps
 from django.utils.timezone import now as timezone_now
 
@@ -14,7 +14,7 @@ def backfill_user_activations_and_deactivations(
     RealmAuditLog = apps.get_model("zerver", "RealmAuditLog")
     UserProfile = apps.get_model("zerver", "UserProfile")
 
-    for user in UserProfile.objects.all():
+    for user in UserProfile.objects.all().iterator():
         RealmAuditLog.objects.create(
             realm=user.realm,
             modified_user=user,

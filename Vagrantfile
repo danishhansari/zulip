@@ -15,7 +15,7 @@ Vagrant.configure("2") do |config|
   ubuntu_mirror = ""
   vboxadd_version = nil
 
-  config.vm.box = "bento/ubuntu-20.04"
+  config.vm.box = "bento/ubuntu-22.04"
 
   config.vm.synced_folder ".", "/vagrant", disabled: true
   config.vm.synced_folder ".", "/srv/zulip", docker_consistency: "z"
@@ -61,6 +61,7 @@ Vagrant.configure("2") do |config|
 
   config.vm.network "forwarded_port", guest: 9991, host: host_port, host_ip: host_ip_addr
   config.vm.network "forwarded_port", guest: 9994, host: host_port + 3, host_ip: host_ip_addr
+  config.vm.network "forwarded_port", guest: 9995, host: host_port + 4, host_ip: host_ip_addr
   # Specify Docker provider before VirtualBox provider so it's preferred.
   config.vm.provider "docker" do |d, override|
     override.vm.box = nil

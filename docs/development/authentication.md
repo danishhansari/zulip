@@ -66,7 +66,7 @@ details worth understanding:
 
 - Register an OAuth2 application with GitHub at one of
   <https://github.com/settings/developers> or
-  <https://github.com/organizations/ORGNAME/settings/developers>.
+  `https://github.com/organizations/<your-org>/settings/applications`.
   Specify `http://auth.zulipdev.com:9991/complete/github/` as the callback URL.
 
 - You should get a page with settings for your new application,
@@ -171,7 +171,7 @@ actual flows for LDAP configuration.
 - To disable fakeldap, set `FAKE_LDAP_MODE` back to `None`.
 
 - In all fakeldap configurations, users' fake LDAP passwords are equal
-  to their usernames (e.g. for `ldapuser1@zulip.com`, the password is
+  to their usernames (e.g., for `ldapuser1@zulip.com`, the password is
   `ldapuser1`).
 
 - `FAKE_LDAP_NUM_USERS` in `zproject/dev_settings.py` can be used to

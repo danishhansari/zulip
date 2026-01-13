@@ -1,14 +1,15 @@
 # https://zulip.readthedocs.io/en/latest/subsystems/email.html#testing-in-a-real-email-client
 import configparser
 import logging
+from collections.abc import Sequence
 from email.message import Message
-from typing import MutableSequence, Sequence, Union
 
 from django.conf import settings
 from django.core.mail import EmailMultiAlternatives
 from django.core.mail.backends.smtp import EmailBackend
-from django.core.mail.message import EmailMessage
+from django.core.mail.message import EmailAlternative, EmailMessage
 from django.template import loader
+from typing_extensions import override
 
 
 def get_forward_address() -> str:
@@ -36,7 +37,7 @@ class EmailLogBackEnd(EmailBackend):
     @staticmethod
     def log_email(email: EmailMessage) -> None:
         """Used in development to record sent emails in a nice HTML log"""
-        html_message: Union[bytes, EmailMessage, Message, str] = "Missing HTML message"
+        html_message: bytes | EmailMessage | Message | str = "Missing HTML message"
         assert isinstance(email, EmailMultiAlternatives)
         if len(email.alternatives) > 0:
             html_message = email.alternatives[0][0]
@@ -48,6 +49,7 @@ class EmailLogBackEnd(EmailBackend):
             "reply_to": email.reply_to,
             "recipients": email.to,
             "body": email.body,
+            "date": email.extra_headers.get("Date", "?"),
             "html_message": html_message,
         }
 
@@ -66,23 +68,24 @@ class EmailLogBackEnd(EmailBackend):
 
     @staticmethod
     def prepare_email_messages_for_forwarding(email_messages: Sequence[EmailMessage]) -> None:
-        localhost_email_images_base_uri = settings.ROOT_DOMAIN_URI + "/static/images/emails"
-        czo_email_images_base_uri = "https://chat.zulip.org/static/images/emails"
+        localhost_email_images_base_url = settings.ROOT_DOMAIN_URI + "/static/images/emails"
+        czo_email_images_base_url = "https://chat.zulip.org/static/images/emails"
 
         for email_message in email_messages:
             assert isinstance(email_message, EmailMultiAlternatives)
-            assert isinstance(email_message.alternatives[0][0], str)
-            # Here, we replace the email addresses used in development
-            # with chat.zulip.org, so that web email providers like Gmail
+            # Here, we replace the image URLs used in development with
+            # chat.zulip.org URLs, so that web email providers like Gmail
             # will be able to fetch the illustrations used in the emails.
-            html_alternative = (
-                email_message.alternatives[0][0].replace(
-                    localhost_email_images_base_uri, czo_email_images_base_uri
+            assert isinstance(email_message.alternatives[0], EmailAlternative)
+            original_content = email_message.alternatives[0].content
+            original_mimetype = email_message.alternatives[0].mimetype
+            assert isinstance(original_content, str)
+            email_message.alternatives[0] = EmailAlternative(
+                content=original_content.replace(
+                    localhost_email_images_base_url, czo_email_images_base_url
                 ),
-                email_message.alternatives[0][1],
+                mimetype=original_mimetype,
             )
-            assert isinstance(email_message.alternatives, MutableSequence)
-            email_message.alternatives[0] = html_alternative
 
             email_message.to = [get_forward_address()]
 
@@ -94,6 +97,7 @@ class EmailLogBackEnd(EmailBackend):
     def _do_send_messages(self, email_messages: Sequence[EmailMessage]) -> int:
         return super().send_messages(email_messages)  # nocoverage
 
+    @override
     def send_messages(self, email_messages: Sequence[EmailMessage]) -> int:
         num_sent = len(email_messages)
         if get_forward_address():

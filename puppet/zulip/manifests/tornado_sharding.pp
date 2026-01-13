@@ -7,8 +7,8 @@ class zulip::tornado_sharding {
   # the sharding script afterwards and Puppet shouldn't overwrite them.
   file { '/etc/zulip/nginx_sharding_map.conf':
     ensure  => file,
-    owner   => 'root',
-    group   => 'root',
+    owner   => 'zulip',
+    group   => 'zulip',
     mode    => '0644',
     notify  => Service['nginx'],
     content => @(EOT),
@@ -34,8 +34,8 @@ class zulip::tornado_sharding {
   # This creates .tmp files which scripts/refresh-sharding-and-restart
   # moves into place
   exec { 'stage_updated_sharding':
-    command   => "${::zulip_scripts_path}/lib/sharding.py",
-    onlyif    => "${::zulip_scripts_path}/lib/sharding.py --errors-ok",
+    command   => "${facts['zulip_scripts_path']}/lib/sharding.py",
+    onlyif    => "${facts['zulip_scripts_path']}/lib/sharding.py --errors-ok",
     require   => [File['/etc/zulip/nginx_sharding_map.conf'], File['/etc/zulip/sharding.json']],
     logoutput => true,
     loglevel  => warning,

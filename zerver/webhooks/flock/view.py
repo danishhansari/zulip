@@ -2,19 +2,20 @@
 from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_string, to_wild_value
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import UserProfile
 
 
 @webhook_view("Flock")
-@has_request_variables
+@typed_endpoint
 def api_flock_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
+    *,
+    payload: JsonBodyPayload[WildValue],
 ) -> HttpResponse:
     text = payload["text"].tame(check_string)
     if len(text) != 0:
@@ -22,9 +23,9 @@ def api_flock_webhook(
     else:
         message_body = payload["notification"].tame(check_string)
 
-    topic = "Flock notifications"
+    topic_name = "Flock notifications"
     body = f"{message_body}"
 
-    check_send_webhook_message(request, user_profile, topic, body)
+    check_send_webhook_message(request, user_profile, topic_name, body)
 
     return json_success(request)

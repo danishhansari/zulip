@@ -1,25 +1,24 @@
-import datetime
-import sys
-from typing import Sequence
-from unittest import mock
+from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
 
+import time_machine
 from django.conf import settings
 from django.core import mail
 from django.test import override_settings
+from typing_extensions import override
 
 from corporate.lib.stripe import get_latest_seat_count
 from zerver.actions.create_user import notify_new_user
+from zerver.actions.streams import do_set_stream_property
 from zerver.actions.user_settings import do_change_user_setting
 from zerver.lib.initial_password import initial_password
-from zerver.lib.streams import create_stream_if_needed
 from zerver.lib.test_classes import ZulipTestCase
-from zerver.models import Message, Realm, Recipient, Stream, UserProfile, get_realm
+from zerver.models import Message, Recipient, Stream, UserProfile
+from zerver.models.realms import get_realm
+from zerver.models.recipients import get_direct_message_group_user_ids
+from zerver.models.streams import StreamTopicsPolicyEnum, get_stream
+from zerver.models.users import get_system_bot
 from zerver.signals import JUST_CREATED_THRESHOLD, get_device_browser, get_device_os
-
-if sys.version_info < (3, 9):  # nocoverage
-    from backports import zoneinfo
-else:  # nocoverage
-    import zoneinfo
 
 
 class SendLoginEmailTest(ZulipTestCase):
@@ -37,12 +36,12 @@ class SendLoginEmailTest(ZulipTestCase):
         with self.settings(SEND_LOGIN_EMAILS=True):
             self.assertTrue(settings.SEND_LOGIN_EMAILS)
             # we don't use the self.login method since we spoof the user-agent
-            mock_time = datetime.datetime(year=2018, month=1, day=1, tzinfo=datetime.timezone.utc)
+            mock_time = datetime(year=2018, month=1, day=1, tzinfo=timezone.utc)
 
             user = self.example_user("hamlet")
             user.timezone = "US/Pacific"
             user.twenty_four_hour_time = False
-            user.date_joined = mock_time - datetime.timedelta(seconds=JUST_CREATED_THRESHOLD + 1)
+            user.date_joined = mock_time - timedelta(seconds=JUST_CREATED_THRESHOLD + 1)
             user.save()
             password = initial_password(user.delivery_email)
             login_info = dict(
@@ -52,10 +51,8 @@ class SendLoginEmailTest(ZulipTestCase):
             firefox_windows = (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:47.0) Gecko/20100101 Firefox/47.0"
             )
-            user_tz = zoneinfo.ZoneInfo(user.timezone)
-            mock_time = datetime.datetime(year=2018, month=1, day=1, tzinfo=datetime.timezone.utc)
-            reference_time = mock_time.astimezone(user_tz).strftime("%A, %B %d, %Y at %I:%M%p %Z")
-            with mock.patch("zerver.signals.timezone_now", return_value=mock_time):
+            mock_time = datetime(year=2018, month=1, day=1, tzinfo=timezone.utc)
+            with time_machine.travel(mock_time, tick=False):
                 self.client_post(
                     "/accounts/login/", info=login_info, HTTP_USER_AGENT=firefox_windows
                 )
@@ -65,18 +62,18 @@ class SendLoginEmailTest(ZulipTestCase):
             subject = "New login from Firefox on Windows"
             self.assertEqual(mail.outbox[0].subject, subject)
             # local time is correct and in email's body
-            self.assertIn(reference_time, mail.outbox[0].body)
+            self.assertRegex(str(mail.outbox[0].body), r"Sun, Dec 31, 2017, 4:00[ \u202f]PM PST")
 
             # Try again with the 24h time format setting enabled for this user
             self.logout()  # We just logged in, we'd be redirected without this
             user.twenty_four_hour_time = True
             user.save()
-            with mock.patch("zerver.signals.timezone_now", return_value=mock_time):
+            with time_machine.travel(mock_time, tick=False):
                 self.client_post(
                     "/accounts/login/", info=login_info, HTTP_USER_AGENT=firefox_windows
                 )
 
-            reference_time = mock_time.astimezone(user_tz).strftime("%A, %B %d, %Y at %H:%M %Z")
+            reference_time = "Sun, Dec 31, 2017, 16:00 PST"
             self.assertIn(reference_time, mail.outbox[1].body)
 
     def test_dont_send_login_emails_if_send_login_emails_is_false(self) -> None:
@@ -108,26 +105,27 @@ class SendLoginEmailTest(ZulipTestCase):
     @override_settings(SEND_LOGIN_EMAILS=True)
     def test_enable_login_emails_user_setting(self) -> None:
         user = self.example_user("hamlet")
-        mock_time = datetime.datetime(year=2018, month=1, day=1, tzinfo=datetime.timezone.utc)
+        mock_time = datetime(year=2018, month=1, day=1, tzinfo=timezone.utc)
 
         user.timezone = "US/Pacific"
-        user.date_joined = mock_time - datetime.timedelta(seconds=JUST_CREATED_THRESHOLD + 1)
+        user.date_joined = mock_time - timedelta(seconds=JUST_CREATED_THRESHOLD + 1)
         user.save()
 
         do_change_user_setting(user, "enable_login_emails", False, acting_user=None)
         self.assertFalse(user.enable_login_emails)
-        with mock.patch("zerver.signals.timezone_now", return_value=mock_time):
+        with time_machine.travel(mock_time, tick=False):
             self.login_user(user)
         self.assert_length(mail.outbox, 0)
 
         do_change_user_setting(user, "enable_login_emails", True, acting_user=None)
         self.assertTrue(user.enable_login_emails)
-        with mock.patch("zerver.signals.timezone_now", return_value=mock_time):
+        with time_machine.travel(mock_time, tick=False):
             self.login_user(user)
         self.assert_length(mail.outbox, 1)
 
 
 class TestBrowserAndOsUserAgentStrings(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.user_agents = [
@@ -274,53 +272,63 @@ class TestNotifyNewUser(ZulipTestCase):
 
     def test_notify_realm_of_new_user(self) -> None:
         realm = get_realm("zulip")
+        realm.signup_announcements_stream = get_stream("core team", realm)
+        realm.save(update_fields=["signup_announcements_stream"])
         new_user = self.example_user("cordelia")
-        admin_realm = get_realm("zulipinternal")
-        admin_realm_signups_stream, created = create_stream_if_needed(admin_realm, "signups")
         message_count = self.get_message_count()
 
         notify_new_user(new_user)
-        self.assertEqual(self.get_message_count(), message_count + 2)
-        message = self.get_second_to_last_message()
-        self.assertEqual(message.recipient.type, Recipient.STREAM)
-        actual_stream = Stream.objects.get(id=message.recipient.type_id)
-        self.assertEqual(actual_stream.name, Realm.INITIAL_PRIVATE_STREAM_NAME)
-        self.assertIn(
-            f"@_**Cordelia, Lear's daughter|{new_user.id}** just signed up for Zulip.",
-            message.content,
-        )
+        self.assertEqual(self.get_message_count(), message_count + 1)
         message = self.get_last_message()
         self.assertEqual(message.recipient.type, Recipient.STREAM)
         actual_stream = Stream.objects.get(id=message.recipient.type_id)
-        self.assertEqual(actual_stream.name, "signups")
+        self.assertEqual(actual_stream.name, "core team")
+        self.assertEqual(message.topic_name(), "signups")
         self.assertIn(
-            f"Cordelia, Lear's daughter <`{new_user.email}`> just signed up for Zulip. (total:",
+            f"@_**Cordelia, Lear's daughter|{new_user.id}** joined this organization.",
             message.content,
         )
 
-        admin_realm_signups_stream.delete()
-        notify_new_user(new_user)
-        self.assertEqual(self.get_message_count(), message_count + 3)
-        message = self.get_last_message()
-        self.assertEqual(message.recipient.type, Recipient.STREAM)
-        actual_stream = Stream.objects.get(id=message.recipient.type_id)
-        self.assertEqual(actual_stream.name, Realm.INITIAL_PRIVATE_STREAM_NAME)
-        self.assertIn(
-            f"@_**Cordelia, Lear's daughter|{new_user.id}** just signed up for Zulip.",
-            message.content,
-        )
-        realm.signup_notifications_stream = None
-        realm.save(update_fields=["signup_notifications_stream"])
+        realm.signup_announcements_stream = None
+        realm.save(update_fields=["signup_announcements_stream"])
         new_user.refresh_from_db()
         notify_new_user(new_user)
-        self.assertEqual(self.get_message_count(), message_count + 3)
+        self.assertEqual(self.get_message_count(), message_count + 1)
+
+    def test_notify_realm_of_new_user_in_empty_topic_only_channel(self) -> None:
+        realm = get_realm("zulip")
+        iago = self.example_user("iago")
+        stream = get_stream("core team", realm)
+        realm.signup_announcements_stream = stream
+        realm.save(update_fields=["signup_announcements_stream"])
+        do_set_stream_property(
+            stream, "topics_policy", StreamTopicsPolicyEnum.empty_topic_only.value, iago
+        )
+
+        new_user = self.example_user("cordelia")
+        message_count = self.get_message_count()
+
+        notify_new_user(new_user)
+        self.assertEqual(self.get_message_count(), message_count + 1)
+        message = self.get_last_message()
+        self.assertEqual(message.topic_name(), "")
+        self.assertIn(
+            f"@_**Cordelia, Lear's daughter|{new_user.id}** joined this organization.",
+            message.content,
+        )
 
     def test_notify_realm_of_new_user_in_manual_license_management(self) -> None:
         realm = get_realm("zulip")
+        admin_user_ids = set(realm.get_human_admin_users().values_list("id", flat=True))
+        notification_bot = get_system_bot(settings.NOTIFICATION_BOT, realm.id)
+        expected_group_direct_message_user_ids = admin_user_ids | {notification_bot.id}
+        realm.signup_announcements_stream = get_stream("core team", realm)
+        realm.save(update_fields=["signup_announcements_stream"])
 
         user_count = get_latest_seat_count(realm)
+        extra_licenses = 5
         self.subscribe_realm_to_monthly_plan_on_manual_license_management(
-            realm, user_count + 5, user_count + 5
+            realm, user_count + extra_licenses, user_count + extra_licenses
         )
 
         user_no = 0
@@ -339,10 +347,26 @@ class TestNotifyNewUser(ZulipTestCase):
             notify_new_user(new_user)
 
             message = self.get_last_message()
-            actual_stream = Stream.objects.get(id=message.recipient.type_id)
-            self.assertEqual(actual_stream, realm.signup_notifications_stream)
+            if extra_licenses - user_no > 3:
+                # More than 3 licenses remaining. No group DM.
+                actual_stream = Stream.objects.get(id=message.recipient.type_id)
+                self.assertEqual(actual_stream, realm.signup_announcements_stream)
+            else:
+                # Stream message
+                second_to_last_message = self.get_second_to_last_message()
+                actual_stream = Stream.objects.get(id=second_to_last_message.recipient.type_id)
+                self.assertEqual(actual_stream, realm.signup_announcements_stream)
+                self.assertIn(
+                    f"@_**new user {user_no}|{new_user.id}** joined this organization.",
+                    second_to_last_message.content,
+                )
+                # Group DM
+                self.assertEqual(
+                    set(get_direct_message_group_user_ids(message.recipient)),
+                    expected_group_direct_message_user_ids,
+                )
             self.assertIn(
-                f"@_**new user {user_no}|{new_user.id}** just signed up for Zulip.",
+                f"@_**new user {user_no}|{new_user.id}** joined this organization.",
                 message.content,
             )
             for string_present in strings_present:

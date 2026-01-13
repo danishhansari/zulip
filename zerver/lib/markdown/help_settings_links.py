@@ -1,18 +1,21 @@
 import re
-from typing import Any, List, Match
+from re import Match
+from typing import Any
 
 from markdown import Markdown
 from markdown.extensions import Extension
 from markdown.preprocessors import Preprocessor
+from typing_extensions import override
 
-from zerver.lib.markdown.priorities import PREPROCESSOR_PRIORITES
-
-# There is a lot of duplicated code between this file and
-# help_relative_links.py. So if you're making a change here consider making
-# it there as well.
+from zerver.lib.markdown.priorities import PREPROCESSOR_PRIORITIES
 
 REGEXP = re.compile(r"\{settings_tab\|(?P<setting_identifier>.*?)\}")
 
+
+# If any changes to this link mapping are made,
+# `starlight_help/src/components/NavigationSteps.astro` should be updated accordingly.
+# This manual update mechanism will cease to exist once we have switched to the
+# starlight_help system.
 link_mapping = {
     # a mapping from the setting identifier that is the same as the final URL
     # breadcrumb to that setting to the name of its setting type, the setting
@@ -24,12 +27,12 @@ link_mapping = {
         "Account & privacy",
         "/#settings/account-and-privacy",
     ],
-    "display-settings": ["Personal settings", "Display settings", "/#settings/display-settings"],
+    "preferences": ["Personal settings", "Preferences", "/#settings/preferences"],
     "notifications": ["Personal settings", "Notifications", "/#settings/notifications"],
     "your-bots": ["Personal settings", "Bots", "/#settings/your-bots"],
     "alert-words": ["Personal settings", "Alert words", "/#settings/alert-words"],
     "uploaded-files": ["Personal settings", "Uploaded files", "/#settings/uploaded-files"],
-    "muted-topics": ["Personal settings", "Muted topics", "/#settings/muted-topics"],
+    "topics": ["Personal settings", "Topics", "/#settings/topics"],
     "muted-users": ["Personal settings", "Muted users", "/#settings/muted-users"],
     "organization-profile": [
         "Organization settings",
@@ -57,26 +60,30 @@ link_mapping = {
         "Authentication methods",
         "/#organization/auth-methods",
     ],
-    "user-groups-admin": [
+    "users": [
         "Organization settings",
-        "User groups",
-        "/#organization/user-groups-admin",
+        "Users",
+        "/#organization/users/active",
     ],
-    "user-list-admin": ["Organization settings", "Users", "/#organization/user-list-admin"],
-    "deactivated-users-admin": [
+    "deactivated": [
         "Organization settings",
-        "Deactivated users",
-        "/#organization/deactivated-users-admin",
+        "Users",
+        "/#organization/users/deactivated",
     ],
-    "bot-list-admin": [
+    "invitations": [
+        "Organization settings",
+        "Users",
+        "/#organization/users/invitations",
+    ],
+    "bots": [
         "Organization settings",
         "Bots",
-        "/#organization/bot-list-admin",
+        "/#organization/bots",
     ],
-    "default-streams-list": [
+    "default-channels-list": [
         "Organization settings",
-        "Default streams",
-        "/#organization/default-streams-list",
+        "Default channels",
+        "/#organization/default-channels-list",
     ],
     "linkifier-settings": [
         "Organization settings",
@@ -93,10 +100,10 @@ link_mapping = {
         "Custom profile fields",
         "/#organization/profile-field-settings",
     ],
-    "invites-list-admin": [
+    "channel-folder-settings": [
         "Organization settings",
-        "Invitations",
-        "/#organization/invites-list-admin",
+        "Channel folders",
+        "/#organization/channel-folders",
     ],
     "data-exports-admin": [
         "Organization settings",
@@ -106,7 +113,7 @@ link_mapping = {
 }
 
 settings_markdown = """
-1. Click on the **gear** (<i class="fa fa-cog"></i>) icon in the upper
+1. Click on the **gear** (<i class="zulip-icon zulip-icon-gear"></i>) icon in the upper
    right corner of the web or desktop app.
 
 1. Select **{setting_type_name}**.
@@ -120,21 +127,22 @@ def getMarkdown(setting_type_name: str, setting_name: str, setting_link: str) ->
         relative_link = f"[{setting_name}]({setting_link})"
         # The "Bots" label appears in both Personal and Organization settings
         # in the user interface so we need special text for this setting.
-        if setting_name == "Bots":
+        if setting_name in ["Bots", "Users"]:
             return f"1. Navigate to the {relative_link} \
                     tab of the **{setting_type_name}** menu."
         return f"1. Go to {relative_link}."
-    return settings_markdown.format(
+    return settings_markdown.format(  # nocoverage
         setting_type_name=setting_type_name,
         setting_reference=f"**{setting_name}**",
     )
 
 
 class SettingHelpExtension(Extension):
+    @override
     def extendMarkdown(self, md: Markdown) -> None:
         """Add SettingHelpExtension to the Markdown instance."""
         md.registerExtension(self)
-        md.preprocessors.register(Setting(), "setting", PREPROCESSOR_PRIORITES["setting"])
+        md.preprocessors.register(Setting(), "setting", PREPROCESSOR_PRIORITIES["setting"])
 
 
 relative_settings_links: bool = False
@@ -146,7 +154,8 @@ def set_relative_settings_links(value: bool) -> None:
 
 
 class Setting(Preprocessor):
-    def run(self, lines: List[str]) -> List[str]:
+    @override
+    def run(self, lines: list[str]) -> list[str]:
         done = False
         while not done:
             for line in lines:

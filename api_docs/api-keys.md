@@ -1,34 +1,78 @@
 # API keys
 
-An **API key** is how a bot identifies itself to Zulip. Anyone with a
-bot's API key can impersonate the bot, so be careful with it!
+An **API key** is how a bot identifies itself to Zulip. For the official
+clients, such as the Python bindings, we recommend [downloading a `zuliprc`
+file](/api/configuring-python-bindings#download-a-zuliprc-file). This file
+contains an API key and other necessary configuration values for using the
+Zulip API with a specific account on a Zulip server.
 
-## Get a bot's API key
+## Get API key
+
+{start_tabs}
+
+{tab|for-a-bot}
 
 {settings_tab|your-bots}
 
-1. Click **Active bots**.
+1. In the **Actions** column, click the **manage bot**
+   (<i class="zulip-icon zulip-icon-user-cog"></i>) icon,
+   and scroll down to **API key**.
 
-1. Find your bot. The bot's API key is under **API KEY**.
+1. Click the **copy**
+   (<i class="zulip-icon zulip-icon-copy"></i>) icon to
+   copy the bot's API key to your clipboard.
 
-## Get your API key
+!!! warn ""
 
-Anyone with your API key can impersonate you, so be doubly careful with it.
+    Anyone with a bot's API key can impersonate the bot, so be careful with it!
+
+{tab|for-yourself}
 
 {settings_tab|account-and-privacy}
 
-1. Under **API key**, click **Show/change your API key**.
+1. Under **API key**, click **Manage your API key**.
 
-1. Enter your password, and click **Get API key**. If you never had a
-   password, click **Never had one? Forgotten it?** and follow the
-   instructions from there.
+1. Enter your password, and click **Get API key**. If you don't know your
+   password, click **reset it** and follow the instructions from there.
 
 1. Copy your API key.
 
+!!! warn ""
+
+    Anyone with your API key can impersonate you, so be doubly careful with it.
+
+{end_tabs}
+
 ## Invalidate an API key
 
-To invalidate a key, follow the instructions above, and click
-**Generate new API key** or click the **refresh**
-(<i class="fa fa-refresh"></i>) icon as appropriate.
+To invalidate an existing API key, you have to generate a new key.
 
-This will generate a new key for you or the bot, and invalidate the old one.
+{start_tabs}
+
+{tab|for-a-bot}
+
+{settings_tab|your-bots}
+
+1. In the **Actions** column, click the **manage bot**
+   (<i class="zulip-icon zulip-icon-user-cog"></i>) icon,
+   and scroll down to **API key**.
+
+1. Click the **generate new API key**
+   (<i class="zulip-icon zulip-icon-refresh-cw"></i>) icon.
+
+{tab|for-yourself}
+
+{settings_tab|account-and-privacy}
+
+1. Under **API key**, click **Manage your API key**.
+
+1. Enter your password, and click **Get API key**. If you don't know your
+   password, click **reset it** and follow the instructions from there.
+
+1. Click **Generate new API key**
+
+{end_tabs}
+
+## Related articles
+
+* [Configuring the Python bindings](/api/configuring-python-bindings)

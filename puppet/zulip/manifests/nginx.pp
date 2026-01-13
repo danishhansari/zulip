@@ -1,4 +1,5 @@
 class zulip::nginx {
+  include zulip::certbot
   $web_packages = [
     # Needed to run nginx with the modules we use
     $zulip::common::nginx,
@@ -6,7 +7,7 @@ class zulip::nginx {
   ]
   package { $web_packages: ensure => installed }
 
-  if $::os['family'] == 'RedHat' {
+  if $facts['os']['family'] == 'RedHat' {
     file { '/etc/nginx/sites-available':
       ensure => directory,
       owner  => 'root',
@@ -39,11 +40,13 @@ class zulip::nginx {
     source  => 'puppet:///modules/zulip/nginx/dhparam.pem',
   }
 
-  if $::os['family'] == 'Debian' {
-      $ca_crt = '/etc/ssl/certs/ca-certificates.crt'
+  if $facts['os']['family'] == 'Debian' {
+    $ca_crt = '/etc/ssl/certs/ca-certificates.crt'
   } else {
-      $ca_crt = '/etc/pki/tls/certs/ca-bundle.crt'
+    $ca_crt = '/etc/pki/tls/certs/ca-bundle.crt'
   }
+  $worker_processes = zulipconf('application_server', 'nginx_worker_processes', 'auto')
+  $worker_connections = zulipconf('application_server', 'nginx_worker_connections', 10000)
   file { '/etc/nginx/nginx.conf':
     ensure  => file,
     require => Package[$zulip::common::nginx, 'ca-certificates'],
@@ -52,6 +55,30 @@ class zulip::nginx {
     mode    => '0644',
     notify  => Service['nginx'],
     content => template('zulip/nginx.conf.template.erb'),
+  }
+
+  $loadbalancers = split(zulipconf('loadbalancer', 'ips', ''), ',')
+  $raw_true_client_header = zulipconf('loadbalancer', 'true_client_header', '')
+  $true_client_header = regsubst(downcase($raw_true_client_header), '-', '_', 'G')
+  $true_client_header_from = split(zulipconf('loadbalancer', 'true_client_header_from', ''), ',')
+  $lb_rejects_http_requests = zulipconf('loadbalancer', 'rejects_http_requests', false)
+  file { '/etc/nginx/zulip-include/trusted-ip':
+    ensure  => file,
+    require => Package[$zulip::common::nginx],
+    owner   => 'root',
+    group   => 'root',
+    mode    => '0644',
+    notify  => Service['nginx'],
+    content => template('zulip/nginx/trusted-ip.template.erb'),
+  }
+  file { '/etc/nginx/zulip-include/trusted-proto':
+    ensure  => file,
+    require => Package[$zulip::common::nginx],
+    owner   => 'root',
+    group   => 'root',
+    mode    => '0644',
+    notify  => Service['nginx'],
+    content => template('zulip/nginx/trusted-proto.template.erb'),
   }
 
   file { '/etc/nginx/uwsgi_params':
@@ -75,16 +102,14 @@ class zulip::nginx {
     group  => 'adm',
     mode   => '0750',
   }
+  $access_log_retention_days = zulipconf('application_server','access_log_retention_days', 14)
   file { '/etc/logrotate.d/nginx':
     ensure  => file,
     require => Package[$zulip::common::nginx],
     owner   => 'root',
     group   => 'root',
     mode    => '0644',
-    source  => 'puppet:///modules/zulip/logrotate/nginx',
-  }
-  package { 'certbot':
-    ensure => installed,
+    content => template('zulip/logrotate/nginx.template.erb'),
   }
   file { ['/var/lib/zulip', '/var/lib/zulip/certbot-webroot']:
     ensure => directory,
@@ -94,6 +119,6 @@ class zulip::nginx {
   }
 
   service { 'nginx':
-    ensure     => running,
+    ensure => running,
   }
 }

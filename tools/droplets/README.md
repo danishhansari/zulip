@@ -66,7 +66,7 @@ listing all the droplets created during GCI.
 [Tags](https://www.digitalocean.com/community/tutorials/how-to-tag-digitalocean-droplets)
 may contain letters, numbers, colons, dashes, and underscores.
 
-You'll need to run this from the Zulip development environment (e.g. in
+You'll need to run this from the Zulip development environment (e.g., in
 Vagrant).
 
 The script will also stop if a droplet has already been created for the
@@ -99,8 +99,8 @@ Your remote Zulip dev server has been created!
   `ssh zulipdev@<username>.zulipdev.org` on the command line
   (Terminal for macOS and Linux, Bash for Git on Windows).
 - There is no password; your account is configured to use your SSH keys.
-- Once you log in, you should see `(zulip-py3-venv) ~$`.
-- To start the dev server, `cd zulip` and then run `./tools/run-dev.py`.
+- Once you log in, you should see `(zulip-server) ~$`.
+- To start the dev server, `cd zulip` and then run `./tools/run-dev`.
 - While the dev server is running, you can see the Zulip server in your browser
   at http://<username>.zulipdev.org:9991.
 
@@ -130,13 +130,10 @@ so they are notified.
    - Check "Monitoring", "IPv6", and "User data"
    - Paste the contents of `tools/droplets/new-droplet-image` into the
      text box which says `Enter user data here...`
-   - Name it e.g. `base-ubuntu-20-04.zulipdev.org`
-1. Add an A record for `base.zulipdev.org` to point to the new host.
+   - Name it (e.g., `base-ubuntu-22-04.zulipdev.org`)
 1. Wait for the host to boot.
-1. `scp tools/droplets/new-droplet-image base.zulipdev.org:/tmp/new-droplet-image`
-1. `ssh root@base.zulipdev.org bash /tmp/new-droplet-image`; this
-   should take about 15 minutes to complete, and will finish by
-   closing the connection and shutting the host down.
+1. Wait for the host to complete provisioning and shut down; this will take
+   about 15 minutes.
 1. Go to the Snapshots tab on the image, and "Take a Snapshot".
 1. Wait for several minutes for it to complete.
 1. "Add to region" the snapshot into `NYC3`, `SFO3`, `BLR1`, and `FRA1`.

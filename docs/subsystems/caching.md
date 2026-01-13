@@ -10,9 +10,9 @@ caching).
 
 On the backend, Zulip uses `memcached`, a popular key-value store, for
 caching. Our `memcached` caching helps let us optimize Zulip's
-performance and scalability, since most requests don't need to talk to
-the database (which, even for a trivial query with everything on the
-same machine, usually takes 3-10x as long as a memcached fetch).
+performance and scalability, since we often avoid overhead related
+to database requests. With Django a typical trivial query can
+often take 3-10x as long as a memcached fetch.
 
 We use Django's built-in caching integration to manage talking to
 memcached, and then a small application-layer library
@@ -32,10 +32,10 @@ amount of Zulip's core caching code correctly, then the code most developers
 naturally write will both benefit from caching and not create any cache
 consistency problems.
 
-The overall result of this design is that in the vast majority of
+The overall result of this design is that for many places in the
 Zulip's Django codebase, all one needs to do is call the standard
-accessor functions for data (like `get_user` or `get_stream` to fetch
-user and stream objects, or for view code, functions like
+accessor functions for data (like `get_user` to fetch
+user objects, or, for view code, functions like
 `access_stream_by_id`, which checks permissions), and everything will
 work great. The data fetches automatically benefit from `memcached`
 caching, since those accessor methods have already been written to
@@ -47,7 +47,7 @@ work.
 As a side note, the policy of using these accessor functions wherever
 possible is a good idea, regardless of caching, because the functions
 also generally take care of details you might not think about
-(e.g. case-insensitive matching of stream names or email addresses).
+(e.g., case-insensitive matching of channel names or email addresses).
 It's amazing how slightly tricky logic that's duplicated in several
 places invariably ends up buggy in some of those places, and in
 aggregate we call these accessor functions hundreds of times in
@@ -60,29 +60,30 @@ framework; as you can see, it's very little code on top of our
 `cache_with_key` decorator:
 
 ```python
-def user_profile_cache_key_id(email: str, realm_id: int) -> str:
-    return u"user_profile:%s:%s" % (make_safe_digest(email.strip()), realm_id,)
+def user_profile_by_email_realm_id_cache_key(email: str, realm_id: int) -> str:
+    return f"user_profile:{hashlib.sha1(email.strip().encode()).hexdigest()}:{realm_id}"
 
-def user_profile_cache_key(email: str, realm: 'Realm') -> str:
-    return user_profile_cache_key_id(email, realm.id)
+def user_profile_by_email_realm_cache_key(email: str, realm: "Realm") -> str:
+    return user_profile_by_email_realm_id_cache_key(email, realm.id)
 
-@cache_with_key(user_profile_cache_key, timeout=3600*24*7)
+@cache_with_key(user_profile_by_email_realm_cache_key, timeout=3600 * 24 * 7)
 def get_user(email: str, realm: Realm) -> UserProfile:
-    return UserProfile.objects.select_related().get(
-        email__iexact=email.strip(), realm=realm)
+    # A small amount of complexity, of prefetching additional relationd objects,
+    # has been trimmed here
+    return UserProfile.objects.get(email__iexact=email.strip(), realm=realm)
 ```
 
 This decorator implements a pretty classic caching paradigm:
 
-- The `user_profile_cache_key` function defines a unique map from a
-  canonical form of its arguments to a string. These strings are
-  namespaced (the `user_profile:` part) so that they won't overlap
-  with other caches, and encode the arguments so that two uses of this
-  cache won't overlap. In this case, a hash of the email address and
-  realm ID are those canonicalized arguments. (The `make_safe_digest`
-  is important to ensure we don't send special characters to
-  memcached). And we have two versions, depending whether the caller
-  has access to a `Realm` or just a `realm_id`.
+- The `user_profile_by_email_realm_id_cache_key` function defines a
+  unique map from a canonical form of its arguments to a string. These
+  strings are namespaced (the `user_profile:` part) so that they won't
+  overlap with other caches, and encode the arguments so that two uses
+  of this cache won't overlap. In this case, a hash of the email
+  address and realm ID are those canonicalized arguments. (The
+  `make_safe_digest` is important to ensure we don't send special
+  characters to memcached). And we have two versions, depending
+  whether the caller has access to a `Realm` or just a `realm_id`.
 - When `get_user` is called, `cache_with_key` will compute the key,
   and do a Django `cache_get` query for the key (which goes to
   memcached). If the key is in the cache, it just returns the value.
@@ -95,7 +96,7 @@ This decorator implements a pretty classic caching paradigm:
   `KEY_PREFIX` is rotated every time we deploy to production; see
   below for details.
 
-We use this decorator in more than 30 places in Zulip, and it saves a
+We use this decorator in about 30 places in Zulip, and it saves a
 huge amount of otherwise very self-similar caching code.
 
 ### Cautions
@@ -130,7 +131,7 @@ you configure some code to run every time Django does something (for
 `post_save`, right after any write to the database using Django's
 `.save()`).
 
-There's a handful of lines in `zerver/models.py` like these that
+There's a handful of lines in `zerver/models/*.py` like these that
 configure this:
 
 ```python
@@ -157,7 +158,7 @@ those keys from the cache (if present).
 Maintaining these flush functions requires some care (every time we
 add a new cache, we need to look through them), but overall it's a
 pretty simple algorithm: If the changed data appears in any form in a
-given cache key, that cache key needs to be cleared. E.g. the
+given cache key, that cache key needs to be cleared. E.g., the
 `active_user_ids_cache_key` cache for a realm needs to be flushed
 whenever a new user is created in that realm, or user is
 deactivated/reactivated, even though it's just a list of IDs and thus
@@ -219,9 +220,9 @@ test run).
 ### Manual testing and memcached
 
 Zulip's development environment will automatically flush (delete all
-keys in) `memcached` when provisioning and when starting `run-dev.py`.
+keys in) `memcached` when provisioning and when starting `run-dev`.
 You can run the server with that behavior disabled using
-`tools/run-dev.py --no-clear-memcached`.
+`tools/run-dev --no-clear-memcached`.
 
 ### Performance
 
@@ -230,7 +231,7 @@ them in loops (the same applies for database queries!). Instead, one
 should use a bulk query. We have a fancy function,
 `generate_bulk_cached_fetch`, which is super magical and handles this
 for us, with support for a bunch of fancy features like marshalling
-data before/after going into the cache (e.g. to compress `message`
+data before/after going into the cache (e.g., to compress `message`
 objects to minimize data transfer between Django and memcached).
 
 ## In-process caching in Django
@@ -239,10 +240,10 @@ We generally try to avoid in-process backend caching in Zulip's Django
 codebase, because every Zulip production installation involves
 multiple servers. We do have a few, however:
 
-- `per_request_display_recipient_cache`: A cache flushed at the start
-  of every request; this simplifies correctly implementing our goal of
-  not repeatedly fetching the "display recipient" (e.g. stream name)
-  for each message in the `GET /messages` codebase.
+- `@return_same_value_during_entire_request`: We use this decorator to
+  cache values in memory during the lifetime of a request. We use this
+  for linkifiers and display recipients. The middleware knows how to
+  flush the relevant in-memory caches at the start of a request.
 - Caches of various data, like the `SourceMap` object, that are
   expensive to construct, not needed for most requests, and don't
   change once a Zulip server has been deployed in production.
@@ -251,7 +252,7 @@ multiple servers. We do have a few, however:
 
 Zulip makes extensive use of caching of data in the browser and mobile
 apps; details like which users exist, with metadata like names and
-avatars, similar details for streams, recent message history, etc.
+avatars, similar details for channels, recent message history, etc.
 
 This data is fetched in the `/register` endpoint (or `page_params`
 for the web app), and kept correct over time. The key to keeping these
@@ -262,4 +263,4 @@ cached by clients is changed. Clients are responsible for handling
 the events, updating their state, and rerendering any UI components
 that might display the modified state.
 
-[post-save-signals]: https://docs.djangoproject.com/en/3.2/ref/signals/#post-save
+[post-save-signals]: https://docs.djangoproject.com/en/5.0/ref/signals/#post-save

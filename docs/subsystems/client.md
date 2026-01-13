@@ -3,7 +3,7 @@
 `zerver.models.Client` is Zulip's analogue of the HTTP User-Agent
 header (and is populated from User-Agent). It exists for use in
 analytics and other places to provide human-readable summary data
-about "which Zulip client" was used for an operation (e.g. was it the
+about "which Zulip client" was used for an operation (e.g., was it the
 Android app, the desktop app, or a bot?).
 
 In general, it shouldn't be used for anything controlling the behavior
@@ -29,10 +29,10 @@ The `webhook_view` auth decorator, used for most incoming
 webhooks, accepts the name of the integration as an argument and uses
 it to generate a client name that it adds to the `request_notes`
 object that can be accessed with the `request` (Django
-[HttpRequest](https://docs.djangoproject.com/en/3.2/ref/request-response/#django.http.HttpRequest))
+[HttpRequest](https://docs.djangoproject.com/en/5.0/ref/request-response/#django.http.HttpRequest))
 object via `zerver.lib.request.get_request_notes(request)`.
 
 In most integrations, `request_notes.client` is then passed to
 `check_send_webhook_message`, where it is used to keep track of which client
 sent the message (which in turn is used by analytics). For more
-information, see [the incoming webhook walkthrough](https://zulip.com/api/incoming-webhooks-walkthrough).
+information, see [the incoming webhook walkthrough](../webhooks/incoming-webhooks-walkthrough.md).

@@ -1,12 +1,11 @@
 import operator
-from typing import Dict, List
 
 from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_bool, check_int, check_string, to_wild_value
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_bool, check_int, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import UserProfile
 
@@ -22,16 +21,17 @@ ANSIBLETOWER_JOB_HOST_ROW_TEMPLATE = "* {hostname}: {status}\n"
 
 
 @webhook_view("AnsibleTower")
-@has_request_variables
+@typed_endpoint
 def api_ansibletower_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
+    *,
+    payload: JsonBodyPayload[WildValue],
 ) -> HttpResponse:
     body = get_body(payload)
-    subject = payload["name"].tame(check_string)
+    topic_name = payload["name"].tame(check_string)
 
-    check_send_webhook_message(request, user_profile, subject, body)
+    check_send_webhook_message(request, user_profile, topic_name, body)
     return json_success(request)
 
 
@@ -62,7 +62,7 @@ def get_body(payload: WildValue) -> str:
                 }
             )
 
-        if payload["status"] == "successful":
+        if payload["status"].tame(check_string) == "successful":
             status = "was successful"
         else:
             status = "failed"
@@ -93,7 +93,7 @@ def get_body(payload: WildValue) -> str:
         return ANSIBLETOWER_DEFAULT_MESSAGE_TEMPLATE.format(**data)
 
 
-def get_hosts_content(hosts_data: List[Dict[str, str]]) -> str:
+def get_hosts_content(hosts_data: list[dict[str, str]]) -> str:
     hosts_data = sorted(hosts_data, key=operator.itemgetter("hostname"))
     hosts_content = ""
     for host in hosts_data:

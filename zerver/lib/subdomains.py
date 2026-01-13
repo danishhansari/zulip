@@ -1,6 +1,5 @@
 import re
-import urllib
-from typing import Optional
+from urllib.parse import urlsplit
 
 from django.conf import settings
 from django.http import HttpRequest
@@ -23,22 +22,27 @@ def get_subdomain(request: HttpRequest) -> str:
     # compatibility with older versions of Zulip, so that's a start.
 
     host = request.get_host().lower()
-    return get_subdomain_from_hostname(host)
+    subdomain = get_subdomain_from_hostname(host)
+    assert subdomain is not None
+    return subdomain
 
 
-def get_subdomain_from_hostname(host: str) -> str:
+def get_subdomain_from_hostname(
+    host: str, default_subdomain: str | None = Realm.SUBDOMAIN_FOR_ROOT_DOMAIN
+) -> str | None:
+    # Set `default_subdomain` as None to check if a valid subdomain was found.
     m = re.search(rf"\.{settings.EXTERNAL_HOST}(:\d+)?$", host)
     if m:
         subdomain = host[: m.start()]
-        if subdomain in settings.ROOT_SUBDOMAIN_ALIASES:
-            return Realm.SUBDOMAIN_FOR_ROOT_DOMAIN
+        if default_subdomain is not None and subdomain in settings.ROOT_SUBDOMAIN_ALIASES:
+            return default_subdomain
         return subdomain
 
     for subdomain, realm_host in settings.REALM_HOSTS.items():
         if re.search(rf"^{realm_host}(:\d+)?$", host):
             return subdomain
 
-    return Realm.SUBDOMAIN_FOR_ROOT_DOMAIN
+    return default_subdomain
 
 
 def is_subdomain_root_or_alias(request: HttpRequest) -> bool:
@@ -55,9 +59,10 @@ def is_root_domain_available() -> bool:
     return not Realm.objects.filter(string_id=Realm.SUBDOMAIN_FOR_ROOT_DOMAIN).exists()
 
 
-def is_static_or_current_realm_url(url: str, realm: Optional[Realm]) -> bool:
-    split_url = urllib.parse.urlsplit(url)
-    split_static_url = urllib.parse.urlsplit(settings.STATIC_URL)
+def is_static_or_current_realm_url(url: str, realm: Realm | None) -> bool:
+    assert settings.STATIC_URL is not None
+    split_url = urlsplit(url)
+    split_static_url = urlsplit(settings.STATIC_URL)
 
     # The netloc check here is important to correctness if STATIC_URL
     # does not contain a `/`; see the tests for why.

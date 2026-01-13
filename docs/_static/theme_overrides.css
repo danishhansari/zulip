@@ -10,6 +10,9 @@
     overflow: visible !important;
 }
 
-.wy-side-nav-search > a.home-link {
-    font-weight: 100;
+/* Present tables with columns of equal size
+   when images are present. */
+.rst-content table.docutils:has(img) {
+    table-layout: fixed;
+    width: 100%;
 }

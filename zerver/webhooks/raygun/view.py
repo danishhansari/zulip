@@ -1,19 +1,13 @@
-import time
+from datetime import datetime
 
 from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
 from zerver.lib.exceptions import UnsupportedWebhookEventTypeError
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import (
-    WildValue,
-    check_anything,
-    check_int,
-    check_list,
-    check_string,
-    to_wild_value,
-)
+from zerver.lib.timestamp import datetime_to_global_time
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_anything, check_int, check_list, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import UserProfile
 
@@ -21,11 +15,12 @@ ALL_EVENT_TYPES = ["error_notification", "error_activity"]
 
 
 @webhook_view("Raygun", all_event_types=ALL_EVENT_TYPES)
-@has_request_variables
+@typed_endpoint
 def api_raygun_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
+    *,
+    payload: JsonBodyPayload[WildValue],
 ) -> HttpResponse:
     # The payload contains 'event' key. This 'event' key has a value of either
     # 'error_notification' or 'error_activity'. 'error_notification' happens
@@ -45,9 +40,9 @@ def api_raygun_webhook(
     else:
         raise UnsupportedWebhookEventTypeError(event)
 
-    topic = "test"
+    topic_name = "test"
 
-    check_send_webhook_message(request, user_profile, topic, message, event)
+    check_send_webhook_message(request, user_profile, topic_name, message, event)
 
     return json_success(request)
 
@@ -227,7 +222,7 @@ def compose_notification_message(payload: WildValue) -> str:
     # We now split this main function again into two functions. One is for
     # "NewErrorOccurred" and "ErrorReoccurred", and one is for the rest. Both
     # functions will return a text message that is formatted for the chat.
-    if event_type == "NewErrorOccurred" or event_type == "ErrorReoccurred":
+    if event_type in ("NewErrorOccurred", "ErrorReoccurred"):
         return notification_message_error_occurred(payload)
     elif "FollowUp" in event_type:
         return notification_message_follow_up(payload)
@@ -285,27 +280,18 @@ def compose_activity_message(payload: WildValue) -> str:
     # But, they all are almost identical and the only differences between them
     # are the keys at line 9 (check fixtures). So there's no need to split
     # the function like the notification one.
-    if (
-        event_type == "StatusChanged"
-        or event_type == "AssignedToUser"
-        or event_type == "CommentAdded"
-    ):
+    if event_type in ("StatusChanged", "AssignedToUser", "CommentAdded"):
         return activity_message(payload)
     else:
         raise UnsupportedWebhookEventTypeError(event_type)
 
 
-def parse_time(timestamp: str) -> str:
+def parse_time(dt_str: str) -> str:
     """Parses and returns the timestamp provided
 
     :param timestamp: The timestamp provided by the payload
     :returns: A string containing the time
     """
 
-    # Raygun provides two timestamp format, one with the Z at the end,
-    # and one without the Z.
-
-    format = "%Y-%m-%dT%H:%M:%S"
-    format += "Z" if timestamp[-1:] == "Z" else ""
-    parsed_time = time.strftime("%c", time.strptime(timestamp, format))
-    return parsed_time
+    dt = datetime.fromisoformat(dt_str)
+    return datetime_to_global_time(dt)

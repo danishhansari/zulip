@@ -2,7 +2,7 @@
 
 from django.contrib.postgres.operations import AddIndexConcurrently
 from django.db import connection, migrations, models
-from django.db.backends.postgresql.schema import BaseDatabaseSchemaEditor
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 from django.db.migrations.state import StateApps
 
 
@@ -41,7 +41,9 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RunPython(backfill_is_user_active, reverse_code=migrations.RunPython.noop),
+        migrations.RunPython(
+            backfill_is_user_active, reverse_code=migrations.RunPython.noop, elidable=True
+        ),
         # Make the field non-null now that we backfilled.
         migrations.AlterField(
             model_name="subscription",

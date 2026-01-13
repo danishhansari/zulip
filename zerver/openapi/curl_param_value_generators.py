@@ -5,46 +5,52 @@
 # based on Zulip's OpenAPI definitions, as well as test setup and
 # fetching of appropriate parameter values to use when running the
 # cURL examples as part of the tools/test-api test suite.
+import re
+from collections.abc import Callable
 from functools import wraps
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, cast
 
 from django.utils.timezone import now as timezone_now
 
+from zerver.actions.channel_folders import check_add_channel_folder
 from zerver.actions.create_user import do_create_user
 from zerver.actions.presence import update_user_presence
 from zerver.actions.reactions import do_add_reaction
 from zerver.actions.realm_linkifiers import do_add_linkifier
-from zerver.actions.realm_playgrounds import do_add_realm_playground
+from zerver.actions.realm_playgrounds import check_add_realm_playground
 from zerver.lib.events import do_events_register
 from zerver.lib.initial_password import initial_password
 from zerver.lib.test_classes import ZulipTestCase
-from zerver.lib.upload import upload_message_file
-from zerver.lib.users import get_api_key
-from zerver.models import Client, Message, UserGroup, UserPresence, get_realm, get_user
+from zerver.lib.upload import upload_message_attachment
+from zerver.models import Client, Message, NamedUserGroup, UserPresence
+from zerver.models.channel_folders import ChannelFolder
+from zerver.models.realms import get_realm
+from zerver.models.users import UserProfile, get_user
+from zerver.openapi.openapi import Parameter
 
-GENERATOR_FUNCTIONS: Dict[str, Callable[[], Dict[str, object]]] = {}
-REGISTERED_GENERATOR_FUNCTIONS: Set[str] = set()
-CALLED_GENERATOR_FUNCTIONS: Set[str] = set()
+GENERATOR_FUNCTIONS: dict[str, Callable[[], dict[str, object]]] = {}
+REGISTERED_GENERATOR_FUNCTIONS: set[str] = set()
+CALLED_GENERATOR_FUNCTIONS: set[str] = set()
 # This is a List rather than just a string in order to make it easier
 # to write to it from another module.
-AUTHENTICATION_LINE: List[str] = [""]
+AUTHENTICATION_LINE: list[str] = [""]
 
 helpers = ZulipTestCase()
 
 
 def openapi_param_value_generator(
-    endpoints: List[str],
-) -> Callable[[Callable[[], Dict[str, object]]], Callable[[], Dict[str, object]]]:
-    """This decorator is used to register OpenAPI param value genarator functions
+    endpoints: list[str],
+) -> Callable[[Callable[[], dict[str, object]]], Callable[[], dict[str, object]]]:
+    """This decorator is used to register OpenAPI param value generator functions
     with endpoints. Example usage:
 
     @openapi_param_value_generator(["/messages/render:post"])
     def ...
     """
 
-    def wrapper(generator_func: Callable[[], Dict[str, object]]) -> Callable[[], Dict[str, object]]:
+    def wrapper(generator_func: Callable[[], dict[str, object]]) -> Callable[[], dict[str, object]]:
         @wraps(generator_func)
-        def _record_calls_wrapper() -> Dict[str, object]:
+        def _record_calls_wrapper() -> dict[str, object]:
             CALLED_GENERATOR_FUNCTIONS.add(generator_func.__name__)
             return generator_func()
 
@@ -69,32 +75,28 @@ def assert_all_helper_functions_called() -> None:
 
 def patch_openapi_example_values(
     entry: str,
-    params: List[Dict[str, Any]],
-    request_body: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[Dict[str, object]], Optional[Dict[str, object]]]:
+    parameters: list[Parameter],
+    request_body: dict[str, Any] | None = None,
+) -> tuple[list[Parameter], dict[str, object] | None]:
     if entry not in GENERATOR_FUNCTIONS:
-        return params, request_body
+        return parameters, request_body
     func = GENERATOR_FUNCTIONS[entry]
-    realm_example_values: Dict[str, object] = func()
+    realm_example_values: dict[str, object] = func()
 
-    for param in params:
-        param_name = param["name"]
-        if param_name in realm_example_values:
-            if "content" in param:
-                param["content"]["application/json"]["example"] = realm_example_values[param_name]
-            else:
-                param["example"] = realm_example_values[param_name]
+    for parameter in parameters:
+        if parameter.name in realm_example_values:
+            parameter.example = realm_example_values[parameter.name]
 
-    if request_body is not None:
-        properties = request_body["content"]["multipart/form-data"]["schema"]["properties"]
+    if request_body is not None and "multipart/form-data" in (content := request_body["content"]):
+        properties = content["multipart/form-data"]["schema"]["properties"]
         for key, property in properties.items():
             if key in realm_example_values:
                 property["example"] = realm_example_values[key]
-    return params, request_body
+    return parameters, request_body
 
 
 @openapi_param_value_generator(["/fetch_api_key:post"])
-def fetch_api_key() -> Dict[str, object]:
+def fetch_api_key() -> dict[str, object]:
     email = helpers.example_email("iago")
     password = initial_password(email)
 
@@ -110,9 +112,10 @@ def fetch_api_key() -> Dict[str, object]:
         "/messages/{message_id}/history:get",
         "/messages/{message_id}:patch",
         "/messages/{message_id}:delete",
+        "/messages/{message_id}/reactions:post",
     ]
 )
-def iago_message_id() -> Dict[str, object]:
+def iago_message_id() -> dict[str, object]:
     iago = helpers.example_user("iago")
     helpers.subscribe(iago, "Denmark")
     return {
@@ -121,44 +124,46 @@ def iago_message_id() -> Dict[str, object]:
 
 
 @openapi_param_value_generator(["/messages/{message_id}/reactions:delete"])
-def add_emoji_to_message() -> Dict[str, object]:
+def add_emoji_to_message() -> dict[str, object]:
     user_profile = helpers.example_user("iago")
 
-    # The message ID here is hardcoded based on the corresponding value
-    # for the example message IDs we use in zulip.yaml.
-    message_id = 46
+    # Get a message ID by calling the message generator
+    message_id = cast(int, iago_message_id()["message_id"])
+
     emoji_name = "octopus"
     emoji_code = "1f419"
     reaction_type = "unicode_emoji"
 
-    message = Message.objects.select_related().get(id=message_id)
+    message = Message.objects.select_related(*Message.DEFAULT_SELECT_RELATED).get(id=message_id)
     do_add_reaction(user_profile, message, emoji_name, emoji_code, reaction_type)
 
-    return {}
+    return {
+        "message_id": message_id,
+    }
 
 
 @openapi_param_value_generator(["/messages/flags:post"])
-def update_flags_message_ids() -> Dict[str, object]:
+def update_flags_message_ids() -> dict[str, object]:
     stream_name = "Venice"
     helpers.subscribe(helpers.example_user("iago"), stream_name)
 
-    messages = []
-    for _ in range(3):
-        messages.append(helpers.send_stream_message(helpers.example_user("iago"), stream_name))
+    messages = [
+        helpers.send_stream_message(helpers.example_user("iago"), stream_name) for _ in range(3)
+    ]
     return {
         "messages": messages,
     }
 
 
 @openapi_param_value_generator(["/mark_stream_as_read:post", "/users/me/{stream_id}/topics:get"])
-def get_venice_stream_id() -> Dict[str, object]:
+def get_venice_stream_id() -> dict[str, object]:
     return {
         "stream_id": helpers.get_stream_id("Venice"),
     }
 
 
 @openapi_param_value_generator(["/streams/{stream_id}:patch"])
-def update_stream() -> Dict[str, object]:
+def update_stream() -> dict[str, object]:
     stream = helpers.subscribe(helpers.example_user("iago"), "temp_stream 1")
     return {
         "stream_id": stream.id,
@@ -166,7 +171,7 @@ def update_stream() -> Dict[str, object]:
 
 
 @openapi_param_value_generator(["/streams/{stream_id}:delete"])
-def create_temp_stream_and_get_id() -> Dict[str, object]:
+def create_temp_stream_and_get_id() -> dict[str, object]:
     stream = helpers.subscribe(helpers.example_user("iago"), "temp_stream 2")
     return {
         "stream_id": stream.id,
@@ -174,7 +179,7 @@ def create_temp_stream_and_get_id() -> Dict[str, object]:
 
 
 @openapi_param_value_generator(["/mark_topic_as_read:post"])
-def get_denmark_stream_id_and_topic() -> Dict[str, object]:
+def get_denmark_stream_id_and_topic() -> dict[str, object]:
     stream_name = "Denmark"
     topic_name = "Tivoli Gardens"
 
@@ -188,7 +193,7 @@ def get_denmark_stream_id_and_topic() -> Dict[str, object]:
 
 
 @openapi_param_value_generator(["/users/me/subscriptions/properties:post"])
-def update_subscription_data() -> Dict[str, object]:
+def update_subscription_data() -> dict[str, object]:
     profile = helpers.example_user("iago")
     helpers.subscribe(profile, "Verona")
     helpers.subscribe(profile, "social")
@@ -201,7 +206,7 @@ def update_subscription_data() -> Dict[str, object]:
 
 
 @openapi_param_value_generator(["/users/me/subscriptions:delete"])
-def delete_subscription_data() -> Dict[str, object]:
+def delete_subscription_data() -> dict[str, object]:
     iago = helpers.example_user("iago")
     zoe = helpers.example_user("ZOE")
     helpers.subscribe(iago, "Verona")
@@ -212,7 +217,7 @@ def delete_subscription_data() -> Dict[str, object]:
 
 
 @openapi_param_value_generator(["/events:get"])
-def get_events() -> Dict[str, object]:
+def get_events() -> dict[str, object]:
     profile = helpers.example_user("iago")
     helpers.subscribe(profile, "Verona")
     client = Client.objects.create(name="curl-test-client-1")
@@ -227,7 +232,7 @@ def get_events() -> Dict[str, object]:
 
 
 @openapi_param_value_generator(["/events:delete"])
-def delete_event_queue() -> Dict[str, object]:
+def delete_event_queue() -> dict[str, object]:
     profile = helpers.example_user("iago")
     client = Client.objects.create(name="curl-test-client-2")
     response = do_events_register(profile, profile.realm, client, event_types=["message"])
@@ -238,43 +243,82 @@ def delete_event_queue() -> Dict[str, object]:
 
 
 @openapi_param_value_generator(["/users/{user_id_or_email}/presence:get"])
-def get_user_presence() -> Dict[str, object]:
+def get_user_presence() -> dict[str, object]:
     iago = helpers.example_user("iago")
     client = Client.objects.create(name="curl-test-client-3")
-    update_user_presence(iago, client, timezone_now(), UserPresence.ACTIVE, False)
+    update_user_presence(iago, client, timezone_now(), UserPresence.LEGACY_STATUS_ACTIVE_INT, False)
     return {}
 
 
 @openapi_param_value_generator(["/users:post"])
-def create_user() -> Dict[str, object]:
+def create_user() -> dict[str, object]:
     return {
         "email": helpers.nonreg_email("test"),
     }
 
 
+@openapi_param_value_generator(["/users/{email]:patch", "/users/{user_id}:patch"])
+def new_email_value() -> dict[str, object]:
+    count = 0
+    exists = True
+    while exists:
+        email = f"new{count}@zulip.com"
+        exists = UserProfile.objects.filter(delivery_email=email).exists()
+        count += 1
+    return {
+        "new_email": email,
+    }
+
+
 @openapi_param_value_generator(["/user_groups/create:post"])
-def create_user_group_data() -> Dict[str, object]:
+def create_user_group_data() -> dict[str, object]:
     return {
         "members": [helpers.example_user("hamlet").id, helpers.example_user("othello").id],
     }
 
 
-@openapi_param_value_generator(
-    ["/user_groups/{user_group_id}:patch", "/user_groups/{user_group_id}:delete"]
-)
-def get_temp_user_group_id() -> Dict[str, object]:
-    user_group, _ = UserGroup.objects.get_or_create(name="temp", realm=get_realm("zulip"))
+@openapi_param_value_generator(["/user_groups/{user_group_id}:patch"])
+def get_temp_user_group_id() -> dict[str, object]:
+    user_group, _ = NamedUserGroup.objects.get_or_create(
+        name="temp",
+        realm=get_realm("zulip"),
+        can_add_members_group_id=11,
+        can_join_group_id=11,
+        can_leave_group_id=15,
+        can_manage_group_id=11,
+        can_mention_group_id=11,
+        can_remove_members_group_id=11,
+        realm_for_sharding=get_realm("zulip"),
+    )
+    return {
+        "user_group_id": user_group.id,
+    }
+
+
+@openapi_param_value_generator(["/user_groups/{user_group_id}/deactivate:post"])
+def get_temp_user_group_id_for_deactivation() -> dict[str, object]:
+    user_group, _ = NamedUserGroup.objects.get_or_create(
+        name="temp-deactivation",
+        realm=get_realm("zulip"),
+        can_add_members_group_id=11,
+        can_join_group_id=11,
+        can_leave_group_id=15,
+        can_manage_group_id=11,
+        can_mention_group_id=11,
+        can_remove_members_group_id=11,
+        realm_for_sharding=get_realm("zulip"),
+    )
     return {
         "user_group_id": user_group.id,
     }
 
 
 @openapi_param_value_generator(["/realm/filters/{filter_id}:delete"])
-def remove_realm_filters() -> Dict[str, object]:
+def remove_realm_filters() -> dict[str, object]:
     filter_id = do_add_linkifier(
         get_realm("zulip"),
         "#(?P<id>[0-9]{2,8})",
-        "https://github.com/zulip/zulip/pull/%(id)s",
+        "https://github.com/zulip/zulip/pull/{id}",
         acting_user=None,
     )
     return {
@@ -283,36 +327,37 @@ def remove_realm_filters() -> Dict[str, object]:
 
 
 @openapi_param_value_generator(["/realm/emoji/{emoji_name}:post", "/user_uploads:post"])
-def upload_custom_emoji() -> Dict[str, object]:
+def upload_custom_emoji() -> dict[str, object]:
     return {
         "filename": "zerver/tests/images/animated_img.gif",
     }
 
 
 @openapi_param_value_generator(["/realm/playgrounds:post"])
-def add_realm_playground() -> Dict[str, object]:
+def add_realm_playground() -> dict[str, object]:
     return {
         "name": "Python2 playground",
         "pygments_language": "Python2",
-        "url_prefix": "https://python2.example.com",
+        "url_template": "https://python2.example.com?code={code}",
     }
 
 
 @openapi_param_value_generator(["/realm/playgrounds/{playground_id}:delete"])
-def remove_realm_playground() -> Dict[str, object]:
-    playground_info = dict(
+def remove_realm_playground() -> dict[str, object]:
+    playground_id = check_add_realm_playground(
+        get_realm("zulip"),
+        acting_user=None,
         name="Python playground",
         pygments_language="Python",
-        url_prefix="https://python.example.com",
+        url_template="https://python.example.com?code={code}",
     )
-    playground_id = do_add_realm_playground(get_realm("zulip"), acting_user=None, **playground_info)
     return {
         "playground_id": playground_id,
     }
 
 
 @openapi_param_value_generator(["/users/{user_id}:delete"])
-def deactivate_user() -> Dict[str, object]:
+def deactivate_user() -> dict[str, object]:
     user_profile = do_create_user(
         email="testuser@zulip.com",
         password=None,
@@ -324,7 +369,7 @@ def deactivate_user() -> Dict[str, object]:
 
 
 @openapi_param_value_generator(["/users/me:delete"])
-def deactivate_own_user() -> Dict[str, object]:
+def deactivate_own_user() -> dict[str, object]:
     test_user_email = "delete-test@zulip.com"
     deactivate_test_user = do_create_user(
         test_user_email,
@@ -336,16 +381,51 @@ def deactivate_own_user() -> Dict[str, object]:
     )
     realm = get_realm("zulip")
     test_user = get_user(test_user_email, realm)
-    test_user_api_key = get_api_key(test_user)
+    test_user_api_key = test_user.api_key
     # change authentication line to allow test_client to delete itself.
     AUTHENTICATION_LINE[0] = f"{deactivate_test_user.email}:{test_user_api_key}"
     return {}
 
 
 @openapi_param_value_generator(["/attachments/{attachment_id}:delete"])
-def remove_attachment() -> Dict[str, object]:
+def remove_attachment() -> dict[str, object]:
     user_profile = helpers.example_user("iago")
-    url = upload_message_file("dummy.txt", len(b"zulip!"), "text/plain", b"zulip!", user_profile)
+    url = upload_message_attachment("dummy.txt", "text/plain", b"zulip!", user_profile)[0]
     attachment_id = url.replace("/user_uploads/", "").split("/")[0]
 
     return {"attachment_id": attachment_id}
+
+
+@openapi_param_value_generator(["/channel_folders:patch"])
+def add_channel_folders() -> dict[str, object]:
+    user_profile = helpers.example_user("iago")
+    realm = user_profile.realm
+    check_add_channel_folder(
+        realm,
+        "General",
+        "Channel for general discussions",
+        acting_user=user_profile,
+    )
+    check_add_channel_folder(
+        realm,
+        "Documentation",
+        "Channels for **documentation** discussions",
+        acting_user=user_profile,
+    )
+    check_add_channel_folder(realm, "Memes", "Channels for sharing memes", acting_user=user_profile)
+    channel_folders = ChannelFolder.objects.filter(realm=realm)
+
+    return {"order": [folder.id for folder in channel_folders]}
+
+
+@openapi_param_value_generator(["/user_uploads/{realm_id_str}/{filename}:get"])
+def get_temporary_url_for_uploaded_file() -> dict[str, object]:
+    realm_id = ""
+    filename = ""
+    user_profile = helpers.example_user("iago")
+    url = upload_message_attachment("dummy.txt", "text/plain", b"zulip!", user_profile)[0]
+    upload_path_parts = re.match(r"/user_uploads/(\d+)/(.*)", url)
+    if upload_path_parts:
+        realm_id = upload_path_parts[1]
+        filename = upload_path_parts[2]
+    return {"realm_id_str": realm_id, "filename": filename}

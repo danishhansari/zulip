@@ -2,8 +2,8 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
-from typing import Iterator, Optional
 
 # Verify the Zulip venv is available.
 from tools.lib import sanity_check
@@ -32,7 +32,7 @@ def set_up_django(external_host: str) -> None:
     os.environ["PYTHONUNBUFFERED"] = "y"
 
 
-def assert_server_running(server: "subprocess.Popen[bytes]", log_file: Optional[str]) -> None:
+def assert_server_running(server: "subprocess.Popen[bytes]", log_file: str | None) -> None:
     """Get the exit code of the server, or None if it is still running."""
     if server.poll() is not None:
         message = "Server died unexpectedly!"
@@ -41,7 +41,7 @@ def assert_server_running(server: "subprocess.Popen[bytes]", log_file: Optional[
         raise RuntimeError(message)
 
 
-def server_is_up(server: "subprocess.Popen[bytes]", log_file: Optional[str]) -> bool:
+def server_is_up(server: "subprocess.Popen[bytes]", log_file: str | None) -> bool:
     assert_server_running(server, log_file)
     try:
         # We could get a 501 error if the reverse proxy is up but the Django app isn't.
@@ -55,8 +55,9 @@ def server_is_up(server: "subprocess.Popen[bytes]", log_file: Optional[str]) -> 
 def test_server_running(
     skip_provision_check: bool = False,
     external_host: str = "testserver",
-    log_file: Optional[str] = None,
+    log_file: str | None = None,
     dots: bool = False,
+    enable_help_center: bool = False,
 ) -> Iterator[None]:
     with ExitStack() as stack:
         log = sys.stdout
@@ -72,9 +73,11 @@ def test_server_running(
         update_test_databases_if_required(rebuild_test_database=True)
 
         # Run this not through the shell, so that we have the actual PID.
-        run_dev_server_command = ["tools/run-dev.py", "--test", "--streamlined"]
+        run_dev_server_command = ["tools/run-dev", "--test", "--streamlined"]
         if skip_provision_check:
             run_dev_server_command.append("--skip-provision-check")
+        if enable_help_center:
+            run_dev_server_command.append("--help-center-static-build")
         server = subprocess.Popen(run_dev_server_command, stdout=log, stderr=log)
 
         try:

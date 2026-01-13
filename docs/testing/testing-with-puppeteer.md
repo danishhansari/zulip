@@ -3,8 +3,8 @@
 While our [node test suite](testing-with-node.md) is the
 preferred way to test most frontend code because they are easy to
 write and maintain, some code is best tested in a real browser, either
-because of navigation (E.g. login) or because we want to verify the
-interaction between Zulip logic and browser behavior (E.g. copy/paste,
+because of navigation (e.g., login) or because we want to verify the
+interaction between Zulip logic and browser behavior (e.g., copy/paste,
 keyboard shortcuts, etc.).
 
 ## Running tests
@@ -19,9 +19,9 @@ See `tools/test-js-with-puppeteer --help` for useful options,
 especially running specific subsets of the tests to save time when
 debugging.
 
-The test files live in `frontend_tests/puppeteer_tests` and make use
+The test files live in `web/e2e-tests` and make use
 of various useful helper functions defined in
-`frontend_tests/puppeteer_lib/common.js`.
+`web/e2e-tests/lib/common.ts`.
 
 ## How Puppeteer tests work
 
@@ -33,7 +33,7 @@ web app, like "Type this key", "Wait until this HTML element
 appears/disappears", or "Click on this HTML element".
 
 For example, this function might test the `x` keyboard shortcut to
-open the compose box for a new private message:
+open the compose box for a new direct message:
 
 ```js
 async function test_private_message_compose_shortcut(page) {
@@ -74,7 +74,7 @@ integration](continuous-integration.md):
   affects any of the selectors used in the tests? If so, the test may
   just need to be updated for your changes.
 - Does the test fail deterministically when you run it locally using
-  E.g. `./tools/test-js-with-puppeteer compose.ts`? If so, you can
+  e.g., `./tools/test-js-with-puppeteer compose.ts`? If so, you can
   iteratively debug to see the failure.
 - Does the test fail nondeterministically? If so, the problem is
   likely that a `waitForSelector` statement is either missing or not
@@ -112,7 +112,7 @@ These tools/features are often useful when debugging:
   failures.
 - TODO: Document any other techniques/ideas that were helpful when porting
   the Casper suite.
-- The Zulip server powering these tests is just `run-dev.py` with some
+- The Zulip server powering these tests is just `run-dev` with some
   extra [Django settings](../subsystems/settings.md) from
   `zproject/test_extra_settings.py` to configure an isolated database
   so that the tests will not interfere/interact with a normal
@@ -123,7 +123,7 @@ These tools/features are often useful when debugging:
 See also [Puppeteer upstream's debugging
 tips](https://github.com/puppeteer/puppeteer#debugging-tips); some
 tips may require temporary patches to functions like `run_test` or
-`ensure_browser` in `frontend_tests/puppeteer_lib/common.js`.
+`ensure_browser` in `web/e2e-tests/lib/common.ts`.
 
 ## Writing Puppeteer tests
 
@@ -141,7 +141,7 @@ notes above:
   `main`.
 - With black-box browser tests like these, it's very important to write your code
   to wait for browser's UI to update before taking any action that
-  assumes the last step was processed by the browser (E.g. after you
+  assumes the last step was processed by the browser (e.g., after you
   click on a user's avatar, you need an explicit wait for the profile
   popover to appear before you can try to click on a menu item in that
   popover). This means that before essentially every action in your

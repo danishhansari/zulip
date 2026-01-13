@@ -12,9 +12,14 @@ asking-great-questions
 design-discussions
 commit-discipline
 code-style
-reviewable-prs
 code-reviewing
+reviewable-prs
+review-process
+continuing-unfinished-work
 zulipbot-usage
-bug-reports
+reporting-bugs
+reporting-security-vulnerabilities
+suggesting-features
+counting-contributions
 licensing
 ```

@@ -20,7 +20,7 @@ tests, use Django's tooling.
 Zulip's [directory structure](../overview/directory-structure.md)
 will also be helpful to review when creating a new feature. Many
 aspects of the structure will be familiar to Django developers. Visit
-[Django's documentation](https://docs.djangoproject.com/en/3.2/#index-first-steps)
+[Django's documentation](https://docs.djangoproject.com/en/5.0/#index-first-steps)
 for more information about how Django projects are typically
 organized. And finally, the
 [message sending](../subsystems/sending-messages.md) documentation on
@@ -35,7 +35,7 @@ organization in Zulip). The following files are involved in the process:
 
 **Backend**
 
-- `zerver/models.py`: Defines the database model.
+- `zerver/models/realms.py`: Defines the database model.
 - `zerver/views/realm.py`: The view function that implements the API endpoint
   for editing realm objects.
 - `zerver/actions/realm_settings.py`: Contains code for updating and interacting with the database.
@@ -44,11 +44,11 @@ organization in Zulip). The following files are involved in the process:
 
 **Frontend**
 
-- `static/templates/settings/organization_permissions_admin.hbs`: defines
+- `web/templates/settings/organization_permissions_admin.hbs`: defines
   the structure of the admin permissions page (checkboxes for each organization
   permission setting).
-- `static/js/settings_org.js`: handles organization setting form submission.
-- `static/js/server_events_dispatch.js`: handles events coming from the server
+- `web/src/settings_org.ts`: handles organization setting form submission.
+- `web/src/server_events_dispatch.js`: handles events coming from the server
   (ex: pushing an organization change to other open browsers and updating
   the application's state).
 
@@ -60,20 +60,20 @@ organization in Zulip). The following files are involved in the process:
 
 **Frontend testing**
 
-- `frontend_tests/puppeteer_tests/admin.ts`: end-to-end tests for the organization
+- `web/e2e-tests/admin.test.ts`: end-to-end tests for the organization
   admin settings pages.
-- `frontend_tests/node_tests/dispatch.js`
+- `web/tests/dispatch.test.cjs`
 
 **Documentation**
 
 - `zerver/openapi/zulip.yaml`: OpenAPI definitions for the Zulip REST API.
 - `api_docs/changelog.md`: documentation listing all changes to the Zulip Server API.
-- `help/...`: end user facing documentation (Help Center) for the application.
+- `help/...`: end user facing documentation (help center) for the application.
 
 ### Adding a field to the database
 
 **Update the model:** The server accesses the underlying database in
-`zerver/models.py`. Add a new field in the appropriate class.
+`zerver/models/realms.py`. Add a new field in the appropriate class.
 
 **Create and run the migration:** To create and apply a migration, run the
 following commands:
@@ -83,14 +83,13 @@ following commands:
 ./manage.py migrate
 ```
 
-You can read our
+It's highly recommended to read our
 [database migration documentation](../subsystems/schema-migrations.md)
 to learn more about creating and applying database migrations.
 
-**Test your changes:** Once you've run the migration, flush memcached
-on your development server (`./scripts/setup/flush-memcached`) and then
-[restart the development server](../development/remote.md#running-the-development-server)
-to avoid interacting with cached objects.
+**Test your changes:** Once you've run the migration, [restart the
+development
+server](../development/remote.md#running-the-development-server).
 
 ### Backend changes
 
@@ -118,23 +117,23 @@ includes both views that serve HTML (new pages on Zulip) as well as new
 API endpoints that serve JSON-formatted data.
 
 **Testing:** At the very least, add a test of your event data flowing
-through the system in `test_events.py` and an API test (e.g. for a
+through the system in `test_events.py` and an API test (e.g., for a
 Realm setting, in `test_realm.py`).
 
 ### Frontend changes
 
 **JavaScript/TypeScript:** Zulip's JavaScript and TypeScript sources are
-located in the directory `static/js/`. The exact files you may need to change
+located in the directory `web/src/`. The exact files you may need to change
 depend on your feature. If you've added a new event that is sent to clients,
-be sure to add a handler for it in `static/js/server_events_dispatch.js`.
+be sure to add a handler for it in `web/src/server_events_dispatch.js`.
 
-**CSS:** The primary CSS file is `static/styles/zulip.css`. If your new
+**CSS:** The primary CSS file is `web/styles/zulip.css`. If your new
 feature requires UI changes, you may need to add additional CSS to this
 file.
 
 **Templates:** The initial page structure is rendered via Jinja2
 templates located in `templates/zerver/app`. For JavaScript, Zulip uses
-Handlebars templates located in `static/templates`. Templates are
+Handlebars templates located in `web/templates`. Templates are
 precompiled as part of the build/deploy process.
 
 Zulip is fully internationalized, so when writing both HTML templates
@@ -144,8 +143,8 @@ or JavaScript/TypeScript/Python code that generates user-facing strings, be sure
 **Testing:** There are two types of frontend tests: node-based unit
 tests and blackbox end-to-end tests. The blackbox tests are run in a
 headless Chromium browser using Puppeteer and are located in
-`frontend_tests/puppeteer_tests/`. The unit tests use Node's `assert`
-module are located in `frontend_tests/node_tests/`. For more
+`web/e2e-tests/`. The unit tests use Node's `assert`
+module are located in `web/tests/`. For more
 information on writing and running tests, see the
 [testing documentation](../testing/testing.md).
 
@@ -172,7 +171,7 @@ guide to adding or updating documentation for an API endpoint.
 ## Example feature
 
 This example describes the process of adding a new setting to Zulip: a
-flag that allows an admin to require topics on stream messages (the default
+flag that allows an admin to require topics on channel messages (the default
 behavior is that topics can have no subject). This flag is an
 actual Zulip feature. You can review [the original commit](https://github.com/zulip/zulip/pull/5660/commits/aeeb81d3ff0e0cc201e891cec07e1d2cd0a2060d)
 in the Zulip repo. (This commit displays the work of setting up a checkbox
@@ -185,10 +184,10 @@ task of requiring messages to have a topic, you can [view this commit](https://g
 
 First, update the database and model to store the new setting. Add a new
 boolean field, `mandatory_topics`, to the Realm model in
-`zerver/models.py`.
+`zerver/models/realms.py`.
 
 ```diff
- # zerver/models.py
+ # zerver/models/realms.py
 
  class Realm(models.Model):
      # ...
@@ -205,7 +204,7 @@ is the field's type. Add the new field to the `property_types`
 dictionary.
 
 ```diff
- # zerver/models.py
+ # zerver/models/realms.py
 
  class Realm(models.Model)
      # ...
@@ -241,14 +240,12 @@ Create the migration file using the Django `makemigrations` command:
 (NNNN is a number that is equal to the number of migrations.)
 
 If you run into problems, the
-[Django migration documentation](https://docs.djangoproject.com/en/3.2/topics/migrations/)
+[Django migration documentation](https://docs.djangoproject.com/en/5.0/topics/migrations/)
 is helpful.
 
 ### Test your migration changes
 
-Apply the migration using Django's `migrate` command: `./manage.py migrate`.
-
-Output:
+Apply the migration using Django's `migrate` command, `./manage.py migrate`:
 
 ```console
 shell $ ./manage.py migrate
@@ -264,9 +261,8 @@ Running migrations:
   Applying zerver.NNNN_realm_mandatory_topics... OK
 ```
 
-Once you've run the migration, restart memcached on your development
-server (`/etc/init.d/memcached restart`) and then [restart the development server](../development/remote.md#running-the-development-server)
-to avoid interacting with cached objects.
+Once you've run the migration, [restart the development
+server](../development/remote.md#running-the-development-server).
 
 ### Handle database interactions
 
@@ -281,11 +277,13 @@ first contacts the server, the server sends the client its
 initial state. Subsequently, clients subscribe to "events," which can
 (among other things) indicate that settings have changed.
 
-For the backend piece, we will need our action to make a call to `send_event`
-to send the event to clients that are active. We will also need to
-modify `fetch_initial_state_data` so that the new field is passed to
-clients. See [our event system docs](../subsystems/events-system.md) for all the
-gory details.
+For the backend piece, we will need our action to make a call to
+`send_event_on_commit` to send the event to clients that are active
+(The event is only sent after the current database transaction
+commits, hence the name). We will also need to modify
+`fetch_initial_state_data` so that the new field is passed to
+clients. See [our event system docs](../subsystems/events-system.md)
+for all the gory details.
 
 Anyway, getting back to implementation details...
 
@@ -303,10 +301,10 @@ help catch coding mistakes, not to check for bad user input.
 
 After updating the given realm field, `do_set_realm_property` creates
 an 'update' event with the name of the property and the new value. It
-then calls `send_event`, passing the event and the list of users whose
+then calls `send_event_on_commit`, passing the event and the list of users whose
 browser sessions should be notified as the second argument. The latter
 argument can be a single user (if the setting is a personal one, like
-time display format), members in a particular stream only or all
+time display format), members in a particular channel only or all
 active users in a realm.
 
 ```python
@@ -316,7 +314,7 @@ def do_set_realm_property(
     realm: Realm, name: str, value: Any, *, acting_user: Optional[UserProfile]
 ) -> None:
     """Takes in a realm object, the name of an attribute to update, the
-       value to update and and the user who initiated the update.
+       value to update and the user who initiated the update.
     """
     property_type = Realm.property_types[name]
     assert isinstance(value, property_type), (
@@ -331,7 +329,7 @@ def do_set_realm_property(
         property=name,
         value=value,
     )
-    send_event(realm, event, active_user_ids(realm))
+    send_event_on_commit(realm, event, active_user_ids(realm))
 ```
 
 If the new realm property being added does not fit into the
@@ -340,12 +338,12 @@ field), you'll need to create a new function to explicitly update this
 field and send an event. For example:
 
 ```python
-# zerver/actions/realm_settings.p
+# zerver/actions/realm_settings.py
 
 def do_set_realm_authentication_methods(
     realm: Realm, authentication_methods: Dict[str, bool], *, acting_user: Optional[UserProfile]
 ) -> None:
-    for key, value in list(authentication_methods.items()):
+    for key, value in authentication_methods.items():
         index = getattr(realm.authentication_methods, key).number
         realm.authentication_methods.set_bit(index, int(value))
     realm.save(update_fields=['authentication_methods'])
@@ -355,7 +353,7 @@ def do_set_realm_authentication_methods(
         property='default',
         data=dict(authentication_methods=realm.authentication_methods_dict())
     )
-    send_event(realm, event, active_user_ids(realm))
+    send_event_on_commit(realm, event, active_user_ids(realm))
 ```
 
 ### Update application state
@@ -437,12 +435,14 @@ annotation).
 ```diff
  # zerver/views/realm.py
 
+ @typed_endpoint
  def update_realm(
      request: HttpRequest,
      user_profile: UserProfile,
-     name: Optional[str] = REQ(str_validator=check_string, default=None),
+     *,
+     name: str | None,
      # ...
-+    mandatory_topics: Optional[bool] = REQ(json_validator=check_bool, default=None),
++    mandatory_topics: Json[bool] | None = None,
      # ...
  ):
      # ...
@@ -510,7 +510,7 @@ framework is `do_set_realm_property_test`, and in `test_realm.py`, it is
 `do_test_realm_update_api`.
 
 One still needs to add a test for whether the setting actually
-controls the feature it is supposed to control, however (e.g. for this
+controls the feature it is supposed to control, however (e.g., for this
 example feature, whether sending a message without a topic fails with
 the setting enabled).
 
@@ -532,7 +532,7 @@ to server when a realm is updated) and the change event needs to be
 handled on the client.
 
 To add the checkbox to the admin page, modify the relevant template in
-`static/templates/settings/`, which can be
+`web/templates/settings/`, which can be
 `organization_permissions_admin.hbs` or `organization_settings_admin.hbs`
 (omitted here since it is relatively straightforward).
 
@@ -540,23 +540,23 @@ If you're adding a non-checkbox field, you'll need to specify the type
 of the field via the `data-setting-widget-type` attribute in the HTML
 template.
 
-Then add the new form control in `static/js/admin.js`.
+Then add the new form control in `web/src/admin.ts`.
 
 ```diff
- // static/js/admin.js
+ // web/src/admin.ts
 
  export function build_page() {
      const options = {
-         custom_profile_field_types: page_params.custom_profile_field_types,
-         full_name: page_params.full_name,
-         realm_name: page_params.realm_name,
+         custom_profile_field_types: realm.custom_profile_field_types,
+         full_name: current_user.full_name,
+         realm_name: realm.realm_name,
          // ...
-+        realm_mandatory_topics: page_params.mandatory_topics,
++        realm_mandatory_topics: realm.realm_mandatory_topics,
          // ...
 ```
 
 The JavaScript code for organization settings and permissions can be found in
-`static/js/settings_org.js`.
+`web/src/settings_org.ts`.
 
 In frontend, we have split the `property_types` into three objects:
 
@@ -572,12 +572,12 @@ In frontend, we have split the `property_types` into three objects:
 - `org_permissions`: This contains properties for the "organization
   permissions" section. These properties control security controls
   like who can join the organization and whether normal users can
-  create streams or upload custom emoji.
+  create channels or upload custom emoji.
 
 Once you've determined whether the new setting belongs, the next step
 is to find the right subsection of that page to put the setting
 in. For example in this case of `mandatory_topics` it will lie in
-"Other settings" (`other_settings`) subsection.
+"Compose settings" (`org-compose-settings`) subsection.
 
 _If you're not sure in which section your feature belongs, it's
 better to discuss it in
@@ -616,7 +616,7 @@ setting has changed, your function should be referenced in the
 `settings_emoji.update_custom_emoji_ui`.
 
 ```diff
- // static/js/server_events_dispatch.js
+ // web/src/server_events_dispatch.js
 
  function dispatch_normal_event(event) {
      switch (event.type) {
@@ -667,12 +667,12 @@ frontend tests: [node-based unit tests](../testing/testing-with-node.md) and
 [Puppeteer end-to-end tests](../testing/testing-with-puppeteer.md).
 
 At the minimum, if you created a new function to update UI in
-`settings_org.js`, you will need to mock that function in
-`frontend_tests/node_tests/dispatch.js`. Add the name of the UI
+`settings_org.ts`, you will need to mock that function in
+`web/tests/dispatch.test.cjs`. Add the name of the UI
 function you created to the following object with `noop` as the value:
 
 ```js
-// frontend_tests/node_tests/dispatch.js
+// web/tests/dispatch.test.cjs
 
 set_global('settings_org', {
     update_email_change_display: noop,

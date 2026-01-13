@@ -1,30 +1,34 @@
-from typing import List, Optional
+from typing import Annotated
 
 from django.http import HttpRequest, HttpResponse
 from django.utils.translation import gettext as _
+from pydantic import Json, NonNegativeInt
 
 from zerver.actions.message_flags import (
     do_mark_all_as_read,
     do_mark_stream_messages_as_read,
     do_update_message_flags,
 )
-from zerver.lib.exceptions import ErrorCode, JsonableError
+from zerver.lib.exceptions import JsonableError
 from zerver.lib.narrow import (
-    OptionalNarrowListT,
+    NarrowParameter,
     fetch_messages,
-    narrow_parameter,
     parse_anchor_value,
+    update_narrow_terms_containing_empty_topic_fallback_name,
 )
-from zerver.lib.request import REQ, RequestNotes, has_request_variables
-from zerver.lib.response import json_partial_success, json_success
+from zerver.lib.request import RequestNotes
+from zerver.lib.response import json_success
 from zerver.lib.streams import access_stream_by_id
-from zerver.lib.timeout import TimeoutExpiredError, timeout
-from zerver.lib.topic import user_message_exists_for_topic
-from zerver.lib.validator import check_bool, check_int, check_list, to_non_negative_int
+from zerver.lib.topic import maybe_rename_general_chat_to_empty_topic, user_message_exists_for_topic
+from zerver.lib.typed_endpoint import (
+    ApiParamConfig,
+    typed_endpoint,
+    typed_endpoint_without_parameters,
+)
 from zerver.models import UserActivity, UserProfile
 
 
-def get_latest_update_message_flag_activity(user_profile: UserProfile) -> Optional[UserActivity]:
+def get_latest_update_message_flag_activity(user_profile: UserProfile) -> UserActivity | None:
     return (
         UserActivity.objects.filter(
             user_profile=user_profile,
@@ -37,18 +41,21 @@ def get_latest_update_message_flag_activity(user_profile: UserProfile) -> Option
 
 # NOTE: If this function name is changed, add the new name to the
 # query in get_latest_update_message_flag_activity
-@has_request_variables
+@typed_endpoint
 def update_message_flags(
     request: HttpRequest,
     user_profile: UserProfile,
-    messages: List[int] = REQ(json_validator=check_list(check_int)),
-    operation: str = REQ("op"),
-    flag: str = REQ(),
+    *,
+    flag: str,
+    messages: Json[list[int]],
+    operation: Annotated[str, ApiParamConfig("op")],
 ) -> HttpResponse:
     request_notes = RequestNotes.get_notes(request)
     assert request_notes.log_data is not None
 
-    count = do_update_message_flags(user_profile, operation, flag, messages)
+    (count, ignored_because_not_subscribed_channels) = do_update_message_flags(
+        user_profile, operation, flag, messages
+    )
 
     target_count_str = str(len(messages))
     log_data_str = f"[{operation} {flag}/{target_count_str}] actually {count}"
@@ -58,6 +65,7 @@ def update_message_flags(
         request,
         data={
             "messages": messages,  # Useless, but included for backwards compatibility.
+            "ignored_because_not_subscribed_channels": ignored_because_not_subscribed_channels,
         },
     )
 
@@ -67,19 +75,20 @@ MAX_MESSAGES_PER_UPDATE = 5000
 
 # NOTE: If this function name is changed, add the new name to the
 # query in get_latest_update_message_flag_activity
-@has_request_variables
+@typed_endpoint
 def update_message_flags_for_narrow(
     request: HttpRequest,
     user_profile: UserProfile,
-    anchor_val: str = REQ("anchor"),
-    include_anchor: bool = REQ(json_validator=check_bool, default=True),
-    num_before: int = REQ(converter=to_non_negative_int),
-    num_after: int = REQ(converter=to_non_negative_int),
-    narrow: OptionalNarrowListT = REQ("narrow", converter=narrow_parameter),
-    operation: str = REQ("op"),
-    flag: str = REQ(),
+    *,
+    anchor_val: Annotated[str, ApiParamConfig("anchor")],
+    flag: str,
+    include_anchor: Json[bool] = True,
+    narrow: Json[list[NarrowParameter] | None],
+    num_after: Json[NonNegativeInt],
+    num_before: Json[NonNegativeInt],
+    operation: Annotated[str, ApiParamConfig("op")],
 ) -> HttpResponse:
-    anchor = parse_anchor_value(anchor_val, use_first_unread_anchor=False)
+    anchor_info = parse_anchor_value(anchor_val, use_first_unread_anchor=False)
 
     if num_before > 0 and num_after > 0 and not include_anchor:
         raise JsonableError(_("The anchor can only be excluded at an end of the range"))
@@ -90,19 +99,23 @@ def update_message_flags_for_narrow(
     )
     num_after = min(num_after, MAX_MESSAGES_PER_UPDATE - num_before)
 
+    narrow = update_narrow_terms_containing_empty_topic_fallback_name(narrow)
+
     query_info = fetch_messages(
         narrow=narrow,
         user_profile=user_profile,
         realm=user_profile.realm,
         is_web_public_query=False,
-        anchor=anchor,
+        anchor_info=anchor_info,
         include_anchor=include_anchor,
         num_before=num_before,
         num_after=num_after,
     )
 
     messages = [row[0] for row in query_info.rows]
-    updated_count = do_update_message_flags(user_profile, operation, flag, messages)
+    (updated_count, ignored_because_not_subscribed_channels) = do_update_message_flags(
+        user_profile, operation, flag, messages
+    )
 
     return json_success(
         request,
@@ -113,30 +126,30 @@ def update_message_flags_for_narrow(
             "last_processed_id": messages[-1] if messages else None,
             "found_oldest": query_info.found_oldest,
             "found_newest": query_info.found_newest,
+            "ignored_because_not_subscribed_channels": ignored_because_not_subscribed_channels,
         },
     )
 
 
-@has_request_variables
+@typed_endpoint_without_parameters
 def mark_all_as_read(request: HttpRequest, user_profile: UserProfile) -> HttpResponse:
     request_notes = RequestNotes.get_notes(request)
-    try:
-        count = timeout(50, lambda: do_mark_all_as_read(user_profile))
-    except TimeoutExpiredError:
-        return json_partial_success(request, data={"code": ErrorCode.REQUEST_TIMEOUT.name})
+    count = do_mark_all_as_read(user_profile, timeout=50)
+    if count is None:
+        return json_success(request, data={"complete": False})
 
     log_data_str = f"[{count} updated]"
     assert request_notes.log_data is not None
     request_notes.log_data["extra"] = log_data_str
 
-    return json_success(request)
+    return json_success(request, data={"complete": True})
 
 
-@has_request_variables
+@typed_endpoint
 def mark_stream_as_read(
-    request: HttpRequest, user_profile: UserProfile, stream_id: int = REQ(json_validator=check_int)
+    request: HttpRequest, user_profile: UserProfile, *, stream_id: Json[int]
 ) -> HttpResponse:
-    stream, sub = access_stream_by_id(user_profile, stream_id)
+    stream, _sub = access_stream_by_id(user_profile, stream_id)
     assert stream.recipient_id is not None
     count = do_mark_stream_messages_as_read(user_profile, stream.recipient_id)
 
@@ -148,17 +161,19 @@ def mark_stream_as_read(
     return json_success(request)
 
 
-@has_request_variables
+@typed_endpoint
 def mark_topic_as_read(
     request: HttpRequest,
     user_profile: UserProfile,
-    stream_id: int = REQ(json_validator=check_int),
-    topic_name: str = REQ(),
+    *,
+    topic_name: str,
+    stream_id: Json[int],
 ) -> HttpResponse:
-    stream, sub = access_stream_by_id(user_profile, stream_id)
+    stream, _sub = access_stream_by_id(user_profile, stream_id)
     assert stream.recipient_id is not None
 
     if topic_name:
+        topic_name = maybe_rename_general_chat_to_empty_topic(topic_name)
         topic_exists = user_message_exists_for_topic(
             user_profile=user_profile,
             recipient_id=stream.recipient_id,
@@ -166,7 +181,7 @@ def mark_topic_as_read(
         )
 
         if not topic_exists:
-            raise JsonableError(_("No such topic '{}'").format(topic_name))
+            raise JsonableError(_("No such topic '{topic}'").format(topic=topic_name))
 
     count = do_mark_stream_messages_as_read(user_profile, stream.recipient_id, topic_name)
 

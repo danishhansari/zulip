@@ -3,8 +3,8 @@ import os
 import random
 import shutil
 import unittest
-from functools import partial
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Type, Union
+from collections.abc import Callable, Iterable
+from typing import Any, TypeAlias
 from unittest import TestSuite, runner
 from unittest.result import TestResult
 
@@ -14,6 +14,7 @@ from django.db import ProgrammingError, connections
 from django.test import runner as django_runner
 from django.test.runner import DiscoverRunner
 from django.test.signals import template_rendered
+from typing_extensions import override
 
 from scripts.lib.zulip_tools import (
     TEMPLATE_DATABASE_DIR,
@@ -21,6 +22,7 @@ from scripts.lib.zulip_tools import (
     get_or_create_dev_uuid_var_path,
 )
 from zerver.lib import test_helpers
+from zerver.lib.partial import partial
 from zerver.lib.sqlalchemy_utils import get_sqlalchemy_connection
 from zerver.lib.test_fixtures import BACKEND_DATABASE_TEMPLATE
 from zerver.lib.test_helpers import append_instrumentation_data, write_instrumentation_reports
@@ -33,7 +35,7 @@ from zerver.lib.test_helpers import append_instrumentation_data, write_instrumen
 random_id_range_start = str(random.randint(1, 10000000))
 
 
-def get_database_id(worker_id: Optional[int] = None) -> str:
+def get_database_id(worker_id: int | None = None) -> str:
     if worker_id:
         return f"{random_id_range_start}_{worker_id}"
     return random_id_range_start
@@ -55,29 +57,34 @@ class TextTestResult(runner.TextTestResult):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.failed_tests: List[str] = []
+        self.failed_tests: list[str] = []
 
-    def addInstrumentation(self, test: unittest.TestCase, data: Dict[str, Any]) -> None:
+    def addInstrumentation(self, test: unittest.TestCase, data: dict[str, Any]) -> None:
         append_instrumentation_data(data)
 
+    @override
     def startTest(self, test: unittest.TestCase) -> None:
         TestResult.startTest(self, test)
         self.stream.write(f"Running {test.id()}\n")
         self.stream.flush()
 
+    @override
     def addSuccess(self, *args: Any, **kwargs: Any) -> None:
         TestResult.addSuccess(self, *args, **kwargs)
 
+    @override
     def addError(self, *args: Any, **kwargs: Any) -> None:
         TestResult.addError(self, *args, **kwargs)
         test_name = args[0].id()
         self.failed_tests.append(test_name)
 
+    @override
     def addFailure(self, *args: Any, **kwargs: Any) -> None:
         TestResult.addFailure(self, *args, **kwargs)
         test_name = args[0].id()
         self.failed_tests.append(test_name)
 
+    @override
     def addSkip(self, test: unittest.TestCase, reason: str) -> None:
         TestResult.addSkip(self, test, reason)
         self.stream.write(f"** Skipping {test.id()}: {reason}\n")
@@ -90,24 +97,23 @@ class RemoteTestResult(django_runner.RemoteTestResult):
     base class.
     """
 
-    def addInstrumentation(self, test: unittest.TestCase, data: Dict[str, Any]) -> None:
+    def addInstrumentation(self, test: unittest.TestCase, data: dict[str, Any]) -> None:
         # Some elements of data['info'] cannot be serialized.
-        if "info" in data:
-            del data["info"]
+        data.pop("info", None)
 
         self.events.append(("addInstrumentation", self.test_index, data))
 
 
-def process_instrumented_calls(func: Callable[[Dict[str, Any]], None]) -> None:
+def process_instrumented_calls(func: Callable[[dict[str, Any]], None]) -> None:
     for call in test_helpers.INSTRUMENTED_CALLS:
         func(call)
 
 
-SerializedSubsuite = Tuple[Type[TestSuite], List[str]]
-SubsuiteArgs = Tuple[Type["RemoteTestRunner"], int, SerializedSubsuite, bool, bool]
+SerializedSubsuite: TypeAlias = tuple[type[TestSuite], list[str]]
+SubsuiteArgs: TypeAlias = tuple[type["RemoteTestRunner"], int, SerializedSubsuite, bool, bool]
 
 
-def run_subsuite(args: SubsuiteArgs) -> Tuple[int, Any]:
+def run_subsuite(args: SubsuiteArgs) -> tuple[int, Any]:
     # Reset the accumulated INSTRUMENTED_CALLS before running this subsuite.
     test_helpers.INSTRUMENTED_CALLS = []
     # The first argument is the test runner class but we don't need it
@@ -124,7 +130,7 @@ def run_subsuite(args: SubsuiteArgs) -> Tuple[int, Any]:
     return subsuite_index, result.events
 
 
-def destroy_test_databases(worker_id: Optional[int] = None) -> None:
+def destroy_test_databases(worker_id: int | None = None) -> None:
     for alias in connections:
         connection = connections[alias]
 
@@ -175,11 +181,12 @@ def create_test_databases(worker_id: int) -> None:
 
 def init_worker(
     counter: "multiprocessing.sharedctypes.Synchronized[int]",
-    initial_settings: Optional[Dict[str, Any]] = None,
-    serialized_contents: Optional[Dict[str, str]] = None,
-    process_setup: Optional[Callable[..., None]] = None,
-    process_setup_args: Optional[Tuple[Any, ...]] = None,
-    debug_mode: Optional[bool] = None,
+    initial_settings: dict[str, Any] | None = None,
+    serialized_contents: dict[str, str] | None = None,
+    process_setup: Callable[..., None] | None = None,
+    process_setup_args: tuple[Any, ...] | None = None,
+    debug_mode: bool | None = None,
+    used_aliases: set[str] | None = None,
 ) -> None:
     """
     This function runs only under parallel mode. It initializes the
@@ -243,6 +250,14 @@ def initialize_worker_path(worker_id: int) -> None:
     settings.LOCAL_AVATARS_DIR = os.path.join(settings.LOCAL_UPLOADS_DIR, "avatars")
     settings.LOCAL_FILES_DIR = os.path.join(settings.LOCAL_UPLOADS_DIR, "files")
 
+    # Perform the import of upload_backend now, because the backend is
+    # chosen at import time; this prevents @use_s3_backend from
+    # effectively caching the backend
+    from zerver.lib.upload import upload_backend
+    from zerver.lib.upload.local import LocalUploadBackend
+
+    assert isinstance(upload_backend, LocalUploadBackend)
+
 
 class Runner(DiscoverRunner):
     parallel_test_suite = ParallelTestSuite
@@ -252,16 +267,17 @@ class Runner(DiscoverRunner):
 
         # `templates_rendered` holds templates which were rendered
         # in proper logical tests.
-        self.templates_rendered: Set[str] = set()
+        self.templates_rendered: set[str] = set()
         # `shallow_tested_templates` holds templates which were rendered
         # in `zerver.tests.test_templates`.
-        self.shallow_tested_templates: Set[str] = set()
+        self.shallow_tested_templates: set[str] = set()
         template_rendered.connect(self.on_template_rendered)
 
-    def get_resultclass(self) -> Optional[Type[TextTestResult]]:
+    @override
+    def get_resultclass(self) -> type[TextTestResult] | None:
         return TextTestResult
 
-    def on_template_rendered(self, sender: Any, context: Dict[str, Any], **kwargs: Any) -> None:
+    def on_template_rendered(self, sender: Any, context: dict[str, Any], **kwargs: Any) -> None:
         if hasattr(sender, "template"):
             template_name = sender.template.name
             if template_name not in self.templates_rendered:
@@ -271,9 +287,10 @@ class Runner(DiscoverRunner):
                     self.templates_rendered.add(template_name)
                     self.shallow_tested_templates.discard(template_name)
 
-    def get_shallow_tested_templates(self) -> Set[str]:
+    def get_shallow_tested_templates(self) -> set[str]:
         return self.shallow_tested_templates
 
+    @override
     def setup_test_environment(self, *args: Any, **kwargs: Any) -> Any:
         settings.DATABASES["default"]["NAME"] = BACKEND_DATABASE_TEMPLATE
         # We create/destroy the test databases in run_tests to avoid
@@ -285,8 +302,7 @@ class Runner(DiscoverRunner):
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w") as f:
             if self.parallel > 1:
-                for index in range(self.parallel):
-                    f.write(get_database_id(index + 1) + "\n")
+                f.writelines(get_database_id(index + 1) + "\n" for index in range(self.parallel))
             else:
                 f.write(get_database_id() + "\n")
 
@@ -297,6 +313,7 @@ class Runner(DiscoverRunner):
 
         return super().setup_test_environment(*args, **kwargs)
 
+    @override
     def teardown_test_environment(self, *args: Any, **kwargs: Any) -> Any:
         # The test environment setup clones the zulip_test_template
         # database, creating databases with names:
@@ -323,59 +340,38 @@ class Runner(DiscoverRunner):
             print("Unable to clean up the test run's directory.")
         return super().teardown_test_environment(*args, **kwargs)
 
-    def test_imports(
-        self, test_labels: List[str], suite: Union[TestSuite, ParallelTestSuite]
-    ) -> None:
-        prefix_old = "unittest.loader.ModuleImportFailure."  # Python <= 3.4
-        prefix_new = "unittest.loader._FailedTest."  # Python > 3.4
-        error_prefixes = [prefix_old, prefix_new]
+    def test_imports(self, test_labels: list[str], suite: TestSuite | ParallelTestSuite) -> None:
+        prefix = "unittest.loader._FailedTest."
         for test_name in get_test_names(suite):
-            for prefix in error_prefixes:
-                if test_name.startswith(prefix):
-                    test_name = test_name[len(prefix) :]
-                    for label in test_labels:
-                        # This code block is for Python 3.5 when test label is
-                        # directly provided, for example:
-                        # ./tools/test-backend zerver.tests.test_alert_words.py
-                        #
-                        # In this case, the test name is of this form:
-                        # 'unittest.loader._FailedTest.test_alert_words'
-                        #
-                        # Whereas check_import_error requires test names of
-                        # this form:
-                        # 'unittest.loader._FailedTest.zerver.tests.test_alert_words'.
-                        if test_name in label:
-                            test_name = label
-                            break
-                    check_import_error(test_name)
+            if test_name.startswith(prefix):
+                test_name = test_name.removeprefix(prefix)
+                for label in test_labels:
+                    # This code block is for when a test label is
+                    # directly provided, for example:
+                    # ./tools/test-backend zerver.tests.test_alert_words.py
+                    #
+                    # In this case, the test name is of this form:
+                    # 'unittest.loader._FailedTest.test_alert_words'
+                    #
+                    # Whereas check_import_error requires test names of
+                    # this form:
+                    # 'unittest.loader._FailedTest.zerver.tests.test_alert_words'.
+                    if test_name in label:
+                        test_name = label
+                        break
+                check_import_error(test_name)
 
+    @override
     def run_tests(
         self,
-        test_labels: List[str],
-        extra_tests: Optional[List[unittest.TestCase]] = None,
-        failed_tests_path: Optional[str] = None,
+        test_labels: list[str],
+        failed_tests_path: str | None = None,
         full_suite: bool = False,
         include_webhooks: bool = False,
         **kwargs: Any,
     ) -> int:
         self.setup_test_environment()
-        try:
-            suite = self.build_suite(test_labels, extra_tests)
-        except AttributeError:
-            # We are likely to get here only when running tests in serial
-            # mode on Python 3.4 or lower.
-            # test_labels are always normalized to include the correct prefix.
-            # If we run the command with ./tools/test-backend test_alert_words,
-            # test_labels will be equal to ['zerver.tests.test_alert_words'].
-            for test_label in test_labels:
-                check_import_error(test_label)
-
-            # I think we won't reach this line under normal circumstances, but
-            # for some unforeseen scenario in which the AttributeError was not
-            # caused by an import error, let's re-raise the exception for
-            # debugging purposes.
-            raise
-
+        suite = self.build_suite(test_labels)
         self.test_imports(test_labels, suite)
         if self.parallel == 1:
             # We are running in serial mode so create the databases here.
@@ -405,7 +401,7 @@ class Runner(DiscoverRunner):
         return failed
 
 
-def get_test_names(suite: Union[TestSuite, ParallelTestSuite]) -> List[str]:
+def get_test_names(suite: TestSuite | ParallelTestSuite) -> list[str]:
     if isinstance(suite, ParallelTestSuite):
         return [name for subsuite in suite.subsuites for name in get_test_names(subsuite)]
     else:

@@ -1,19 +1,21 @@
 from unittest.mock import patch
 
 import orjson
+from django.test.utils import override_settings
+from typing_extensions import override
 
 from zerver.lib.bot_lib import EmbeddedBotQuitError
+from zerver.lib.display_recipient import get_display_recipient
 from zerver.lib.test_classes import ZulipTestCase
-from zerver.models import (
-    UserProfile,
-    get_display_recipient,
-    get_realm,
-    get_service_profile,
-    get_user,
-)
+from zerver.models import UserProfile
+from zerver.models.bots import get_service_profile
+from zerver.models.realms import get_realm
+from zerver.models.recipients import get_or_create_direct_message_group
+from zerver.models.users import get_user
 
 
 class TestEmbeddedBotMessaging(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.user_profile = self.example_user("othello")
@@ -37,6 +39,27 @@ class TestEmbeddedBotMessaging(ZulipTestCase):
         self.assert_length(display_recipient, 1)
         self.assertEqual(display_recipient[0]["email"], self.user_profile.email)
 
+    @override_settings(PREFER_DIRECT_MESSAGE_GROUP=True)
+    def test_pm_to_embedded_bot_using_direct_group_message(self) -> None:
+        assert self.bot_profile is not None
+
+        direct_group_message = get_or_create_direct_message_group(
+            id_list=[self.user_profile.id, self.bot_profile.id]
+        )
+
+        self.send_personal_message(self.user_profile, self.bot_profile, content="help")
+
+        last_message = self.get_last_message()
+        self.assertEqual(last_message.content, "beep boop")
+        self.assertEqual(last_message.sender_id, self.bot_profile.id)
+        self.assertEqual(last_message.recipient, direct_group_message.recipient)
+
+        display_recipient = get_display_recipient(last_message.recipient)
+        assert isinstance(display_recipient, list)
+        self.assert_length(display_recipient, 2)
+        self.assertEqual(display_recipient[0]["email"], self.user_profile.email)
+        self.assertEqual(display_recipient[1]["email"], self.bot_profile.email)
+
     def test_stream_message_to_embedded_bot(self) -> None:
         assert self.bot_profile is not None
         self.send_stream_message(
@@ -49,8 +72,7 @@ class TestEmbeddedBotMessaging(ZulipTestCase):
         self.assertEqual(last_message.content, "beep boop")
         self.assertEqual(last_message.sender_id, self.bot_profile.id)
         self.assertEqual(last_message.topic_name(), "bar")
-        display_recipient = get_display_recipient(last_message.recipient)
-        self.assertEqual(display_recipient, "Denmark")
+        self.assert_message_stream_name(last_message, "Denmark")
 
     def test_stream_message_not_to_embedded_bot(self) -> None:
         self.send_stream_message(self.user_profile, "Denmark", content="foo", topic_name="bar")
@@ -73,18 +95,20 @@ class TestEmbeddedBotMessaging(ZulipTestCase):
 
     def test_embedded_bot_quit_exception(self) -> None:
         assert self.bot_profile is not None
-        with patch(
-            "zulip_bots.bots.helloworld.helloworld.HelloWorldHandler.handle_message",
-            side_effect=EmbeddedBotQuitError("I'm quitting!"),
+        with (
+            patch(
+                "zulip_bots.bots.helloworld.helloworld.HelloWorldHandler.handle_message",
+                side_effect=EmbeddedBotQuitError("I'm quitting!"),
+            ),
+            self.assertLogs(level="WARNING") as m,
         ):
-            with self.assertLogs(level="WARNING") as m:
-                self.send_stream_message(
-                    self.user_profile,
-                    "Denmark",
-                    content=f"@**{self.bot_profile.full_name}** foo",
-                    topic_name="bar",
-                )
-                self.assertEqual(m.output, ["WARNING:root:I'm quitting!"])
+            self.send_stream_message(
+                self.user_profile,
+                "Denmark",
+                content=f"@**{self.bot_profile.full_name}** foo",
+                topic_name="bar",
+            )
+            self.assertEqual(m.output, ["WARNING:root:I'm quitting!"])
 
 
 class TestEmbeddedBotFailures(ZulipTestCase):

@@ -1,11 +1,13 @@
+from collections.abc import Callable
 from functools import wraps
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Concatenate
 from unittest import mock
 
 import orjson
+import responses
 from django.conf import settings
 from django.test import override_settings
-from typing_extensions import Concatenate, ParamSpec
+from typing_extensions import ParamSpec, override
 
 from zerver.actions.create_user import do_create_user
 from zerver.actions.message_send import get_service_bot_events
@@ -15,7 +17,10 @@ from zerver.lib.bot_storage import StateError
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.test_helpers import mock_queue_publish
 from zerver.lib.validator import check_string
-from zerver.models import Recipient, UserProfile, get_realm
+from zerver.models import Recipient, UserProfile
+from zerver.models.messages import UserMessage
+from zerver.models.realms import get_realm
+from zerver.models.scheduled_jobs import NotificationTriggers
 
 BOT_TYPE_TO_QUEUE_NAME = {
     UserProfile.OUTGOING_WEBHOOK_BOT: "outgoing_webhooks",
@@ -56,7 +61,7 @@ class TestServiceBotBasics(ZulipTestCase):
 
         expected = dict(
             outgoing_webhooks=[
-                dict(trigger="private_message", user_profile_id=outgoing_bot.id),
+                dict(trigger=NotificationTriggers.DIRECT_MESSAGE, user_profile_id=outgoing_bot.id),
             ],
         )
 
@@ -171,6 +176,7 @@ class TestServiceBotBasics(ZulipTestCase):
 
 
 class TestServiceBotStateHandler(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.user_profile = self.example_user("othello")
@@ -296,7 +302,7 @@ class TestServiceBotStateHandler(ZulipTestCase):
             "keys": ["This is a list, but should be a serialized string."],
         }
         result = self.client_get("/json/bot_storage", invalid_params)
-        self.assert_json_error(result, 'Argument "keys" is not valid JSON.')
+        self.assert_json_error(result, "keys is not valid JSON")
 
         params = {
             "keys": orjson.dumps(["key 1", "nonexistent key"]).decode(),
@@ -308,7 +314,7 @@ class TestServiceBotStateHandler(ZulipTestCase):
             "storage": orjson.dumps({"foo": [1, 2, 3]}).decode(),
         }
         result = self.client_put("/json/bot_storage", params)
-        self.assert_json_error(result, "storage contains a value that is not a string")
+        self.assert_json_error(result, 'storage["foo"] is not a string')
 
         # Remove some entries.
         keys_to_remove = ["key 1", "key 2"]
@@ -348,6 +354,7 @@ class TestServiceBotStateHandler(ZulipTestCase):
 
 
 class TestServiceBotConfigHandler(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.user_profile = self.example_user("othello")
@@ -418,7 +425,7 @@ ParamT = ParamSpec("ParamT")
 
 
 def for_all_bot_types(
-    test_func: Callable[Concatenate["TestServiceBotEventTriggers", ParamT], None]
+    test_func: Callable[Concatenate["TestServiceBotEventTriggers", ParamT], None],
 ) -> Callable[Concatenate["TestServiceBotEventTriggers", ParamT], None]:
     @wraps(test_func)
     def _wrapped(
@@ -439,7 +446,7 @@ def patch_queue_publish(
     Callable[["TestServiceBotEventTriggers"], None],
 ]:
     def inner(
-        func: Callable[["TestServiceBotEventTriggers", mock.Mock], None]
+        func: Callable[["TestServiceBotEventTriggers", mock.Mock], None],
     ) -> Callable[["TestServiceBotEventTriggers"], None]:
         @wraps(func)
         def _wrapped(self: "TestServiceBotEventTriggers") -> None:
@@ -452,6 +459,7 @@ def patch_queue_publish(
 
 
 class TestServiceBotEventTriggers(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.user_profile = self.example_user("othello")
@@ -475,65 +483,67 @@ class TestServiceBotEventTriggers(ZulipTestCase):
         )
 
     @for_all_bot_types
-    @patch_queue_publish("zerver.actions.message_send.queue_json_publish")
-    def test_trigger_on_stream_mention_from_user(self, mock_queue_json_publish: mock.Mock) -> None:
+    @patch_queue_publish("zerver.actions.message_send.queue_event_on_commit")
+    def test_trigger_on_stream_mention_from_user(
+        self, mock_queue_event_on_commit: mock.Mock
+    ) -> None:
         content = "@**FooBot** foo bar!!!"
         recipient = "Denmark"
         trigger = "mention"
-        message_type = Recipient._type_names[Recipient.STREAM]
+        recipient_type = "stream"
 
         def check_values_passed(
             queue_name: Any,
-            trigger_event: Dict[str, Any],
-            processor: Optional[Callable[[Any], None]] = None,
+            trigger_event: dict[str, Any],
+            processor: Callable[[Any], None] | None = None,
         ) -> None:
             assert self.bot_profile.bot_type
             self.assertEqual(queue_name, BOT_TYPE_TO_QUEUE_NAME[self.bot_profile.bot_type])
             self.assertEqual(trigger_event["message"]["content"], content)
             self.assertEqual(trigger_event["message"]["display_recipient"], recipient)
             self.assertEqual(trigger_event["message"]["sender_email"], self.user_profile.email)
-            self.assertEqual(trigger_event["message"]["type"], message_type)
+            self.assertEqual(trigger_event["message"]["type"], recipient_type)
             self.assertEqual(trigger_event["trigger"], trigger)
             self.assertEqual(trigger_event["user_profile_id"], self.bot_profile.id)
 
-        mock_queue_json_publish.side_effect = check_values_passed
+        mock_queue_event_on_commit.side_effect = check_values_passed
 
         self.send_stream_message(self.user_profile, "Denmark", content)
-        self.assertTrue(mock_queue_json_publish.called)
+        self.assertTrue(mock_queue_event_on_commit.called)
 
-    @patch_queue_publish("zerver.actions.message_send.queue_json_publish")
+    @patch_queue_publish("zerver.actions.message_send.queue_event_on_commit")
     def test_no_trigger_on_stream_message_without_mention(
-        self, mock_queue_json_publish: mock.Mock
+        self, mock_queue_event_on_commit: mock.Mock
     ) -> None:
         sender = self.user_profile
         self.send_stream_message(sender, "Denmark")
-        self.assertFalse(mock_queue_json_publish.called)
+        self.assertFalse(mock_queue_event_on_commit.called)
 
     @for_all_bot_types
-    @patch_queue_publish("zerver.actions.message_send.queue_json_publish")
+    @patch_queue_publish("zerver.actions.message_send.queue_event_on_commit")
     def test_no_trigger_on_stream_mention_from_bot(
-        self, mock_queue_json_publish: mock.Mock
+        self, mock_queue_event_on_commit: mock.Mock
     ) -> None:
         self.send_stream_message(self.second_bot_profile, "Denmark", "@**FooBot** foo bar!!!")
-        self.assertFalse(mock_queue_json_publish.called)
+        self.assertFalse(mock_queue_event_on_commit.called)
 
     @for_all_bot_types
-    @patch_queue_publish("zerver.actions.message_send.queue_json_publish")
+    @patch_queue_publish("zerver.actions.message_send.queue_event_on_commit")
     def test_trigger_on_personal_message_from_user(
-        self, mock_queue_json_publish: mock.Mock
+        self, mock_queue_event_on_commit: mock.Mock
     ) -> None:
         sender = self.user_profile
         recipient = self.bot_profile
 
         def check_values_passed(
             queue_name: Any,
-            trigger_event: Dict[str, Any],
-            processor: Optional[Callable[[Any], None]] = None,
+            trigger_event: dict[str, Any],
+            processor: Callable[[Any], None] | None = None,
         ) -> None:
             assert self.bot_profile.bot_type
             self.assertEqual(queue_name, BOT_TYPE_TO_QUEUE_NAME[self.bot_profile.bot_type])
             self.assertEqual(trigger_event["user_profile_id"], self.bot_profile.id)
-            self.assertEqual(trigger_event["trigger"], "private_message")
+            self.assertEqual(trigger_event["trigger"], NotificationTriggers.DIRECT_MESSAGE)
             self.assertEqual(trigger_event["message"]["sender_email"], sender.email)
             display_recipients = [
                 trigger_event["message"]["display_recipient"][0]["email"],
@@ -542,24 +552,26 @@ class TestServiceBotEventTriggers(ZulipTestCase):
             self.assertTrue(sender.email in display_recipients)
             self.assertTrue(recipient.email in display_recipients)
 
-        mock_queue_json_publish.side_effect = check_values_passed
+        mock_queue_event_on_commit.side_effect = check_values_passed
 
         self.send_personal_message(sender, recipient, "test")
-        self.assertTrue(mock_queue_json_publish.called)
+        self.assertTrue(mock_queue_event_on_commit.called)
 
     @for_all_bot_types
-    @patch_queue_publish("zerver.actions.message_send.queue_json_publish")
+    @patch_queue_publish("zerver.actions.message_send.queue_event_on_commit")
     def test_no_trigger_on_personal_message_from_bot(
-        self, mock_queue_json_publish: mock.Mock
+        self, mock_queue_event_on_commit: mock.Mock
     ) -> None:
         sender = self.second_bot_profile
         recipient = self.bot_profile
         self.send_personal_message(sender, recipient)
-        self.assertFalse(mock_queue_json_publish.called)
+        self.assertFalse(mock_queue_event_on_commit.called)
 
     @for_all_bot_types
-    @patch_queue_publish("zerver.actions.message_send.queue_json_publish")
-    def test_trigger_on_huddle_message_from_user(self, mock_queue_json_publish: mock.Mock) -> None:
+    @patch_queue_publish("zerver.actions.message_send.queue_event_on_commit")
+    def test_trigger_on_group_direct_message_from_user(
+        self, mock_queue_event_on_commit: mock.Mock
+    ) -> None:
         self.second_bot_profile.bot_type = self.bot_profile.bot_type
         self.second_bot_profile.save()
 
@@ -569,28 +581,51 @@ class TestServiceBotEventTriggers(ZulipTestCase):
 
         def check_values_passed(
             queue_name: Any,
-            trigger_event: Dict[str, Any],
-            processor: Optional[Callable[[Any], None]] = None,
+            trigger_event: dict[str, Any],
+            processor: Callable[[Any], None] | None = None,
         ) -> None:
             assert self.bot_profile.bot_type
             self.assertEqual(queue_name, BOT_TYPE_TO_QUEUE_NAME[self.bot_profile.bot_type])
             self.assertIn(trigger_event["user_profile_id"], profile_ids)
             profile_ids.remove(trigger_event["user_profile_id"])
-            self.assertEqual(trigger_event["trigger"], "private_message")
+            self.assertEqual(trigger_event["trigger"], NotificationTriggers.DIRECT_MESSAGE)
             self.assertEqual(trigger_event["message"]["sender_email"], sender.email)
             self.assertEqual(trigger_event["message"]["type"], "private")
 
-        mock_queue_json_publish.side_effect = check_values_passed
+        mock_queue_event_on_commit.side_effect = check_values_passed
 
-        self.send_huddle_message(sender, recipients, "test")
-        self.assertEqual(mock_queue_json_publish.call_count, 2)
+        self.send_group_direct_message(sender, recipients, "test")
+        self.assertEqual(mock_queue_event_on_commit.call_count, 2)
 
     @for_all_bot_types
-    @patch_queue_publish("zerver.actions.message_send.queue_json_publish")
-    def test_no_trigger_on_huddle_message_from_bot(
-        self, mock_queue_json_publish: mock.Mock
+    @patch_queue_publish("zerver.actions.message_send.queue_event_on_commit")
+    def test_no_trigger_on_group_direct_message_from_bot(
+        self, mock_queue_event_on_commit: mock.Mock
     ) -> None:
         sender = self.second_bot_profile
         recipients = [self.user_profile, self.bot_profile]
-        self.send_huddle_message(sender, recipients)
-        self.assertFalse(mock_queue_json_publish.called)
+        self.send_group_direct_message(sender, recipients)
+        self.assertFalse(mock_queue_event_on_commit.called)
+
+    @responses.activate
+    @for_all_bot_types
+    def test_flag_messages_service_bots_has_processed(self) -> None:
+        """
+        Verifies that once an event has been processed by the service bot's
+        queue processor, the message is marked as processed (flagged with `read`).
+        """
+        sender = self.user_profile
+        recipients = [self.user_profile, self.bot_profile, self.second_bot_profile]
+        responses.add(
+            responses.POST,
+            "https://bot.example.com/",
+            json="",
+        )
+        message_id = self.send_group_direct_message(
+            sender, recipients, content=f"@**{self.bot_profile.full_name}** foo"
+        )
+        # message = Message.objects.get(id=message_id, sender=sender)
+        bot_user_message = UserMessage.objects.get(
+            user_profile=self.bot_profile, message=message_id
+        )
+        self.assertIn("read", bot_user_message.flags_list())

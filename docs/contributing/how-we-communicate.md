@@ -3,10 +3,10 @@
 The primary communication forum for the Zulip community is the Zulip server
 hosted at [chat.zulip.org](https://chat.zulip.org/). If you are not familiar
 with it, start by reading the [Zulip development community
-section](contributing.md#zulip-development-community) of the contributing guide.
-The guidelines here also apply to how we communicate on GitHub issues and pull
-requests, but other pages in this section go into greater detail about
-expectations that are specific to pull requests.
+guide](https://zulip.com/development-community/). The guidelines here also apply
+to how we communicate on GitHub issues and pull requests, but other pages in
+this section go into greater detail about expectations that are specific to pull
+requests.
 
 We are deeply committed to maintaining a respectful, collaborative atmosphere in
 across all interactions in the Zulip community. To get a feel for what that
@@ -60,7 +60,7 @@ better decisions as a group, and learn and have fun along the way.
   where they are coming from.
 
 - If you think someone is factually mistaken, consider how they might have reached
-  their conclusion, and aim to get to a shared understanding. E.g.:
+  their conclusion, and aim to get to a shared understanding. For example:
 
   - “I wasn't able to replicate this -- is it possible you are on an old Zulip
     server?”, rather than “This bug report is wrong.”
@@ -86,7 +86,8 @@ question in the development community, or suggesting a new feature. It's
 especially important to thank and encourage folks who are stretching themselves
 to try something new.
 
-- Remember to say “thanks” when responding to a question or suggestion. E.g.:
+- Remember to say “thanks” when responding to a question or suggestion. For
+  example:
 
   - “Thanks for the report! ... ” when someone reports a bug.
   - “Thanks for reviewing my PR! ... ”
@@ -101,7 +102,7 @@ to try something new.
 
 - You can use a variety of channels to express your appreciation. A comment
   directly in a Zulip thread or on a pull request is often best, but in some
-  cases you may also want to send a friendly PM. E.g.:
+  cases you may also want to send a friendly direct message. For example:
 
   - “I've noticed that you've been answering lots of questions in #**development
     help** lately. Thanks so much for doing that!”

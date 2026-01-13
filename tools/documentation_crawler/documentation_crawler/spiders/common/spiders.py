@@ -1,16 +1,19 @@
 import json
 import os
 import re
-from typing import Callable, Iterator, List, Optional, Union
-from urllib.parse import urlparse, urlsplit
+from collections.abc import AsyncIterator, Callable, Iterator
+from urllib.parse import urlsplit
 
 import scrapy
-from scrapy.http import Request, Response
+from scrapy.http.request import Request
+from scrapy.http.response import Response
+from scrapy.http.response.text import TextResponse
 from scrapy.linkextractors import IGNORED_EXTENSIONS
 from scrapy.linkextractors.lxmlhtml import LxmlLinkExtractor
 from scrapy.spidermiddlewares.httperror import HttpError
 from scrapy.utils.url import url_has_any_extension
 from twisted.python.failure import Failure
+from typing_extensions import override
 
 EXCLUDED_DOMAINS = [
     # Returns 429 rate-limiting errors
@@ -29,7 +32,6 @@ EXCLUDED_URLS = [
     # Returns 404 to HEAD requests unconditionally
     "https://www.git-tower.com/blog/command-line-cheat-sheet/",
     "https://marketplace.visualstudio.com/items?itemName=rafaelmaiolla.remote-vscode",
-    "https://www.transifex.com/zulip/zulip/announcements/",
     "https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-ssh",
     # Requires authentication
     "https://www.linkedin.com/company/zulip-project",
@@ -41,16 +43,11 @@ EXCLUDED_URLS = [
 
 VNU_IGNORE = [
     # Real errors that should be fixed.
-    r"Duplicate ID “[^”]*”\.",
-    r"The first occurrence of ID “[^”]*” was here\.",
     r"Attribute “markdown” not allowed on element “div” at this point\.",
     r"No “p” element in scope but a “p” end tag seen\.",
-    (
-        r"Element “div” not allowed as child of element “ul” in this context\."
-        r" \(Suppressing further errors from this subtree\.\)"
-    ),
+    r"The heading “h\d” \(with computed level \d\) follows the heading “h\d” \(with computed level \d\), skipping \d heading levels?\.",
     # Opinionated informational messages.
-    r"Self-closing tag syntax in text/html documents is widely discouraged; it’s unnecessary and interacts badly with other HTML features \(e\.g\., unquoted attribute values\)\. If you’re using a tool that injects self-closing tag syntax into all void elements, without any option to prevent it from doing so, then consider switching to a different tool\.",
+    r"Trailing slash on void elements has no effect and interacts badly with unquoted attribute values\.",
 ]
 VNU_IGNORE_REGEX = re.compile(r"|".join(VNU_IGNORE))
 
@@ -61,12 +58,11 @@ ZULIP_SERVER_GITHUB_DIRECTORY_PATH_PREFIX = "/zulip/zulip/tree/main"
 
 
 class BaseDocumentationSpider(scrapy.Spider):
-    name: Optional[str] = None
     # Exclude domain address.
-    deny_domains: List[str] = []
-    start_urls: List[str] = []
-    deny: List[str] = []
-    file_extensions: List[str] = ["." + ext for ext in IGNORED_EXTENSIONS]
+    deny_domains: list[str] = []
+    start_urls: list[str] = []
+    deny: list[str] = []
+    file_extensions: list[str] = ["." + ext for ext in IGNORED_EXTENSIONS]
     tags = ("a", "area", "img")
     attrs = ("href", "src")
 
@@ -81,11 +77,14 @@ class BaseDocumentationSpider(scrapy.Spider):
 
     def _is_external_link(self, url: str) -> bool:
         split_url = urlsplit(url)
-        if split_url.hostname == "chat.zulip.org":
+        if split_url.hostname in ("chat.zulip.org", "status.zulip.com"):
             # Since most chat.zulip.org URLs will be links to specific
             # logged-in content that the spider cannot verify, or the
             # homepage, there's no need to check those (which can
             # cause errors when chat.zulip.org is being updated).
+            #
+            # status.zulip.com is externally hosted and, in a peculiar twist of
+            # cosmic irony, often itself offline.
             return True
         if split_url.hostname == "zulip.readthedocs.io" or f".{split_url.hostname}".endswith(
             (".zulip.com", ".zulip.org")
@@ -113,6 +112,8 @@ class BaseDocumentationSpider(scrapy.Spider):
     def check_fragment(self, response: Response) -> None:
         self.log(response)
         xpath_template = "//*[@id='{fragment}' or @name='{fragment}']"
+        assert isinstance(response, TextResponse)
+        assert response.request is not None
         fragment = urlsplit(response.request.url).fragment
         # Check fragment existing on response page.
         if not response.selector.xpath(xpath_template.format(fragment=fragment)):
@@ -148,12 +149,14 @@ class BaseDocumentationSpider(scrapy.Spider):
         if split_url.netloc == "localhost:9981" and split_url.path in ["", "/"]:
             return
 
-        # This page has some invisible to the user anchor links like #all
+        # These pages have some invisible to the user anchor links like #all
         # that are currently invisible, and thus would otherwise fail this test.
         if url.startswith("http://localhost:9981/communities"):
             return
+        if url.startswith("http://localhost:9981/plans"):
+            return
 
-        callback: Callable[[Response], Optional[Iterator[Request]]] = self.parse
+        callback: Callable[[Response], Iterator[Request] | None] = self.parse
         dont_filter = False
         method = "GET"
         if self._is_external_url(url):
@@ -163,8 +166,8 @@ class BaseDocumentationSpider(scrapy.Spider):
             if split_url.hostname == "github.com" and f"{split_url.path}/".startswith(
                 f"{ZULIP_SERVER_GITHUB_FILE_PATH_PREFIX}/"
             ):
-                file_path = (
-                    DEPLOY_ROOT + split_url.path[len(ZULIP_SERVER_GITHUB_FILE_PATH_PREFIX) :]
+                file_path = DEPLOY_ROOT + split_url.path.removeprefix(
+                    ZULIP_SERVER_GITHUB_FILE_PATH_PREFIX
                 )
                 if not os.path.isfile(file_path):
                     self.logger.error(
@@ -174,8 +177,8 @@ class BaseDocumentationSpider(scrapy.Spider):
             elif split_url.hostname == "github.com" and f"{split_url.path}/".startswith(
                 f"{ZULIP_SERVER_GITHUB_DIRECTORY_PATH_PREFIX}/"
             ):
-                dir_path = (
-                    DEPLOY_ROOT + split_url.path[len(ZULIP_SERVER_GITHUB_DIRECTORY_PATH_PREFIX) :]
+                dir_path = DEPLOY_ROOT + split_url.path.removeprefix(
+                    ZULIP_SERVER_GITHUB_DIRECTORY_PATH_PREFIX
                 )
                 if not os.path.isdir(dir_path):
                     self.logger.error(
@@ -199,10 +202,13 @@ class BaseDocumentationSpider(scrapy.Spider):
             errback=self.error_callback,
         )
 
-    def start_requests(self) -> Iterator[Request]:
+    @override
+    async def start(self) -> AsyncIterator[Request]:
         for url in self.start_urls:
-            yield from self._make_requests(url)
+            for request in self._make_requests(url):
+                yield request
 
+    @override
     def parse(self, response: Response) -> Iterator[Request]:
         self.log(response)
 
@@ -216,6 +222,7 @@ class BaseDocumentationSpider(scrapy.Spider):
                 errback=self.error_callback,
             )
 
+        assert isinstance(response, TextResponse)
         for link in LxmlLinkExtractor(
             deny_domains=self.deny_domains,
             deny_extensions=["doc"],
@@ -231,13 +238,14 @@ class BaseDocumentationSpider(scrapy.Spider):
         request.dont_filter = True
         yield request
 
-    def error_callback(self, failure: Failure) -> Optional[Union[Failure, Iterator[Request]]]:
+    def error_callback(self, failure: Failure) -> Failure | Iterator[Request] | None:
         if isinstance(failure.value, HttpError):
             response = failure.value.response
             # Hack: The filtering above does not catch this URL,
             # likely due to a redirect.
-            if urlparse(response.url).netloc == "idmsa.apple.com":
+            if urlsplit(response.url).netloc == "idmsa.apple.com":
                 return None
+            assert response.request is not None
             if response.status == 405 and response.request.method == "HEAD":
                 # Method 'HEAD' not allowed, repeat request with 'GET'
                 return self.retry_request_with_get(response.request)

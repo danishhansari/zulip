@@ -1,9 +1,10 @@
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Iterator, Optional
 
 import sqlalchemy
 from django.db import connection
 from sqlalchemy.engine import Connection, Engine
+from typing_extensions import override
 
 from zerver.lib.db import TimeTrackingConnection
 
@@ -11,6 +12,7 @@ from zerver.lib.db import TimeTrackingConnection
 # This is a Pool that doesn't close connections.  Therefore it can be used with
 # existing Django database connections.
 class NonClosingPool(sqlalchemy.pool.NullPool):
+    @override
     def status(self) -> str:
         return "NonClosingPool"
 
@@ -18,7 +20,7 @@ class NonClosingPool(sqlalchemy.pool.NullPool):
         pass
 
 
-sqlalchemy_engine: Optional[Engine] = None
+sqlalchemy_engine: Engine | None = None
 
 
 @contextmanager

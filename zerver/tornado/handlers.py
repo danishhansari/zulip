@@ -1,7 +1,8 @@
 import logging
-import urllib
+from collections.abc import Collection
 from contextlib import suppress
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
+from urllib.parse import unquote
 
 import tornado.web
 from asgiref.sync import sync_to_async
@@ -14,16 +15,18 @@ from django.urls import set_script_prefix
 from django.utils.cache import patch_vary_headers
 from tornado.iostream import StreamClosedError
 from tornado.wsgi import WSGIContainer
+from typing_extensions import override
 
 from zerver.lib.response import AsynchronousResponse, json_response
 from zerver.tornado.descriptors import get_descriptor_by_handler_id
 
 current_handler_id = 0
-handlers: Dict[int, "AsyncDjangoHandler"] = {}
+handlers: dict[int, "AsyncDjangoHandler"] = {}
+fake_wsgi_container = WSGIContainer(lambda environ, start_response: [])
 
 
-def get_handler_by_id(handler_id: int) -> "AsyncDjangoHandler":
-    return handlers[handler_id]
+def get_handler_by_id(handler_id: int) -> Optional["AsyncDjangoHandler"]:
+    return handlers.get(handler_id)
 
 
 def allocate_handler_id(handler: "AsyncDjangoHandler") -> int:
@@ -35,26 +38,32 @@ def allocate_handler_id(handler: "AsyncDjangoHandler") -> int:
 
 
 def clear_handler_by_id(handler_id: int) -> None:
-    del handlers[handler_id]
+    handlers.pop(handler_id, None)
 
 
 def handler_stats_string() -> str:
     return f"{len(handlers)} handlers, latest ID {current_handler_id}"
 
 
-def finish_handler(handler_id: int, event_queue_id: str, contents: List[Dict[str, Any]]) -> None:
+def finish_handler(handler_id: int, event_queue_id: str, contents: list[dict[str, Any]]) -> None:
     try:
         # We do the import during runtime to avoid cyclic dependency
         # with zerver.lib.request
         from zerver.lib.request import RequestNotes
         from zerver.middleware import async_request_timer_restart
 
+        # The request handler may have been GC'd by a
+        # on_connection_close elsewhere already, so we have to check
+        # it is still around.
+        handler = get_handler_by_id(handler_id)
+        if handler is None:
+            return
+        request = handler._request
+        assert request is not None
+
         # We call async_request_timer_restart here in case we are
         # being finished without any events (because another
         # get_events request has supplanted this request)
-        handler = get_handler_by_id(handler_id)
-        request = handler._request
-        assert request is not None
         async_request_timer_restart(request)
         log_data = RequestNotes.get_notes(request).log_data
         assert log_data is not None
@@ -81,6 +90,9 @@ def finish_handler(handler_id: int, event_queue_id: str, contents: List[Dict[str
 class AsyncDjangoHandler(tornado.web.RequestHandler):
     handler_id: int
 
+    SUPPORTED_METHODS: Collection[str] = {"GET", "POST", "DELETE"}  # type: ignore[assignment]  # https://github.com/tornadoweb/tornado/pull/3354
+
+    @override
     def initialize(self, django_handler: base.BaseHandler) -> None:
         self.django_handler = django_handler
 
@@ -88,11 +100,20 @@ class AsyncDjangoHandler(tornado.web.RequestHandler):
         self._auto_finish = False
 
         # Handler IDs are allocated here, and the handler ID map must
-        # be cleared when the handler finishes its response
+        # be cleared when the handler finishes its response.  See
+        # on_finish and on_connection_close.
         self.handler_id = allocate_handler_id(self)
 
-        self._request: Optional[HttpRequest] = None
+        self._request: HttpRequest | None = None
 
+    @override
+    def on_finish(self) -> None:
+        # Note that this only runs on _successful_ requests.  If the
+        # client closes the connection, see on_connection_close,
+        # below.
+        clear_handler_by_id(self.handler_id)
+
+    @override
     def __repr__(self) -> str:
         descriptor = get_descriptor_by_handler_id(self.handler_id)
         return f"AsyncDjangoHandler<{self.handler_id}, {descriptor}>"
@@ -103,17 +124,14 @@ class AsyncDjangoHandler(tornado.web.RequestHandler):
         # and pass it to Django's WSGIRequest to generate a Django
         # HttpRequest object with the original Tornado request's HTTP
         # headers, parameters, etc.
-        environ = WSGIContainer.environ(self.request)
-        environ["PATH_INFO"] = urllib.parse.unquote(environ["PATH_INFO"])
+        environ = fake_wsgi_container.environ(self.request)
+        environ["PATH_INFO"] = unquote(environ["PATH_INFO"])
 
         # Django WSGIRequest setup code that should match logic from
         # Django's WSGIHandler.__call__ before the call to
         # `get_response()`.
         set_script_prefix(get_script_name(environ))
-        await sync_to_async(
-            lambda: signals.request_started.send(sender=type(self.django_handler)),
-            thread_sensitive=True,
-        )()
+        await signals.request_started.asend(sender=type(self.django_handler))
         self._request = WSGIRequest(environ)
 
         # We do the import during runtime to avoid cyclic dependency
@@ -141,7 +159,7 @@ class AsyncDjangoHandler(tornado.web.RequestHandler):
 
         # Copy any cookies
         if not hasattr(self, "_new_cookies"):
-            self._new_cookies: List[http.cookie.SimpleCookie[str]] = []
+            self._new_cookies: list[http.cookie.SimpleCookie] = []
         self._new_cookies.append(response.cookies)
 
         # Copy the response content
@@ -153,6 +171,7 @@ class AsyncDjangoHandler(tornado.web.RequestHandler):
         with suppress(StreamClosedError):
             await self.finish()
 
+    @override
     async def get(self, *args: Any, **kwargs: Any) -> None:
         request = await self.convert_tornado_request_to_django_request()
         response = await sync_to_async(
@@ -177,10 +196,6 @@ class AsyncDjangoHandler(tornado.web.RequestHandler):
                 # For normal/synchronous requests that don't end up
                 # long-polling, we just need to write the HTTP
                 # response that Django prepared for us via Tornado.
-
-                # Mark this handler ID as finished for Zulip's own tracking.
-                clear_handler_by_id(self.handler_id)
-
                 assert isinstance(response, HttpResponse)
                 await self.write_django_response_as_tornado_response(response)
         finally:
@@ -190,27 +205,27 @@ class AsyncDjangoHandler(tornado.web.RequestHandler):
             # connections.
             await sync_to_async(response.close, thread_sensitive=True)()
 
-    async def head(self, *args: Any, **kwargs: Any) -> None:
-        await self.get(*args, **kwargs)
-
+    @override
     async def post(self, *args: Any, **kwargs: Any) -> None:
         await self.get(*args, **kwargs)
 
+    @override
     async def delete(self, *args: Any, **kwargs: Any) -> None:
         await self.get(*args, **kwargs)
 
+    @override
     def on_connection_close(self) -> None:
         # Register a Tornado handler that runs when client-side
         # connections are closed to notify the events system.
-        #
-        # TODO: Theoretically, this code should run when you Ctrl-C
-        # curl to cause it to break a `GET /events` connection, but
-        # that seems to no longer run this code.  Investigate what's up.
+
+        # If the client goes away, garbage collect the handler (with
+        # attached request information).
+        clear_handler_by_id(self.handler_id)
         client_descriptor = get_descriptor_by_handler_id(self.handler_id)
         if client_descriptor is not None:
             client_descriptor.disconnect_handler(client_closed=True)
 
-    async def zulip_finish(self, result_dict: Dict[str, Any], old_request: HttpRequest) -> None:
+    async def zulip_finish(self, result_dict: dict[str, Any], old_request: HttpRequest) -> None:
         # Function called when we want to break a long-polled
         # get_events request and return a response to the client.
 
@@ -240,10 +255,8 @@ class AsyncDjangoHandler(tornado.web.RequestHandler):
         # Add to this new HttpRequest logging data from the processing of
         # the original request; we will need these for logging.
         request_notes.log_data = old_request_notes.log_data
-        if request_notes.rate_limit is not None:
-            request_notes.rate_limit = old_request_notes.rate_limit
-        if request_notes.requestor_for_logs is not None:
-            request_notes.requestor_for_logs = old_request_notes.requestor_for_logs
+        request_notes.ratelimits_applied += old_request_notes.ratelimits_applied
+        request_notes.requester_for_logs = old_request_notes.requester_for_logs
         request.user = old_request.user
         request_notes.client = old_request_notes.client
         request_notes.client_name = old_request_notes.client_name

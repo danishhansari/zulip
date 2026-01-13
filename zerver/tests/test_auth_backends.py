@@ -1,37 +1,25 @@
 import base64
 import copy
-import datetime
 import json
 import os
 import re
 import secrets
 import time
-import urllib
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from datetime import timedelta
 from email.headerregistry import Address
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Dict,
-    Iterable,
-    Iterator,
-    List,
-    Mapping,
-    Optional,
-    Sequence,
-    Tuple,
-    Type,
-)
+from typing import TYPE_CHECKING, Any
 from unittest import mock
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import jwt
 import ldap
 import orjson
 import requests
 import responses
+import time_machine
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -46,11 +34,16 @@ from django_auth_ldap.backend import LDAPSearch, _LDAPUser
 from jwt.exceptions import PyJWTError
 from onelogin.saml2.auth import OneLogin_Saml2_Auth
 from onelogin.saml2.logout_request import OneLogin_Saml2_Logout_Request
+from onelogin.saml2.logout_response import OneLogin_Saml2_Logout_Response
 from onelogin.saml2.response import OneLogin_Saml2_Response
 from onelogin.saml2.utils import OneLogin_Saml2_Utils
+from social_core.backends.github import GithubOrganizationOAuth2, GithubTeamOAuth2
+from social_core.backends.oauth import BaseOAuth2
+from social_core.backends.saml import SAMLAuth
 from social_core.exceptions import AuthFailed, AuthStateForbidden
 from social_django.storage import BaseDjangoStorage
 from social_django.strategy import DjangoStrategy
+from typing_extensions import override
 
 from confirmation.models import Confirmation, create_confirmation_link
 from zerver.actions.create_realm import do_create_realm
@@ -59,7 +52,12 @@ from zerver.actions.invites import do_invite_users
 from zerver.actions.realm_settings import (
     do_deactivate_realm,
     do_reactivate_realm,
+    do_set_realm_authentication_methods,
     do_set_realm_property,
+)
+from zerver.actions.user_groups import (
+    bulk_add_members_to_user_groups,
+    create_user_group_in_database,
 )
 from zerver.actions.user_settings import do_change_password, do_change_user_setting
 from zerver.actions.users import change_user_is_active, do_deactivate_user
@@ -74,20 +72,28 @@ from zerver.lib.email_validation import (
 from zerver.lib.exceptions import JsonableError, RateLimitedError
 from zerver.lib.initial_password import initial_password
 from zerver.lib.mobile_auth_otp import otp_decrypt_api_key
-from zerver.lib.rate_limiter import add_ratelimit_rule, remove_ratelimit_rule
 from zerver.lib.storage import static_path
+from zerver.lib.stream_subscription import get_subscribed_stream_ids_for_user
 from zerver.lib.streams import ensure_stream
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.test_helpers import (
     HostRequestMock,
     create_s3_buckets,
     load_subdomain_token,
+    most_recent_message,
+    ratelimit_rule,
     read_test_image_file,
     use_s3_backend,
 )
+from zerver.lib.thumbnail import DEFAULT_AVATAR_SIZE, MEDIUM_AVATAR_SIZE, resize_avatar
 from zerver.lib.types import Validator
-from zerver.lib.upload.base import DEFAULT_AVATAR_SIZE, MEDIUM_AVATAR_SIZE, resize_avatar
-from zerver.lib.users import get_all_api_keys, get_api_key, get_raw_user_data
+from zerver.lib.url_encoding import append_url_query_string
+from zerver.lib.user_groups import (
+    get_system_user_group_by_name,
+    get_system_user_group_for_user,
+    is_user_in_group,
+)
+from zerver.lib.users import get_users_for_api
 from zerver.lib.utils import assert_is_not_none
 from zerver.lib.validator import (
     check_bool,
@@ -102,21 +108,22 @@ from zerver.models import (
     CustomProfileField,
     CustomProfileFieldValue,
     MultiuseInvite,
-    PasswordTooWeakError,
+    NamedUserGroup,
     PreregistrationUser,
     Realm,
     RealmDomain,
     Stream,
     UserProfile,
-    clear_supported_auth_backends_cache,
-    get_realm,
-    get_user_by_delivery_email,
 )
+from zerver.models.groups import SystemGroups, UserGroupMembership
+from zerver.models.realms import clear_supported_auth_backends_cache, get_realm
+from zerver.models.users import ExternalAuthID, PasswordTooWeakError, get_user_by_delivery_email
 from zerver.signals import JUST_CREATED_THRESHOLD
 from zerver.views.auth import log_into_subdomain, maybe_send_to_registration
 from zproject.backends import (
     AUTH_BACKEND_NAME_MAP,
     AppleAuthBackend,
+    AuthFuncT,
     AzureADAuthBackend,
     DevAuthBackend,
     EmailAuthBackend,
@@ -143,6 +150,7 @@ from zproject.backends import (
     ZulipLDAPUserPopulator,
     ZulipRemoteUserBackend,
     apple_auth_enabled,
+    auth_enabled_helper,
     check_password_strength,
     dev_auth_enabled,
     email_belongs_to_ldap,
@@ -175,8 +183,8 @@ class AuthBackendTest(ZulipTestCase):
         self,
         backend: Any,
         *,
-        good_kwargs: Dict[str, Any],
-        bad_kwargs: Optional[Dict[str, Any]] = None,
+        good_kwargs: dict[str, Any],
+        bad_kwargs: dict[str, Any] | None = None,
     ) -> None:
         clear_supported_auth_backends_cache()
         user_profile = self.example_user("hamlet")
@@ -192,20 +200,12 @@ class AuthBackendTest(ZulipTestCase):
         # Verify auth fails with a deactivated user
         do_deactivate_user(user_profile, acting_user=None)
         result = backend.authenticate(**good_kwargs)
-        if isinstance(backend, SocialAuthMixin):
-            # Returns a redirect to login page with an error.
-            self.assertEqual(result.status_code, 302)
-            self.assertEqual(
-                result["Location"],
-                f"{user_profile.realm.uri}/login/?"
-                + urlencode({"is_deactivated": user_profile.delivery_email}),
-            )
-        else:
-            # Just takes you back to the login page treating as
-            # invalid auth; this is correct because the form will
-            # provide the appropriate validation error for deactivated
-            # account.
-            self.assertIsNone(result)
+
+        # Just takes you back to the login page treating as
+        # invalid auth; this is correct because the form will
+        # provide the appropriate validation error for deactivated
+        # account.
+        self.assertIsNone(result)
 
         # Reactivate the user and verify auth works again
         do_reactivate_user(user_profile, acting_user=None)
@@ -213,13 +213,15 @@ class AuthBackendTest(ZulipTestCase):
         self.assertEqual(user_profile, result)
 
         # Verify auth fails with a deactivated realm
-        do_deactivate_realm(user_profile.realm, acting_user=None)
+        do_deactivate_realm(
+            user_profile.realm,
+            acting_user=None,
+            deactivation_reason="owner_request",
+            email_owners=False,
+        )
         result = backend.authenticate(**good_kwargs)
-        if isinstance(backend, SocialAuthMixin):
-            self.assertEqual(result.status_code, 302)
-            self.assertEqual(result["Location"], user_profile.realm.uri + "/login/")
-        else:
-            self.assertIsNone(result)
+
+        self.assertIsNone(result)
 
         # Verify auth works again after reactivating the realm
         do_reactivate_realm(user_profile.realm)
@@ -235,11 +237,8 @@ class AuthBackendTest(ZulipTestCase):
         with self.settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipDummyBackend",)):
             clear_supported_auth_backends_cache()
             result = backend.authenticate(**good_kwargs)
-            if isinstance(backend, SocialAuthMixin):
-                self.assertEqual(result.status_code, 302)
-                self.assertEqual(result["Location"], user_profile.realm.uri + "/login/")
-            else:
-                self.assertIsNone(result)
+
+            self.assertIsNone(result)
         clear_supported_auth_backends_cache()
 
         # Verify auth fails if the auth backend is disabled for the realm
@@ -247,9 +246,13 @@ class AuthBackendTest(ZulipTestCase):
             if isinstance(backend, AUTH_BACKEND_NAME_MAP[backend_name]):
                 break
 
-        index = getattr(user_profile.realm.authentication_methods, backend_name).number
-        user_profile.realm.authentication_methods.set_bit(index, False)
-        user_profile.realm.save()
+        authentication_methods = user_profile.realm.authentication_methods_dict()
+        authentication_methods[backend_name] = False
+
+        do_set_realm_authentication_methods(
+            user_profile.realm, authentication_methods, acting_user=None
+        )
+
         if "realm" in good_kwargs:
             # Because this test is a little unfaithful to the ordering
             # (i.e. we fetched the realm object before this function
@@ -259,13 +262,12 @@ class AuthBackendTest(ZulipTestCase):
             # object in good_kwargs.
             good_kwargs["realm"] = user_profile.realm
 
-        if isinstance(backend, SocialAuthMixin):
-            self.assertEqual(result.status_code, 302)
-            self.assertEqual(result["Location"], user_profile.realm.uri + "/login/")
-        else:
-            self.assertIsNone(result)
-        user_profile.realm.authentication_methods.set_bit(index, True)
-        user_profile.realm.save()
+        self.assertIsNone(result)
+
+        authentication_methods[backend_name] = True
+        do_set_realm_authentication_methods(
+            user_profile.realm, authentication_methods, acting_user=None
+        )
 
     def test_dummy_backend(self) -> None:
         realm = get_realm("zulip")
@@ -288,10 +290,11 @@ class AuthBackendTest(ZulipTestCase):
         user_profile.set_password(password)
         user_profile.save()
 
-        with mock.patch("zproject.backends.email_auth_enabled", return_value=False), mock.patch(
-            "zproject.backends.password_auth_enabled", return_value=True
+        with (
+            mock.patch("zproject.backends.email_auth_enabled", return_value=False),
+            mock.patch("zproject.backends.password_auth_enabled", return_value=True),
         ):
-            return_data: Dict[str, bool] = {}
+            return_data: dict[str, bool] = {}
             user = EmailAuthBackend().authenticate(
                 request=mock.MagicMock(),
                 username=user_profile.delivery_email,
@@ -375,17 +378,21 @@ class AuthBackendTest(ZulipTestCase):
         user_profile = self.example_user("hamlet")
         password = "a_password_of_22_chars"
 
-        with self.settings(PASSWORD_HASHERS=("django.contrib.auth.hashers.SHA1PasswordHasher",)):
+        with self.settings(PASSWORD_HASHERS=("django.contrib.auth.hashers.MD5PasswordHasher",)):
             user_profile.set_password(password)
             user_profile.save()
 
-        with self.settings(
-            PASSWORD_HASHERS=(
-                "django.contrib.auth.hashers.MD5PasswordHasher",
-                "django.contrib.auth.hashers.SHA1PasswordHasher",
+        with (
+            self.settings(
+                PASSWORD_HASHERS=(
+                    "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+                    "django.contrib.auth.hashers.MD5PasswordHasher",
+                ),
+                PASSWORD_MIN_LENGTH=30,
             ),
-            PASSWORD_MIN_LENGTH=30,
-        ), self.assertLogs("zulip.auth.email", level="INFO"), self.assertRaises(JsonableError) as m:
+            self.assertLogs("zulip.auth.email", level="INFO"),
+            self.assertRaises(JsonableError) as m,
+        ):
             EmailAuthBackend().authenticate(
                 request=mock.MagicMock(),
                 username=self.example_email("hamlet"),
@@ -420,7 +427,12 @@ class AuthBackendTest(ZulipTestCase):
 
         result = self.client_get("/login/")
         self.assertEqual(result.status_code, 302)
-        self.assertEqual(result["Location"], "http://zulip.testserver")
+        self.assertEqual(result["Location"], "http://zulip.testserver/")
+
+    def test_invalid_login_on_self_hosting_management_subdomain(self) -> None:
+        result = self.client_get("/login/", subdomain="selfhosting")
+        self.assertEqual(result.status_code, 404)
+        self.assert_in_response("No organization found", result)
 
     @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipDummyBackend",))
     def test_no_backend_enabled(self) -> None:
@@ -451,6 +463,13 @@ class AuthBackendTest(ZulipTestCase):
 
         username = self.get_email()
         backend = ZulipLDAPAuthBackend()
+        orig_authenticate = backend.authenticate
+
+        def wrapped_authenticate(*args: Any, **kwargs: Any) -> UserProfile | None:
+            with self.artificial_transaction_savepoint():
+                return orig_authenticate(*args, **kwargs)
+
+        backend.authenticate = wrapped_authenticate  # type: ignore[method-assign]
 
         # Test LDAP auth fails when LDAP server rejects password
         self.assertIsNone(
@@ -513,137 +532,12 @@ class AuthBackendTest(ZulipTestCase):
             bad_kwargs=dict(remote_user=username, realm=get_realm("zephyr")),
         )
 
-    @override_settings(
-        AUTHENTICATION_BACKENDS=(
-            "zproject.backends.GitHubAuthBackend",
-            "zproject.backends.GoogleAuthBackend",
-        )
-    )
-    def test_social_auth_backends(self) -> None:
-        user = self.example_user("hamlet")
-        token_data_dict = {
-            "access_token": "foobar",
-            "token_type": "bearer",
-        }
-        github_email_data = [
-            dict(email=user.delivery_email, verified=True, primary=True),
-            dict(email="nonprimary@zulip.com", verified=True),
-            dict(email="ignored@example.com", verified=False),
-        ]
-        google_email_data = dict(
-            email=user.delivery_email, name=user.full_name, email_verified=True
-        )
-        backends_to_test: Dict[str, Any] = {
-            "google": {
-                "urls": [
-                    # The limited process that we test here doesn't require mocking any urls.
-                ],
-                "backend": GoogleAuthBackend,
-            },
-            "github": {
-                "urls": [
-                    {
-                        "url": "https://api.github.com/user/emails",
-                        "method": responses.GET,
-                        "status": 200,
-                        "body": json.dumps(github_email_data),
-                    },
-                ],
-                "backend": GitHubAuthBackend,
-            },
-        }
-
-        def patched_authenticate(
-            request: Optional["TestHttpResponse"] = None,
-            **kwargs: Any,
-        ) -> Any:
-            # This is how we pass the subdomain to the authentication
-            # backend in production code, so we need to do this setup
-            # here.
-            if "subdomain" in kwargs:
-                backend.strategy.session_set("subdomain", kwargs["subdomain"])
-                del kwargs["subdomain"]
-
-            # Because we're not simulating the full python-social-auth
-            # pipeline here, we need to provide the user's choice of
-            # which email to select in the partial phase of the
-            # pipeline when we display an email picker for the GitHub
-            # authentication backend.  We do that here.
-            def return_email() -> Dict[str, str]:
-                return {"email": user.delivery_email}
-
-            backend.strategy.request_data = return_email
-
-            if request is None:
-                request = mock.MagicMock()
-                request.META = dict(REMOTE_ADDR="127.0.0.1")
-            backend.strategy.request = request
-
-            result = orig_authenticate(backend, request, **kwargs)
-            return result
-
-        def patched_get_verified_emails(*args: Any, **kwargs: Any) -> Any:
-            return google_email_data["email"]
-
-        for backend_name in backends_to_test:
-            with responses.RequestsMock(assert_all_requests_are_fired=True) as requests_mock:
-                urls: List[Dict[str, Any]] = backends_to_test[backend_name]["urls"]
-                for details in urls:
-                    requests_mock.add(
-                        details["method"],
-                        details["url"],
-                        status=details["status"],
-                        body=details["body"],
-                    )
-                backend_class = backends_to_test[backend_name]["backend"]
-
-                # We're creating a new class instance here, so the
-                # monkey-patching of the instance that we're about to
-                # do will be discarded at the end of this test.
-                backend = backend_class()
-                backend.strategy = DjangoStrategy(storage=BaseDjangoStorage())
-
-                orig_authenticate = backend_class.authenticate
-                backend.authenticate = patched_authenticate
-                if backend_name == "google":
-                    backend.get_verified_emails = patched_get_verified_emails
-
-                good_kwargs = dict(
-                    backend=backend,
-                    strategy=backend.strategy,
-                    storage=backend.strategy.storage,
-                    response=token_data_dict,
-                    subdomain="zulip",
-                )
-                bad_kwargs = dict(subdomain="acme")
-                logger_name = f"zulip.auth.{backend.name}"
-
-                with mock.patch(
-                    "zerver.views.auth.redirect_and_log_into_subdomain", return_value=user
-                ), self.assertLogs(logger_name, level="INFO") as info_log:
-                    self.verify_backend(backend, good_kwargs=good_kwargs, bad_kwargs=bad_kwargs)
-                    bad_kwargs["subdomain"] = "zephyr"
-                    self.verify_backend(backend, good_kwargs=good_kwargs, bad_kwargs=bad_kwargs)
-                # Verify logging for deactivated users
-                self.assertEqual(
-                    # Filter out noisy logs:
-                    [
-                        output
-                        for output in info_log.output
-                        if "Authentication attempt from 127.0.0.1" not in output
-                    ],
-                    [
-                        f"INFO:{logger_name}:Failed login attempt for deactivated account: {user.id}@{user.realm.string_id}",
-                        f"INFO:{logger_name}:Failed login attempt for deactivated account: {user.id}@{user.realm.string_id}",
-                    ],
-                )
-
 
 class RateLimitAuthenticationTests(ZulipTestCase):
     @override_settings(RATE_LIMITING_AUTHENTICATE=True)
     def do_test_auth_rate_limiting(
         self,
-        attempt_authentication_func: Callable[[HttpRequest, str, str], Optional[UserProfile]],
+        attempt_authentication_func: Callable[[HttpRequest, str, str], UserProfile | None],
         username: str,
         correct_password: str,
         wrong_password: str,
@@ -657,13 +551,15 @@ class RateLimitAuthenticationTests(ZulipTestCase):
         def _mock_key(self: RateLimitedAuthenticationByUsername) -> str:
             return f"{salt}:{original_key_method(self)}"
 
-        def attempt_authentication(username: str, password: str) -> Optional[UserProfile]:
+        def attempt_authentication(username: str, password: str) -> UserProfile | None:
             request = HttpRequest()
             request.session = mock.MagicMock()
             return attempt_authentication_func(request, username, password)
 
-        add_ratelimit_rule(10, 2, domain="authenticate_by_username")
-        with mock.patch.object(RateLimitedAuthenticationByUsername, "key", new=_mock_key):
+        with (
+            mock.patch.object(RateLimitedAuthenticationByUsername, "key", new=_mock_key),
+            ratelimit_rule(10, 2, domain="authenticate_by_username"),
+        ):
             try:
                 start_time = time.time()
                 with mock.patch("time.time", return_value=start_time):
@@ -699,7 +595,6 @@ class RateLimitAuthenticationTests(ZulipTestCase):
             finally:
                 # Clean up to avoid affecting other tests.
                 RateLimitedAuthenticationByUsername(username).clear_history()
-                remove_ratelimit_rule(10, 2, domain="authenticate_by_username")
 
     def test_email_auth_backend_user_based_rate_limiting(self) -> None:
         user_profile = self.example_user("hamlet")
@@ -709,7 +604,7 @@ class RateLimitAuthenticationTests(ZulipTestCase):
 
         def attempt_authentication(
             request: HttpRequest, username: str, password: str
-        ) -> Optional[UserProfile]:
+        ) -> UserProfile | None:
             return EmailAuthBackend().authenticate(
                 request=request,
                 username=username,
@@ -736,7 +631,7 @@ class RateLimitAuthenticationTests(ZulipTestCase):
 
         def attempt_authentication(
             request: HttpRequest, username: str, password: str
-        ) -> Optional[UserProfile]:
+        ) -> UserProfile | None:
             return ZulipLDAPAuthBackend().authenticate(
                 request=request,
                 username=username,
@@ -771,7 +666,7 @@ class RateLimitAuthenticationTests(ZulipTestCase):
 
         def attempt_authentication(
             request: HttpRequest, username: str, password: str
-        ) -> Optional[UserProfile]:
+        ) -> UserProfile | None:
             user = authenticate(
                 request=request,
                 username=username,
@@ -836,6 +731,12 @@ class DesktopFlowTestingLib(ZulipTestCase):
         self.assertEqual(browser_url, "/login/")
         decrypted_key = self.verify_desktop_data_and_return_key(desktop_data, desktop_flow_otp)
 
+        # Flush the session to have a clean slate - since up till now
+        # we were simulating the part of the flow that happens in the browser.
+        # Now we will simulating the last part of the flow, which gets executed
+        # in the desktop application - thus with a separate session.
+        self.client.session.flush()
+
         result = self.client_get(
             f"http://zulip.testserver/accounts/login/subdomain/{decrypted_key}"
         )
@@ -863,7 +764,7 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
                                   according to the respective backend.
     """
 
-    BACKEND_CLASS: "Type[SocialAuthMixin]"
+    BACKEND_CLASS: "type[SocialAuthMixin]"
     LOGIN_URL: str
     SIGNUP_URL: str
     AUTHORIZATION_URL: str
@@ -874,9 +775,10 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
     CLIENT_SECRET_SETTING: str
 
     @abstractmethod
-    def get_account_data_dict(self, email: str, name: str) -> Dict[str, Any]:
+    def get_account_data_dict(self, email: str, name: str) -> dict[str, Any]:
         raise NotImplementedError
 
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.user_profile = self.example_user("hamlet")
@@ -901,7 +803,7 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
     def register_extra_endpoints(
         self,
         requests_mock: responses.RequestsMock,
-        account_data_dict: Dict[str, str],
+        account_data_dict: dict[str, str],
         **extra_data: Any,
     ) -> None:
         pass
@@ -909,15 +811,16 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
     def prepare_login_url_and_headers(
         self,
         subdomain: str,
-        mobile_flow_otp: Optional[str] = None,
-        desktop_flow_otp: Optional[str] = None,
+        mobile_flow_otp: str | None = None,
+        desktop_flow_otp: str | None = None,
         is_signup: bool = False,
         next: str = "",
         multiuse_object_key: str = "",
-        alternative_start_url: Optional[str] = None,
+        alternative_start_url: str | None = None,
         *,
-        user_agent: Optional[str] = None,
-    ) -> Tuple[str, Dict[str, Any]]:
+        user_agent: str | None = None,
+        extra_headers: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         url = self.LOGIN_URL
         if alternative_start_url is not None:
             url = alternative_start_url
@@ -940,26 +843,31 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         params["next"] = next
         params["multiuse_object_key"] = multiuse_object_key
         if len(params) > 0:
-            url += f"?{urlencode(params)}"
+            query = urlencode(params)
+            url = append_url_query_string(url, query)
+
         if user_agent is not None:
             headers["HTTP_USER_AGENT"] = user_agent
+
+        if extra_headers is not None:
+            headers.update(extra_headers)
 
         return url, headers
 
     def social_auth_test_finish(
         self,
         result: "TestHttpResponse",
-        account_data_dict: Dict[str, str],
+        account_data_dict: dict[str, str],
         expect_choose_email_screen: bool,
         headers: Any,
         **extra_data: Any,
     ) -> "TestHttpResponse":
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        csrf_state = urllib.parse.parse_qs(parsed_url.query)["state"]
+        parsed_url = urlsplit(result["Location"])
+        csrf_state = parse_qs(parsed_url.query)["state"]
         result = self.client_get(self.AUTH_FINISH_URL, dict(state=csrf_state), **headers)
         return result
 
-    def generate_access_token_url_payload(self, account_data_dict: Dict[str, str]) -> str:
+    def generate_access_token_url_payload(self, account_data_dict: dict[str, str]) -> str:
         return json.dumps(
             {
                 "access_token": "foobar",
@@ -969,17 +877,18 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
 
     def social_auth_test(
         self,
-        account_data_dict: Dict[str, str],
+        account_data_dict: dict[str, str],
         *,
         subdomain: str,
-        mobile_flow_otp: Optional[str] = None,
-        desktop_flow_otp: Optional[str] = None,
+        mobile_flow_otp: str | None = None,
+        desktop_flow_otp: str | None = None,
         is_signup: bool = False,
         next: str = "",
         multiuse_object_key: str = "",
         expect_choose_email_screen: bool = False,
-        alternative_start_url: Optional[str] = None,
-        user_agent: Optional[str] = None,
+        alternative_start_url: str | None = None,
+        user_agent: str | None = None,
+        extra_headers: dict[str, Any] | None = None,
         **extra_data: Any,
     ) -> "TestHttpResponse":
         """Main entry point for all social authentication tests.
@@ -1017,6 +926,7 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
             multiuse_object_key,
             alternative_start_url,
             user_agent=user_agent,
+            extra_headers=extra_headers,
         )
 
         result = self.client_get(url, **headers)
@@ -1039,7 +949,7 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         self.client.cookies = result.cookies
 
         # Next, the browser requests result["Location"], and gets
-        # redirected back to the registered redirect uri.
+        # redirected back to the registered redirect url.
 
         # We register callbacks for the key URLs on Identity Provider that
         # auth completion URL will call
@@ -1065,38 +975,88 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
 
     def test_social_auth_no_key(self) -> None:
         account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
-        with self.settings(**{self.CLIENT_KEY_SETTING: None}):
+        with (
+            self.settings(**{self.CLIENT_KEY_SETTING: None}),
+            self.assertLogs("django.request", level="ERROR") as m,
+        ):
             result = self.social_auth_test(
                 account_data_dict, subdomain="zulip", next="/user_uploads/image"
             )
-            self.assert_in_success_response(["Configuration error"], result)
+            self.assertEqual(result.status_code, 500)
+            self.assert_in_response("Configuration error", result)
+            self.assertEqual(
+                m.output,
+                [f"ERROR:django.request:Internal Server Error: {self.LOGIN_URL}"],
+            )
 
     def test_config_error_development(self) -> None:
         if hasattr(self, "CLIENT_KEY_SETTING") and hasattr(self, "CLIENT_SECRET_SETTING"):
-            with self.settings(**{self.CLIENT_KEY_SETTING: None}):
+            with (
+                self.settings(**{self.CLIENT_KEY_SETTING: None}),
+                self.assertLogs("django.request", level="ERROR") as m,
+            ):
                 result = self.client_get(self.LOGIN_URL)
-                self.assert_in_success_response(["Configuration error"], result)
-                self.assert_in_success_response([self.CLIENT_KEY_SETTING.lower()], result)
-                self.assert_in_success_response([self.CLIENT_SECRET_SETTING.lower()], result)
-                self.assert_in_success_response(["zproject/dev-secrets.conf"], result)
-                self.assert_not_in_success_response([self.CLIENT_KEY_SETTING], result)
-                self.assert_not_in_success_response(["zproject/dev_settings.py"], result)
-                self.assert_not_in_success_response(["/etc/zulip/settings.py"], result)
-                self.assert_not_in_success_response(["/etc/zulip/zulip-secrets.conf"], result)
+                self.assertEqual(result.status_code, 500)
+                self.assert_in_response("Configuration error", result)
+                self.assert_in_response(self.CLIENT_KEY_SETTING.lower(), result)
+                self.assert_in_response(self.CLIENT_SECRET_SETTING.lower(), result)
+                self.assert_in_response("zproject/dev-secrets.conf", result)
+                self.assertNotIn(self.CLIENT_KEY_SETTING, result.content.decode())
+                self.assertNotIn("zproject/dev_settings.py", result.content.decode())
+                self.assertNotIn("/etc/zulip/settings.py", result.content.decode())
+                self.assertNotIn("/etc/zulip/zulip-secrets.conf", result.content.decode())
+                self.assertEqual(
+                    m.output,
+                    [f"ERROR:django.request:Internal Server Error: {self.LOGIN_URL}"],
+                )
 
     @override_settings(DEVELOPMENT=False)
     def test_config_error_production(self) -> None:
         if hasattr(self, "CLIENT_KEY_SETTING") and hasattr(self, "CLIENT_SECRET_SETTING"):
-            with self.settings(**{self.CLIENT_KEY_SETTING: None}):
+            with (
+                self.settings(**{self.CLIENT_KEY_SETTING: None}),
+                self.assertLogs("django.request", level="ERROR") as m,
+            ):
                 result = self.client_get(self.LOGIN_URL)
-                self.assert_in_success_response(["Configuration error"], result)
-                self.assert_in_success_response([self.CLIENT_KEY_SETTING], result)
-                self.assert_in_success_response(["/etc/zulip/settings.py"], result)
-                self.assert_in_success_response([self.CLIENT_SECRET_SETTING.lower()], result)
-                self.assert_in_success_response(["/etc/zulip/zulip-secrets.conf"], result)
-                self.assert_not_in_success_response([self.CLIENT_KEY_SETTING.lower()], result)
-                self.assert_not_in_success_response(["zproject/dev_settings.py"], result)
-                self.assert_not_in_success_response(["zproject/dev-secrets.conf"], result)
+                self.assertEqual(result.status_code, 500)
+                self.assert_in_response("Configuration error", result)
+                self.assert_in_response(self.CLIENT_KEY_SETTING, result)
+                self.assert_in_response("/etc/zulip/settings.py", result)
+                self.assert_in_response(self.CLIENT_SECRET_SETTING.lower(), result)
+                self.assert_in_response("/etc/zulip/zulip-secrets.conf", result)
+                self.assertNotIn(self.CLIENT_KEY_SETTING.lower(), result.content.decode())
+                self.assertNotIn("zproject/dev_settings.py", result.content.decode())
+                self.assertNotIn("zproject/dev-secrets.conf", result.content.decode())
+                self.assertEqual(
+                    m.output,
+                    [f"ERROR:django.request:Internal Server Error: {self.LOGIN_URL}"],
+                )
+
+    def test_social_auth_backend_disabled(self) -> None:
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+        realm = get_realm("zulip")
+
+        self.login("desdemona")
+        result = self.client_patch(
+            "/json/realm",
+            {
+                "authentication_methods": orjson.dumps(
+                    {self.backend.auth_backend_name: False, "Dev": True}
+                ).decode()
+            },
+        )
+        self.assert_json_success(result)
+        self.logout()
+
+        self.assertEqual(auth_enabled_helper([self.backend.auth_backend_name], realm), False)
+
+        result = self.social_auth_test(
+            account_data_dict,
+            expect_choose_email_screen=False,
+            subdomain="zulip",
+        )
+        self.assertEqual(result.status_code, 302)
+        self.assertEqual(result["Location"], "http://zulip.testserver/login/")
 
     def test_social_auth_success(self) -> None:
         account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
@@ -1113,14 +1073,92 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         self.assertEqual(data["subdomain"], "zulip")
         self.assertEqual(data["redirect_to"], "/user_uploads/image")
         self.assertEqual(result.status_code, 302)
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        uri = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        self.assertTrue(uri.startswith("http://zulip.testserver/accounts/login/subdomain/"))
+        parsed_url = urlsplit(result["Location"])
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
 
         self.assertIn(
             f"INFO:{self.logger_string}:Authentication attempt from 127.0.0.1: subdomain=zulip;username=hamlet@zulip.com;outcome=success",
             m.output[0],
         )
+
+    def test_social_auth_custom_auth_decorator(self) -> None:
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+
+        backends_with_restriction = []
+
+        def custom_auth_wrapper(
+            auth_func: AuthFuncT, *args: Any, **kwargs: Any
+        ) -> UserProfile | None:
+            nonlocal backends_with_restriction
+
+            backend = args[0]
+            backend_name = backend.name
+            request = args[1]
+            test_header_value = request.headers.get("X-Test-Auth-Header")
+
+            user_profile = auth_func(*args, **kwargs)
+            if backend_name in backends_with_restriction and test_header_value != "allowed":
+                raise JsonableError("Forbidden header value")
+
+            return user_profile
+
+        # It's the ZulipDummyBackend that runs in the social auth codepaths, causing
+        # the custom_auth_wrapper logic to be executed.
+        backends_with_restriction = ["dummy"]
+        with self.settings(CUSTOM_AUTHENTICATION_WRAPPER_FUNCTION=custom_auth_wrapper):
+            result = self.social_auth_test(
+                account_data_dict,
+                expect_choose_email_screen=False,
+                subdomain="zulip",
+            )
+            self.assert_json_error(result, "Forbidden header value")
+
+            with self.assertLogs(self.logger_string, level="INFO") as m:
+                result = self.social_auth_test(
+                    account_data_dict,
+                    expect_choose_email_screen=False,
+                    subdomain="zulip",
+                    next="/user_uploads/image",
+                    extra_headers={"HTTP_X_TEST_AUTH_HEADER": "allowed"},
+                )
+
+            self.assertEqual(result.status_code, 302)
+            url = result["Location"]
+            self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
+
+            url = url.replace("http://zulip.testserver", "")
+
+            result = self.client_get(url, subdomain="zulip", HTTP_X_TEST_AUTH_HEADER="allowed")
+            self.assertEqual(result.status_code, 302)
+            self.assert_logged_in_user_id(self.user_profile.id)
+
+        # Test with a silly custom_auth_wrapper that always returns None, to verify
+        # logging of such failures (which doesn't run if the wrapper is throwing an exception early
+        # like above)
+
+        def custom_auth_wrapper_none(
+            auth_func: AuthFuncT, *args: Any, **kwargs: Any
+        ) -> UserProfile | None:
+            return None
+
+        with self.settings(CUSTOM_AUTHENTICATION_WRAPPER_FUNCTION=custom_auth_wrapper_none):
+            with self.assertLogs(self.logger_string, level="INFO") as m:
+                result = self.social_auth_test(
+                    account_data_dict,
+                    expect_choose_email_screen=False,
+                    subdomain="zulip",
+                )
+            self.assertEqual(result.status_code, 302)
+            self.assertEqual(result["Location"], "http://zulip.testserver/login/")
+
+            self.assertEqual(
+                m.output,
+                [
+                    f"INFO:{self.logger_string}:Authentication attempt from 127.0.0.1: "
+                    f"subdomain=zulip;username={self.email};outcome=failed;return_data={{}}"
+                ],
+            )
 
     @override_settings(SOCIAL_AUTH_SUBDOMAIN=None)
     def test_when_social_auth_subdomain_is_not_set(self) -> None:
@@ -1137,9 +1175,9 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         self.assertEqual(data["subdomain"], "zulip")
         self.assertEqual(data["redirect_to"], "/user_uploads/image")
         self.assertEqual(result.status_code, 302)
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        uri = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        self.assertTrue(uri.startswith("http://zulip.testserver/accounts/login/subdomain/"))
+        parsed_url = urlsplit(result["Location"])
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
 
     def test_social_auth_deactivated_user(self) -> None:
         user_profile = self.example_user("hamlet")
@@ -1155,7 +1193,7 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
             self.assertEqual(result.status_code, 302)
             self.assertEqual(
                 result["Location"],
-                f"{user_profile.realm.uri}/login/?"
+                f"{user_profile.realm.url}/login/?"
                 + urlencode({"is_deactivated": user_profile.delivery_email}),
             )
         self.assertEqual(
@@ -1204,12 +1242,12 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
             ],
         )
         self.assertEqual(result.status_code, 302)
-        self.assertEqual(result["Location"], realm.uri + "/register/")
+        self.assertEqual(result["Location"], realm.url + "/register/")
 
     def test_user_cannot_log_into_nonexisting_realm(self) -> None:
         account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
         result = self.social_auth_test(account_data_dict, subdomain="nonexistent")
-        self.assert_in_response("There is no Zulip organization hosted at this subdomain.", result)
+        self.assert_in_response("There is no Zulip organization at", result)
         self.assertEqual(result.status_code, 404)
 
     def test_user_cannot_log_into_wrong_subdomain(self) -> None:
@@ -1238,7 +1276,7 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
             email=hamlet.delivery_email, name="Full Name"
         )
         self.assert_length(mail.outbox, 0)
-        self.user_profile.date_joined = timezone_now() - datetime.timedelta(
+        self.user_profile.date_joined = timezone_now() - timedelta(
             seconds=JUST_CREATED_THRESHOLD + 1
         )
         self.user_profile.save()
@@ -1263,16 +1301,18 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
             )
         self.assertEqual(result.status_code, 302)
         redirect_url = result["Location"]
-        parsed_url = urllib.parse.urlparse(redirect_url)
-        query_params = urllib.parse.parse_qs(parsed_url.query)
+        parsed_url = urlsplit(redirect_url)
+        query_params = parse_qs(parsed_url.query)
         self.assertEqual(parsed_url.scheme, "zulip")
         self.assertEqual(query_params["realm"], ["http://zulip.testserver"])
         self.assertEqual(query_params["email"], [hamlet.delivery_email])
         self.assertEqual(query_params["user_id"], [str(hamlet.id)])
 
         encrypted_api_key = query_params["otp_encrypted_api_key"][0]
-        hamlet_api_keys = get_all_api_keys(self.example_user("hamlet"))
-        self.assertIn(otp_decrypt_api_key(encrypted_api_key, mobile_flow_otp), hamlet_api_keys)
+        self.assertEqual(
+            otp_decrypt_api_key(encrypted_api_key, mobile_flow_otp),
+            self.example_user("hamlet").api_key,
+        )
         self.assert_length(mail.outbox, 1)
         self.assertIn("Zulip on Android", mail.outbox[0].body)
 
@@ -1309,10 +1349,13 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
 
     def test_social_auth_session_fields_cleared_correctly(self) -> None:
         mobile_flow_otp = "1234abcd" * 8
+        next = "/some/path"
 
-        def initiate_auth(mobile_flow_otp: Optional[str] = None) -> None:
+        def initiate_auth(mobile_flow_otp: str | None = None, next: str | None = None) -> None:
             url, headers = self.prepare_login_url_and_headers(
-                subdomain="zulip", mobile_flow_otp=mobile_flow_otp
+                subdomain="zulip",
+                mobile_flow_otp=mobile_flow_otp,
+                next=next or "",
             )
             result = self.client_get(url, **headers)
             self.assertEqual(result.status_code, 302)
@@ -1320,15 +1363,17 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
             result = self.client_get(result["Location"], **headers)
             self.assertEqual(result.status_code, 302)
 
-        # Start social auth with mobile_flow_otp param. It should get saved into the session
+        # Start social auth with mobile_flow_otp and next params. They should get saved into the session
         # on SOCIAL_AUTH_SUBDOMAIN.
-        initiate_auth(mobile_flow_otp)
+        initiate_auth(mobile_flow_otp, next)
         self.assertEqual(self.client.session["mobile_flow_otp"], mobile_flow_otp)
+        self.assertEqual(self.client.session["next"], next)
 
-        # Make a request without mobile_flow_otp param and verify the field doesn't persist
+        # Make a request without params and verify the fields don't persist
         # in the session from the previous request.
         initiate_auth()
         self.assertEqual(self.client.session.get("mobile_flow_otp"), None)
+        self.assertEqual(self.client.session["next"], None)
 
     def test_social_auth_mobile_and_desktop_flow_in_one_request_error(self) -> None:
         otp = "1234abcd" * 8
@@ -1359,9 +1404,9 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         self.assertEqual(data["full_name"], self.example_user("hamlet").full_name)
         self.assertEqual(data["subdomain"], "zulip")
         self.assertEqual(result.status_code, 302)
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        uri = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        self.assertTrue(uri.startswith("http://zulip.testserver/accounts/login/subdomain/"))
+        parsed_url = urlsplit(result["Location"])
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
         hamlet = self.example_user("hamlet")
         # Name wasn't changed at all
         self.assertEqual(hamlet.full_name, "King Hamlet")
@@ -1375,8 +1420,8 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         name: str,
         expected_final_name: str,
         skip_registration_form: bool,
-        mobile_flow_otp: Optional[str] = None,
-        desktop_flow_otp: Optional[str] = None,
+        mobile_flow_otp: str | None = None,
+        desktop_flow_otp: str | None = None,
         expect_confirm_registration_page: bool = False,
         expect_full_name_prepopulated: bool = True,
     ) -> None:
@@ -1385,9 +1430,9 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         self.assertEqual(data["full_name"], name)
         self.assertEqual(data["subdomain"], "zulip")
         self.assertEqual(result.status_code, 302)
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        uri = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        self.assertTrue(uri.startswith("http://zulip.testserver/accounts/login/subdomain/"))
+        parsed_url = urlsplit(result["Location"])
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
 
         result = self.client_get(result["Location"])
 
@@ -1409,7 +1454,7 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         confirmation_data = {"from_confirmation": "1", "key": confirmation_key}
         result = self.client_post("/accounts/register/", confirmation_data)
         if not skip_registration_form:
-            self.assert_in_response("We just need you to do one last thing", result)
+            self.assert_in_response("Enter your account details to complete registration.", result)
 
             # Verify that the user is asked for name but not password
             self.assert_not_in_success_response(["id_password"], result)
@@ -1428,14 +1473,16 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         if mobile_flow_otp:
             self.assertEqual(result.status_code, 302)
             redirect_url = result["Location"]
-            parsed_url = urllib.parse.urlparse(redirect_url)
-            query_params = urllib.parse.parse_qs(parsed_url.query)
+            parsed_url = urlsplit(redirect_url)
+            query_params = parse_qs(parsed_url.query)
             self.assertEqual(parsed_url.scheme, "zulip")
             self.assertEqual(query_params["realm"], ["http://zulip.testserver"])
             self.assertEqual(query_params["email"], [email])
             encrypted_api_key = query_params["otp_encrypted_api_key"][0]
-            user_api_keys = get_all_api_keys(get_user_by_delivery_email(email, realm))
-            self.assertIn(otp_decrypt_api_key(encrypted_api_key, mobile_flow_otp), user_api_keys)
+            self.assertIn(
+                otp_decrypt_api_key(encrypted_api_key, mobile_flow_otp),
+                get_user_by_delivery_email(email, realm).api_key,
+            )
             return
         elif desktop_flow_otp:
             self.verify_desktop_flow_end_page(result, email, desktop_flow_otp)
@@ -1530,7 +1577,14 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         realm = get_realm("zulip")
 
         iago = self.example_user("iago")
-        do_invite_users(iago, [email], [], invite_expires_in_minutes=2 * 24 * 60)
+        with self.captureOnCommitCallbacks(execute=True):
+            do_invite_users(
+                iago,
+                [email],
+                [],
+                include_realm_default_subscriptions=True,
+                invite_expires_in_minutes=2 * 24 * 60,
+            )
 
         account_data_dict = self.get_account_data_dict(email=email, name=name)
         result = self.social_auth_test(
@@ -1567,19 +1621,28 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         email = "newuser@zulip.com"
         name = "Full Name"
         subdomain = "zulip"
+        desdemona = self.example_user("desdemona")
         realm = get_realm("zulip")
         realm.invite_required = True
         realm.save()
 
         stream_names = ["new_stream_1", "new_stream_2"]
-        streams = []
-        for stream_name in set(stream_names):
-            stream = ensure_stream(realm, stream_name, acting_user=None)
-            streams.append(stream)
+        streams = [
+            ensure_stream(realm, stream_name, acting_user=None) for stream_name in stream_names
+        ]
+
+        testgroup1 = create_user_group_in_database("testgroup1", [], realm, acting_user=desdemona)
+        testgroup2 = create_user_group_in_database("testgroup2", [], realm, acting_user=desdemona)
+        groups = [testgroup1, testgroup2]
 
         referrer = self.example_user("hamlet")
-        multiuse_obj = MultiuseInvite.objects.create(realm=realm, referred_by=referrer)
+        multiuse_obj = MultiuseInvite.objects.create(
+            realm=realm,
+            referred_by=referrer,
+            invited_as=PreregistrationUser.INVITE_AS["REALM_ADMIN"],
+        )
         multiuse_obj.streams.set(streams)
+        multiuse_obj.groups.set(groups)
         validity_in_minutes = 2 * 24 * 60
         create_confirmation_link(
             multiuse_obj, Confirmation.MULTIUSE_INVITE, validity_in_minutes=validity_in_minutes
@@ -1615,6 +1678,28 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         self.assertEqual(prereg_user.email, email)
         self.assertEqual(prereg_user.multiuse_invite, multiuse_obj)
 
+        user_profile = get_user_by_delivery_email(email, realm)
+        self.assertEqual(user_profile.role, UserProfile.ROLE_REALM_ADMINISTRATOR)
+
+        subscribed_stream_ids = set(get_subscribed_stream_ids_for_user(user_profile))
+        for stream in streams:
+            self.assertIn(stream.id, subscribed_stream_ids)
+
+        self.assertTrue(
+            is_user_in_group(
+                testgroup1.id,
+                user_profile,
+                direct_member_only=True,
+            )
+        )
+        self.assertTrue(
+            is_user_in_group(
+                testgroup2.id,
+                user_profile,
+                direct_member_only=True,
+            )
+        )
+
     @override_settings(TERMS_OF_SERVICE_VERSION=None)
     def test_social_auth_registration_using_multiuse_invite_realm_validation(self) -> None:
         """If the user doesn't exist yet, social auth can be used to register an account"""
@@ -1625,7 +1710,7 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         realm.invite_required = True
         realm.save()
 
-        streams: List[Stream] = []
+        streams: list[Stream] = []
 
         # Generate an invitation for a different realm than the one we'll attempt to join:
         lear_realm = get_realm("lear")
@@ -1672,9 +1757,9 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         self.assertEqual(data["full_name"], name)
         self.assertEqual(data["subdomain"], "zulip")
         self.assertEqual(result.status_code, 302)
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        uri = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        self.assertTrue(uri.startswith("http://zulip.testserver/accounts/login/subdomain/"))
+        parsed_url = urlsplit(result["Location"])
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
 
         result = self.client_get(result["Location"])
         self.assertEqual(result.status_code, 200)
@@ -1696,17 +1781,17 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         self.assertEqual(data["full_name"], name)
         self.assertEqual(data["subdomain"], "zulip")
         self.assertEqual(result.status_code, 302)
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        uri = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        self.assertTrue(uri.startswith("http://zulip.testserver/accounts/login/subdomain/"))
+        parsed_url = urlsplit(result["Location"])
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
 
         result = self.client_get(result["Location"])
         self.assertEqual(result.status_code, 200)
         self.assert_in_response('action="/register/"', result)
         self.assert_in_response(
-            "Your email address, {}, is not "
+            f"Your email address, {email}, is not "
             "in one of the domains that are allowed to register "
-            "for accounts in this organization.".format(email),
+            "for accounts in this organization.",
             result,
         )
 
@@ -1721,16 +1806,19 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         account_data_dict = self.get_account_data_dict(email=email, name=name)
 
         backend_path = f"zproject.backends.{self.BACKEND_CLASS.__name__}"
-        with self.settings(
-            POPULATE_PROFILE_VIA_LDAP=True,
-            LDAP_APPEND_DOMAIN="zulip.com",
-            AUTH_LDAP_USER_ATTR_MAP=ldap_user_attr_map,
-            AUTHENTICATION_BACKENDS=(
-                backend_path,
-                "zproject.backends.ZulipLDAPUserPopulator",
-                "zproject.backends.ZulipDummyBackend",
+        with (
+            self.settings(
+                POPULATE_PROFILE_VIA_LDAP=True,
+                LDAP_APPEND_DOMAIN="zulip.com",
+                AUTH_LDAP_USER_ATTR_MAP=ldap_user_attr_map,
+                AUTHENTICATION_BACKENDS=(
+                    backend_path,
+                    "zproject.backends.ZulipLDAPUserPopulator",
+                    "zproject.backends.ZulipDummyBackend",
+                ),
             ),
-        ), self.assertLogs(level="WARNING") as log_warn:
+            self.assertLogs("zulip.ldap", level="WARNING") as log_warn,
+        ):
             result = self.social_auth_test(
                 account_data_dict,
                 expect_choose_email_screen=True,
@@ -1770,7 +1858,8 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
                 skip_registration_form=self.BACKEND_CLASS.full_name_validated,
             )
         self.assertEqual(
-            log_warn.output, [f"WARNING:root:New account email {email} could not be found in LDAP"]
+            log_warn.output,
+            [f"WARNING:zulip.ldap:New account email {email} could not be found in LDAP"],
         )
 
     @override_settings(TERMS_OF_SERVICE_VERSION=None)
@@ -1788,18 +1877,19 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         account_data_dict = self.get_account_data_dict(email=email, name=name)
 
         backend_path = f"zproject.backends.{self.BACKEND_CLASS.__name__}"
-        with self.settings(
-            POPULATE_PROFILE_VIA_LDAP=True,
-            LDAP_EMAIL_ATTR="mail",
-            AUTH_LDAP_USER_ATTR_MAP=ldap_user_attr_map,
-            AUTHENTICATION_BACKENDS=(
-                backend_path,
-                "zproject.backends.ZulipLDAPAuthBackend",
-                "zproject.backends.ZulipDummyBackend",
+        with (
+            self.settings(
+                POPULATE_PROFILE_VIA_LDAP=True,
+                LDAP_EMAIL_ATTR="mail",
+                AUTH_LDAP_USER_ATTR_MAP=ldap_user_attr_map,
+                AUTHENTICATION_BACKENDS=(
+                    backend_path,
+                    "zproject.backends.ZulipLDAPAuthBackend",
+                    "zproject.backends.ZulipDummyBackend",
+                ),
             ),
-        ), self.assertLogs("zulip.ldap", level="DEBUG") as log_debug, self.assertLogs(
-            level="WARNING"
-        ) as log_warn:
+            self.assertLogs("zulip.ldap", level="DEBUG") as log_debug,
+        ):
             account_data_dict = self.get_account_data_dict(email=email, name=name)
             result = self.social_auth_test(
                 account_data_dict,
@@ -1819,34 +1909,42 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
                 skip_registration_form=self.BACKEND_CLASS.full_name_validated,
             )
         self.assertEqual(
-            log_warn.output, [f"WARNING:root:New account email {email} could not be found in LDAP"]
-        )
-        self.assertEqual(
             log_debug.output,
             [
-                f"DEBUG:zulip.ldap:ZulipLDAPAuthBackend: No LDAP user matching django_to_ldap_username result: {email}. Input username: {email}"
+                f"WARNING:zulip.ldap:New account email {email} could not be found in LDAP",
+                f"DEBUG:zulip.ldap:ZulipLDAPAuthBackend: No LDAP user matching django_to_ldap_username result: {email}. Input username: {email}",
             ],
         )
 
     def test_social_auth_complete(self) -> None:
-        with mock.patch(
-            "social_core.backends.oauth.BaseOAuth2.process_error",
-            side_effect=AuthFailed("Not found"),
-        ), self.assertLogs(self.logger_string, level="INFO") as m:
+        def mock_process_error(backend: BaseOAuth2, data: Mapping[str, object]) -> None:
+            raise AuthFailed(backend, "Not found")
+
+        with (
+            mock.patch(
+                "social_core.backends.oauth.BaseOAuth2.process_error",
+                autospec=True,
+                side_effect=mock_process_error,
+            ),
+            self.assertLogs(self.logger_string, level="INFO") as m,
+        ):
             result = self.client_get(reverse("social:complete", args=[self.backend.name]))
             self.assertEqual(result.status_code, 302)
             self.assertIn("login", result["Location"])
         self.assertEqual(
             m.output,
             [
-                self.logger_output("AuthFailed: Authentication failed: ", "info"),
+                self.logger_output("AuthFailed: Authentication failed: Not found", "info"),
             ],
         )
 
-        with mock.patch(
-            "social_core.backends.oauth.BaseOAuth2.auth_complete",
-            side_effect=requests.exceptions.HTTPError,
-        ), self.assertLogs(self.logger_string, level="INFO") as m:
+        with (
+            mock.patch(
+                "social_core.backends.oauth.BaseOAuth2.auth_complete",
+                side_effect=requests.exceptions.HTTPError,
+            ),
+            self.assertLogs(self.logger_string, level="INFO") as m,
+        ):
             result = self.client_get(reverse("social:complete", args=[self.backend.name]))
             self.assertEqual(result.status_code, 302)
             self.assertIn("login", result["Location"])
@@ -1858,10 +1956,17 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         )
 
     def test_social_auth_complete_when_base_exc_is_raised(self) -> None:
-        with mock.patch(
-            "social_core.backends.oauth.BaseOAuth2.auth_complete",
-            side_effect=AuthStateForbidden("State forbidden"),
-        ), self.assertLogs(self.logger_string, level="WARNING"):
+        def mock_auth_complete(backend: BaseOAuth2, *args: object, **kwargs: object) -> object:
+            raise AuthStateForbidden(backend, "State forbidden")
+
+        with (
+            mock.patch(
+                "social_core.backends.oauth.BaseOAuth2.auth_complete",
+                autospec=True,
+                side_effect=mock_auth_complete,
+            ),
+            self.assertLogs(self.logger_string, level="WARNING"),
+        ):
             result = self.client_get(reverse("social:complete", args=[self.backend.name]))
             self.assertEqual(result.status_code, 302)
             self.assertIn("login", result["Location"])
@@ -1873,14 +1978,16 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         name = "Alice Jones"
 
         invite_expires_in_minutes = 2 * 24 * 60
-        do_invite_users(
-            iago,
-            [email],
-            [],
-            invite_expires_in_minutes=invite_expires_in_minutes,
-            invite_as=PreregistrationUser.INVITE_AS["REALM_ADMIN"],
-        )
-        now = timezone_now() + datetime.timedelta(days=3)
+        with self.captureOnCommitCallbacks(execute=True):
+            do_invite_users(
+                iago,
+                [email],
+                [],
+                include_realm_default_subscriptions=False,
+                invite_expires_in_minutes=invite_expires_in_minutes,
+                invite_as=PreregistrationUser.INVITE_AS["REALM_ADMIN"],
+            )
+        now = timezone_now() + timedelta(days=3)
 
         subdomain = "zulip"
         realm = get_realm("zulip")
@@ -1888,7 +1995,7 @@ class SocialAuthBase(DesktopFlowTestingLib, ZulipTestCase, ABC):
         result = self.social_auth_test(
             account_data_dict, expect_choose_email_screen=True, subdomain=subdomain, is_signup=True
         )
-        with mock.patch("zerver.models.timezone_now", return_value=now):
+        with time_machine.travel(now, tick=False):
             self.stage_two_of_registration(
                 result, realm, subdomain, email, name, name, self.BACKEND_CLASS.full_name_validated
             )
@@ -1907,18 +2014,20 @@ class SAMLAuthBackendTest(SocialAuthBase):
 
     # We have to define our own social_auth_test as the flow of SAML authentication
     # is different from the other social backends.
+    @override
     def social_auth_test(
         self,
-        account_data_dict: Dict[str, str],
+        account_data_dict: dict[str, str],
         *,
         subdomain: str,
-        mobile_flow_otp: Optional[str] = None,
-        desktop_flow_otp: Optional[str] = None,
+        mobile_flow_otp: str | None = None,
+        desktop_flow_otp: str | None = None,
         is_signup: bool = False,
         next: str = "",
         multiuse_object_key: str = "",
-        user_agent: Optional[str] = None,
-        extra_attributes: Mapping[str, List[str]] = {},
+        user_agent: str | None = None,
+        extra_attributes: Mapping[str, list[str]] = {},
+        extra_headers: dict[str, Any] | None = None,
         **extra_data: Any,
     ) -> "TestHttpResponse":
         url, headers = self.prepare_login_url_and_headers(
@@ -1929,6 +2038,7 @@ class SAMLAuthBackendTest(SocialAuthBase):
             next,
             multiuse_object_key,
             user_agent=user_agent,
+            extra_headers=extra_headers,
         )
 
         result = self.client_get(url, **headers)
@@ -1951,8 +2061,8 @@ class SAMLAuthBackendTest(SocialAuthBase):
         assert "samlrequest" in result["Location"].lower()
 
         self.client.cookies = result.cookies
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        relay_state = urllib.parse.parse_qs(parsed_url.query)["RelayState"][0]
+        parsed_url = urlsplit(result["Location"])
+        relay_state = parse_qs(parsed_url.query)["RelayState"][0]
         # Make sure params are getting encoded into RelayState:
         data = SAMLAuthBackend.get_data_from_redis(orjson.loads(relay_state)["state_token"])
         assert data is not None
@@ -1981,7 +2091,11 @@ class SAMLAuthBackendTest(SocialAuthBase):
         return result
 
     def generate_saml_response(
-        self, email: str, name: str, extra_attributes: Mapping[str, List[str]] = {}
+        self,
+        email: str,
+        name: str,
+        extra_attributes: Mapping[str, list[str]] = {},
+        include_session_index: bool = True,
     ) -> str:
         """
         The samlresponse.txt fixture has a pre-generated SAMLResponse,
@@ -2016,6 +2130,14 @@ class SAMLAuthBackendTest(SocialAuthBase):
             last_name=last_name,
             extra_attrs=extra_attrs,
         )
+
+        if not include_session_index:
+            # The SessionIndex value is hard-coded in the fixture, so we can remove it
+            # in a very hacky, but easy way, without needing to write regexes or parsing XML.
+            unencoded_saml_response = unencoded_saml_response.replace(
+                ' SessionIndex="ONELOGIN_a5fde8b09598814d7af2537f865d31c2f7aea831"', ""
+            )
+
         # SAMLResponse needs to be base64-encoded.
         saml_response: str = base64.b64encode(unencoded_saml_response.encode()).decode()
 
@@ -2043,20 +2165,223 @@ class SAMLAuthBackendTest(SocialAuthBase):
         if make_validity_checks_pass:
             # It's hard to create fully-correct LogoutRequests with signatures in tests,
             # so we rely on mocking the validating functions instead.
-            with mock.patch.object(
-                OneLogin_Saml2_Logout_Request, "is_valid", return_value=True
-            ), mock.patch.object(
-                OneLogin_Saml2_Auth,
-                "validate_request_signature",
-                return_value=True,
+            with (
+                mock.patch.object(OneLogin_Saml2_Logout_Request, "is_valid", return_value=True),
+                mock.patch.object(
+                    OneLogin_Saml2_Auth,
+                    "validate_request_signature",
+                    return_value=True,
+                ),
             ):
                 result = self.client_get("http://zulip.testserver/complete/saml/", parameters)
         else:
             result = self.client_get("http://zulip.testserver/complete/saml/", parameters)
         return result
 
-    def get_account_data_dict(self, email: str, name: str) -> Dict[str, Any]:
+    @override
+    def get_account_data_dict(self, email: str, name: str) -> dict[str, Any]:
         return dict(email=email, name=name)
+
+    def test_saml_sp_initiated_logout_success(self) -> None:
+        hamlet = self.example_user("hamlet")
+
+        # Begin by logging in via the IdP (the user needs to log in via SAML for the session
+        # for SP-initiated logout to make sense - and the logout flow uses information
+        # about the IdP that was used for login)
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+        with self.assertLogs(self.logger_string, level="INFO"):
+            result = self.social_auth_test(
+                account_data_dict,
+                expect_choose_email_screen=False,
+                subdomain="zulip",
+            )
+        self.client_get(result["Location"])
+
+        self.assert_logged_in_user_id(hamlet.id)
+
+        # Obtain the SessionIndex value saved in the session, for ensuring it's sent in
+        # the LogoutRequest later.
+        session_index = self.client.session["saml_session_index"]
+        self.assertNotEqual(session_index, None)
+
+        result = self.client_post("/accounts/logout/")
+        # A redirect to the IdP is returned.
+        self.assertEqual(result.status_code, 302)
+        self.assertIn(
+            settings.SOCIAL_AUTH_SAML_ENABLED_IDPS["test_idp"]["slo_url"], result["Location"]
+        )
+        # This doesn't log the user out yet.
+        self.assert_logged_in_user_id(hamlet.id)
+
+        # Verify the redirect has the correct form - a LogoutRequest for hamlet
+        # is delivered to the IdP in the SAMLRequest param.
+        query_dict = parse_qs(urlsplit(result["Location"]).query)
+        saml_request_encoded = query_dict["SAMLRequest"][0]
+        saml_request = OneLogin_Saml2_Utils.decode_base64_and_inflate(saml_request_encoded).decode()
+        self.assertIn("<samlp:LogoutRequest", saml_request)
+        self.assertIn(f"saml:NameID>{hamlet.delivery_email}</saml:NameID>", saml_request)
+        self.assertIn(f"<samlp:SessionIndex>{session_index}</samlp:SessionIndex>", saml_request)
+
+        unencoded_logout_response = self.fixture_data("logoutresponse.txt", type="saml")
+        logout_response: str = base64.b64encode(unencoded_logout_response.encode()).decode()
+        # It's hard to create fully-correct LogoutResponse with signatures in tests,
+        # so we rely on mocking the validating functions instead.
+        with (
+            mock.patch.object(OneLogin_Saml2_Logout_Response, "is_valid", return_value=True),
+            mock.patch.object(
+                OneLogin_Saml2_Auth,
+                "validate_response_signature",
+                return_value=True,
+            ),
+        ):
+            result = self.client_get(
+                "/complete/saml/",
+                {
+                    "SAMLResponse": logout_response,
+                    "SigAlg": "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+                    "Signature": "foo",
+                },
+            )
+        self.assertEqual(result.status_code, 302)
+        self.assertEqual(result["Location"], "/accounts/login/")
+        self.client_get(result["Location"])
+        self.assert_logged_in_user_id(None)
+
+    def test_saml_sp_initiated_logout_desktop_flow(self) -> None:
+        desktop_flow_otp = "1234abcd" * 8
+        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+        with self.assertLogs(self.logger_string, level="INFO"):
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                expect_choose_email_screen=False,
+                desktop_flow_otp=desktop_flow_otp,
+            )
+            self.verify_desktop_flow_end_page(result, self.email, desktop_flow_otp)
+
+        # Ensure the SessionIndex gets plumbed through to the final session in the app.
+        session_index = self.client.session["saml_session_index"]
+        self.assertNotEqual(session_index, None)
+
+        # Now we have a desktop app logged in session. Verify that the logout
+        # request will trigger the SAML SLO flow - it should if we correctly
+        # plumbed through the information about the SAML authentication to the
+        # session in the app.
+        result = self.client_post("/accounts/logout/")
+        # A redirect to the IdP is returned.
+        self.assertEqual(result.status_code, 302)
+        self.assertIn(
+            settings.SOCIAL_AUTH_SAML_ENABLED_IDPS["test_idp"]["slo_url"], result["Location"]
+        )
+
+    @override_settings(TERMS_OF_SERVICE_VERSION=None)
+    def test_social_auth_sp_initiated_logout_after_desktop_registration(self) -> None:
+        """
+        SAML SP-initiated logout relies on certain necessary information being saved
+        in the authenticated session that was established during SAML authentication.
+        The mechanism of plumbing the information to the final session through the signup process
+        is a bit different than the one for the simpler case of direct login to an already existing
+        account - thus a separate test is needed for the registration codepath.
+        """
+        email = "newuser@zulip.com"
+        name = "Full Name"
+        subdomain = "zulip"
+        realm = get_realm("zulip")
+        desktop_flow_otp = "1234abcd" * 8
+        account_data_dict = self.get_account_data_dict(email=email, name=name)
+
+        result = self.social_auth_test(
+            account_data_dict,
+            subdomain="zulip",
+            expect_choose_email_screen=True,
+            is_signup=True,
+            desktop_flow_otp=desktop_flow_otp,
+        )
+        self.stage_two_of_registration(
+            result,
+            realm,
+            subdomain,
+            email,
+            name,
+            name,
+            self.BACKEND_CLASS.full_name_validated,
+            desktop_flow_otp=desktop_flow_otp,
+        )
+
+        # Check that the SessionIndex got plumbed through to the final session
+        # acquired in the desktop application after signup.
+        session_index = self.client.session["saml_session_index"]
+        self.assertNotEqual(session_index, None)
+
+        # Verify that the logout request will trigger the SAML SLO flow,
+        # just like in the regular case where the user simply logged in
+        # without needing to go through signup.
+        result = self.client_post("/accounts/logout/")
+        # A redirect to the IdP is returned.
+        self.assertEqual(result.status_code, 302)
+        self.assertIn(
+            settings.SOCIAL_AUTH_SAML_ENABLED_IDPS["test_idp"]["slo_url"], result["Location"]
+        )
+
+    def test_saml_sp_initiated_logout_invalid_logoutresponse(self) -> None:
+        hamlet = self.example_user("hamlet")
+        self.login("hamlet")
+        self.assert_logged_in_user_id(hamlet.id)
+
+        unencoded_logout_response = self.fixture_data("logoutresponse.txt", type="saml")
+        logout_response: str = base64.b64encode(unencoded_logout_response.encode()).decode()
+        result = self.client_get(
+            "/complete/saml/",
+            {
+                "SAMLResponse": logout_response,
+                "SigAlg": "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+                "Signature": "foo",
+            },
+        )
+        self.assert_json_error(
+            result,
+            "LogoutResponse error: ['invalid_logout_response_signature', 'Signature validation failed. Logout Response rejected']",
+        )
+        self.assert_logged_in_user_id(hamlet.id)
+
+    def test_saml_sp_initiated_logout_endpoint_when_not_logged_in(self) -> None:
+        self.assert_logged_in_user_id(None)
+
+        result = self.client_post("/accounts/logout/")
+        self.assertEqual(result.status_code, 302)
+        self.assertEqual(result["Location"], "/accounts/login/")
+
+    def test_saml_sp_initiated_logout_logged_in_not_via_saml(self) -> None:
+        """
+        If the user is logged in, but not via SAML, the normal logout flow
+        should be executed instead of the SAML SP-initiated logout flow.
+        """
+        hamlet = self.example_user("hamlet")
+        self.login("hamlet")
+        self.assert_logged_in_user_id(hamlet.id)
+
+        result = self.client_post("/accounts/logout/")
+        self.assertEqual(result.status_code, 302)
+        self.assertEqual(result["Location"], "/accounts/login/")
+        self.client_get(result["Location"])
+        self.assert_logged_in_user_id(None)
+
+    def test_saml_sp_initiated_logout_when_saml_not_enabled(self) -> None:
+        """
+        If SAML is not enabled, the normal logout flow should be correctly executed.
+        This test verifies that this scenario doesn't end up with some kind of error
+        due to going down the SAML SP-initiated logout codepaths.
+        """
+        hamlet = self.example_user("hamlet")
+        self.login("hamlet")
+        self.assert_logged_in_user_id(hamlet.id)
+
+        with self.settings(AUTHENTICATION_BACKENDS=("zproject.backends.EmailAuthBackend",)):
+            result = self.client_post("/accounts/logout/")
+        self.assertEqual(result.status_code, 302)
+        self.assertEqual(result["Location"], "/accounts/login/")
+        self.client_get(result["Location"])
+        self.assert_logged_in_user_id(None)
 
     def test_saml_idp_initiated_logout_success(self) -> None:
         hamlet = self.example_user("hamlet")
@@ -2073,8 +2398,8 @@ class SAMLAuthBackendTest(SocialAuthBase):
         redirect_to = result["Location"]
         self.assertIn(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS["test_idp"]["slo_url"], redirect_to)
 
-        parsed = urllib.parse.urlparse(redirect_to)
-        query_dict = urllib.parse.parse_qs(parsed.query)
+        parsed = urlsplit(redirect_to)
+        query_dict = parse_qs(parsed.query)
 
         self.assertIn("SAMLResponse", query_dict)
         # Do some very basic parsing of the SAMLResponse to verify it's a success response.
@@ -2208,6 +2533,7 @@ class SAMLAuthBackendTest(SocialAuthBase):
             expect_full_name_prepopulated=False,
         )
 
+    @override
     def test_social_auth_no_key(self) -> None:
         """
         Since in the case of SAML there isn't a direct equivalent of CLIENT_KEY_SETTING,
@@ -2216,25 +2542,39 @@ class SAMLAuthBackendTest(SocialAuthBase):
         """
         account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
         with self.settings(SOCIAL_AUTH_SAML_ENABLED_IDPS=None):
-            result = self.social_auth_test(
-                account_data_dict, subdomain="zulip", next="/user_uploads/image"
-            )
-            self.assert_in_success_response(["Configuration error", "SAML authentication"], result)
+            with self.assertLogs("django.request", level="ERROR") as m:
+                result = self.social_auth_test(
+                    account_data_dict, subdomain="zulip", next="/user_uploads/image"
+                )
+                self.assertEqual(result.status_code, 500)
+                self.assert_in_response("Configuration error", result)
+                self.assert_in_response("SAML authentication", result)
+                self.assertEqual(
+                    m.output, [f"ERROR:django.request:Internal Server Error: {self.LOGIN_URL}"]
+                )
 
-            # Test the signup path too:
-            result = self.social_auth_test(
-                account_data_dict, is_signup=True, subdomain="zulip", next="/user_uploads/image"
-            )
-            self.assert_in_success_response(["Configuration error", "SAML authentication"], result)
+            with self.assertLogs("django.request", level="ERROR") as m:
+                # Test the signup path too:
+                result = self.social_auth_test(
+                    account_data_dict, is_signup=True, subdomain="zulip", next="/user_uploads/image"
+                )
+                self.assertEqual(result.status_code, 500)
+                self.assert_in_response("Configuration error", result)
+                self.assert_in_response("SAML authentication", result)
+                self.assertEqual(
+                    m.output, [f"ERROR:django.request:Internal Server Error: {self.SIGNUP_URL}"]
+                )
 
     def test_config_error_page(self) -> None:
         with self.assertLogs(level="INFO") as info_log:
             result = self.client_get("/accounts/login/social/saml")
         self.assertEqual(
-            info_log.output,
-            ["INFO:root:Attempted to initiate SAML authentication with wrong idp argument: None"],
+            info_log.output[0],
+            "INFO:root:Attempted to initiate saml authentication with wrong idp argument: None",
         )
-        self.assert_in_success_response(["Configuration error", "SAML authentication"], result)
+        self.assertEqual(result.status_code, 500)
+        self.assert_in_response("Configuration error", result)
+        self.assert_in_response("SAML authentication", result)
 
     def test_saml_auth_works_without_private_public_keys(self) -> None:
         with self.settings(SOCIAL_AUTH_SAML_SP_PUBLIC_CERT="", SOCIAL_AUTH_SAML_SP_PRIVATE_KEY=""):
@@ -2282,11 +2622,13 @@ class SAMLAuthBackendTest(SocialAuthBase):
                 expect_confirm_registration_page=False,
             )
 
+    @override
     def test_social_auth_complete(self) -> None:
         with mock.patch.object(OneLogin_Saml2_Response, "is_valid", return_value=True):
-            with mock.patch.object(
-                OneLogin_Saml2_Auth, "is_authenticated", return_value=False
-            ), self.assertLogs(self.logger_string, level="INFO") as m:
+            with (
+                mock.patch.object(OneLogin_Saml2_Auth, "is_authenticated", return_value=False),
+                self.assertLogs(self.logger_string, level="INFO") as m,
+            ):
                 # This mock causes AuthFailed to be raised.
                 saml_response = self.generate_saml_response(self.email, self.name)
                 relay_state = orjson.dumps(
@@ -2307,12 +2649,20 @@ class SAMLAuthBackendTest(SocialAuthBase):
                 ],
             )
 
+    @override
     def test_social_auth_complete_when_base_exc_is_raised(self) -> None:
+        def mock_auth_complete(backend: SAMLAuth, *args: object, **kwargs: object) -> object:
+            raise AuthStateForbidden(backend, "State forbidden")
+
         with mock.patch.object(OneLogin_Saml2_Response, "is_valid", return_value=True):
-            with mock.patch(
-                "social_core.backends.saml.SAMLAuth.auth_complete",
-                side_effect=AuthStateForbidden("State forbidden"),
-            ), self.assertLogs(self.logger_string, level="WARNING") as m:
+            with (
+                mock.patch(
+                    "social_core.backends.saml.SAMLAuth.auth_complete",
+                    autospec=True,
+                    side_effect=mock_auth_complete,
+                ),
+                self.assertLogs(self.logger_string, level="WARNING") as m,
+            ):
                 saml_response = self.generate_saml_response(self.email, self.name)
                 relay_state = orjson.dumps(
                     dict(
@@ -2429,6 +2779,39 @@ class SAMLAuthBackendTest(SocialAuthBase):
             ],
         )
 
+    def test_social_auth_complete_samlresponse_without_session_index_logging(self) -> None:
+        """
+        Tests submitting a valid SAMLResponse to /complete/saml/ without the SessionIndex attribute,
+        which is optional - to verify we log that unusual situation appropriately.
+        """
+
+        # We don't need to test full flow, so just generate the data to POST to /complete/saml/
+        # as the last step of the SAML flow.
+        relay_state = orjson.dumps(
+            dict(
+                state_token=SAMLAuthBackend.put_data_in_redis({"subdomain": "zulip"}),
+            )
+        ).decode()
+        saml_response = self.generate_saml_response(
+            email=self.example_email("hamlet"), name="King Hamlet", include_session_index=False
+        )
+
+        with self.assertLogs(self.logger_string, level="INFO") as m:
+            post_params = {"RelayState": relay_state, "SAMLResponse": saml_response}
+            with mock.patch.object(OneLogin_Saml2_Response, "is_valid", return_value=True):
+                result = self.client_post("/complete/saml/", post_params)
+            # Redirect to /accounts/login/subdomain/ indicating auth success.
+            self.assertEqual(result.status_code, 302)
+            self.assertIn("/accounts/login/subdomain/", result["Location"])
+
+        # Verify the expected logline exists.
+        self.assertIn(
+            self.logger_output(
+                "/complete/saml/: IdP did not provide SessionIndex in the SAMLResponse.", "info"
+            ),
+            m.output,
+        )
+
     def test_social_auth_complete_wrong_issuing_idp(self) -> None:
         relay_state = orjson.dumps(
             dict(
@@ -2458,6 +2841,39 @@ class SAMLAuthBackendTest(SocialAuthBase):
                 ],
             )
 
+        # Now test a slightly different case, where instead of an invalid issuer,
+        # the issuer is not included in the SAMLResponse at all.
+        # self.generate_saml_response doesn't support something as fiddly as a SAMLResponse
+        # with no issuers and it doesn't make sense to clutter it with such a "feature", so
+        # we manually load and tweak the fixture here.
+        unencoded_saml_response = self.fixture_data("samlresponse.txt", type="saml").format(
+            email=self.example_email("hamlet"),
+            first_name="King",
+            last_name="Hamlet",
+            extra_attrs="",
+        )
+        # Simple regex to remove Issuer occurrences from the XML.
+        unencoded_saml_response_without_issuer = re.sub(
+            r"\<saml2:Issuer.+</saml2:Issuer>", "", unencoded_saml_response
+        )
+
+        # SAMLResponse needs to be base64-encoded.
+        saml_response_without_issuer: str = base64.b64encode(
+            unencoded_saml_response_without_issuer.encode()
+        ).decode()
+        with self.assertLogs(self.logger_string, level="INFO") as m:
+            post_params = {"RelayState": relay_state, "SAMLResponse": saml_response_without_issuer}
+            result = self.client_post("/complete/saml/", post_params)
+            self.assertEqual(result.status_code, 302)
+            self.assertEqual("/login/", result["Location"])
+        self.assertEqual(
+            m.output,
+            [
+                "ERROR:zulip.auth.saml:Error parsing SAMLResponse: Issuer of the Assertion not found or multiple.",
+                "INFO:zulip.auth.saml:/complete/saml/: No valid IdP as issuer of the SAMLResponse.",
+            ],
+        )
+
     def test_social_auth_complete_valid_get_idp_bad_samlresponse(self) -> None:
         """
         This tests for a hypothetical scenario where our basic parsing of the SAMLResponse
@@ -2465,8 +2881,9 @@ class SAMLAuthBackendTest(SocialAuthBase):
         validation in the underlying libraries.
         """
 
-        with self.assertLogs(self.logger_string, level="INFO") as m, mock.patch.object(
-            SAMLDocument, "get_issuing_idp", return_value="test_idp"
+        with (
+            self.assertLogs(self.logger_string, level="INFO") as m,
+            mock.patch.object(SAMLDocument, "get_issuing_idp", return_value="test_idp"),
         ):
             relay_state = orjson.dumps(
                 dict(
@@ -2481,7 +2898,7 @@ class SAMLAuthBackendTest(SocialAuthBase):
             self.assertEqual(result.status_code, 302)
             self.assertIn("login", result["Location"])
 
-        self.assert_length(m.output, 1)
+        self.assert_length(m.output, 3)
 
     def test_social_auth_saml_bad_idp_param_on_login_page(self) -> None:
         with self.assertLogs(self.logger_string, level="INFO") as m:
@@ -2510,6 +2927,7 @@ class SAMLAuthBackendTest(SocialAuthBase):
             ],
         )
 
+    @override
     def test_social_auth_invalid_email(self) -> None:
         """
         This test needs an override from the original class. For security reasons,
@@ -2530,7 +2948,7 @@ class SAMLAuthBackendTest(SocialAuthBase):
             warn_log.output, [self.logger_output("SAML got invalid email argument.", "warning")]
         )
         self.assertEqual(result.status_code, 302)
-        self.assertEqual(result["Location"], realm.uri + "/register/")
+        self.assertEqual(result["Location"], realm.url + "/register/")
 
     def test_social_auth_saml_multiple_idps_configured(self) -> None:
         # Set up a new SOCIAL_AUTH_SAML_ENABLED_IDPS dict with two idps.
@@ -2607,24 +3025,24 @@ class SAMLAuthBackendTest(SocialAuthBase):
             with self.assertLogs(level="INFO") as info_log:
                 result = self.client_get(f"/accounts/{action}/social/saml")
             # Missing idp argument.
-            self.assert_in_success_response(["Configuration error", "SAML authentication"], result)
+            self.assertEqual(result.status_code, 500)
+            self.assert_in_response("Configuration error", result)
+            self.assert_in_response("SAML authentication", result)
             self.assertEqual(
-                info_log.output,
-                [
-                    "INFO:root:Attempted to initiate SAML authentication with wrong idp argument: None"
-                ],
+                info_log.output[0],
+                "INFO:root:Attempted to initiate saml authentication with wrong idp argument: None",
             )
 
             with self.assertLogs(level="INFO") as info_log:
                 result = self.client_get(f"/accounts/{action}/social/saml/nonexistent_idp")
             # No such IdP is configured.
             self.assertEqual(
-                info_log.output,
-                [
-                    "INFO:root:Attempted to initiate SAML authentication with wrong idp argument: nonexistent_idp"
-                ],
+                info_log.output[0],
+                "INFO:root:Attempted to initiate saml authentication with wrong idp argument: nonexistent_idp",
             )
-            self.assert_in_success_response(["Configuration error", "SAML authentication"], result)
+            self.assertEqual(result.status_code, 500)
+            self.assert_in_response("Configuration error", result)
+            self.assert_in_response("SAML authentication", result)
 
             result = self.client_get(f"/accounts/{action}/social/saml/")
             # No matching URL pattern.
@@ -2673,11 +3091,11 @@ class SAMLAuthBackendTest(SocialAuthBase):
         self.assertEqual(data["full_name"], self.name)
         self.assertEqual(data["subdomain"], "zulip")
         self.assertEqual(result.status_code, 302)
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        uri = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        self.assertTrue(uri.startswith("http://zulip.testserver/accounts/login/subdomain/"))
+        parsed_url = urlsplit(result["Location"])
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
 
-        self.client_get(uri)
+        self.client_get(url)
         self.assert_logged_in_user_id(self.example_user("hamlet").id)
 
     def test_choose_subdomain_invalid_subdomain_specified(self) -> None:
@@ -2708,11 +3126,11 @@ class SAMLAuthBackendTest(SocialAuthBase):
         self.assertEqual(data["full_name"], self.name)
         self.assertEqual(data["subdomain"], "zulip")
         self.assertEqual(result.status_code, 302)
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        uri = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        self.assertTrue(uri.startswith("http://zulip.testserver/accounts/login/subdomain/"))
+        parsed_url = urlsplit(result["Location"])
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
 
-        self.client_get(uri)
+        self.client_get(url)
         self.assert_logged_in_user_id(self.example_user("hamlet").id)
 
     def test_idp_initiated_signin_subdomain_implicit_no_relaystate_param(self) -> None:
@@ -2729,11 +3147,11 @@ class SAMLAuthBackendTest(SocialAuthBase):
         self.assertEqual(data["full_name"], self.name)
         self.assertEqual(data["subdomain"], "zulip")
         self.assertEqual(result.status_code, 302)
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        uri = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        self.assertTrue(uri.startswith("http://zulip.testserver/accounts/login/subdomain/"))
+        parsed_url = urlsplit(result["Location"])
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
 
-        self.client_get(uri)
+        self.client_get(url)
         self.assert_logged_in_user_id(self.example_user("hamlet").id)
 
     def test_idp_initiated_signin_subdomain_implicit_invalid(self) -> None:
@@ -2851,7 +3269,7 @@ class SAMLAuthBackendTest(SocialAuthBase):
             ],
         )
 
-    def test_social_auth_custom_profile_field_sync(self) -> None:
+    def test_social_auth_profile_field_sync(self) -> None:
         birthday_field = CustomProfileField.objects.get(
             realm=self.user_profile.realm, name="Birthday"
         )
@@ -2860,25 +3278,32 @@ class SAMLAuthBackendTest(SocialAuthBase):
         ).value
 
         idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
-        idps_dict["test_idp"]["extra_attrs"] = ["mobilePhone"]
+        idps_dict["test_idp"]["extra_attrs"] = ["mobilePhone", "zulip_role"]
 
         sync_custom_attrs_dict = {
             "zulip": {
                 "saml": {
-                    "phone_number": "mobilePhone",
+                    "custom__phone_number": "mobilePhone",
+                    "role": "zulip_role",
                 }
             }
         }
 
+        # Before we procee, verify the role, which is supposed to get synced, is like
+        # we expect.
+        self.assertEqual(self.user_profile.role, UserProfile.ROLE_MEMBER)
+
         with self.settings(
             SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
-            SOCIAL_AUTH_SYNC_CUSTOM_ATTRS_DICT=sync_custom_attrs_dict,
+            SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
         ):
             account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
             result = self.social_auth_test(
                 account_data_dict,
                 subdomain="zulip",
-                extra_attributes=dict(mobilePhone=["123412341234"], birthday=["2021-01-01"]),
+                extra_attributes=dict(
+                    mobilePhone=["123412341234"], birthday=["2021-01-01"], zulip_role=["owner"]
+                ),
             )
         data = load_subdomain_token(result)
         self.assertEqual(data["email"], self.email)
@@ -2900,12 +3325,678 @@ class SAMLAuthBackendTest(SocialAuthBase):
         ).value
         self.assertEqual(new_birthday_field_value, old_birthday_field_value)
 
-    def test_social_auth_custom_profile_field_sync_custom_field_not_existing(self) -> None:
+        self.user_profile.refresh_from_db()
+        self.assertEqual(self.user_profile.role, UserProfile.ROLE_REALM_OWNER)
+
+        # Now test with an invalid role value.
+        with (
+            self.settings(
+                SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
+                SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
+            ),
+            self.assertLogs(self.logger_string, level="WARNING") as m,
+        ):
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attributes=dict(zulip_role=["wrongrole"]),
+            )
+
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.user_profile.refresh_from_db()
+        self.assertEqual(self.user_profile.role, UserProfile.ROLE_REALM_OWNER)
+        self.assertEqual(
+            m.output,
+            [
+                self.logger_output(
+                    f"Ignoring unsupported role value wrongrole for user {self.user_profile.id} in SOCIAL_AUTH_SYNC_ATTRS_DICT",
+                    type="warning",
+                )
+            ],
+        )
+
+        # Verify empty attribute is handled.
+        with self.settings(
+            SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
+            SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
+        ):
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attributes=dict(mobilePhone=[""], zulip_role=[""]),
+            )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.user_profile.refresh_from_db()
+        self.assertEqual(self.user_profile.role, UserProfile.ROLE_REALM_OWNER)
+        phone_field_value = CustomProfileFieldValue.objects.get(
+            user_profile=self.user_profile, field=phone_field
+        ).value
+        self.assertEqual(phone_field_value, "123412341234")
+
+        # Verify with none of these attributes sent at all.
+        with self.settings(
+            SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
+            SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
+        ):
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attributes=dict(),
+            )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.user_profile.refresh_from_db()
+        self.assertEqual(self.user_profile.role, UserProfile.ROLE_REALM_OWNER)
+        phone_field_value = CustomProfileFieldValue.objects.get(
+            user_profile=self.user_profile, field=phone_field
+        ).value
+        self.assertEqual(phone_field_value, "123412341234")
+
+        # Disable syncing of role in SOCIAL_AUTH_SYNC_ATTRS_DICT, while keeping
+        # role in extra_attrs. This edge case means the attribute will be read from the
+        # data provided by the IdP, but won't be used for anything.
+        with self.settings(
+            SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
+            SOCIAL_AUTH_SYNC_ATTRS_DICT={},
+        ):
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attributes=dict(zulip_role=["guest"]),
+            )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.user_profile.refresh_from_db()
+        self.assertEqual(self.user_profile.role, UserProfile.ROLE_REALM_OWNER)
+
+    def test_social_auth_group_sync(self) -> None:
+        realm = get_realm("zulip")
+        hamlet = self.example_user("hamlet")
+        testgroup1 = create_user_group_in_database("testgroup1", [], realm, acting_user=hamlet)
+        testgroup2 = create_user_group_in_database("testgroup2", [], realm, acting_user=hamlet)
+        # Sanity assert. We'll use this group name to verify that groups get created on demand by group sync.
+        assert not NamedUserGroup.objects.filter(
+            name="newtestgroup", realm_for_sharding=realm
+        ).exists()
+
         sync_custom_attrs_dict = {
             "zulip": {
                 "saml": {
-                    "title": "title",
-                    "phone_number": "mobilePhone",
+                    "role": "zulip_role",
+                    "groups": [
+                        "testgroup1",
+                        ("samlgroup2", "testgroup2"),
+                        ("samlgroup3", "newtestgroup"),
+                    ],
+                }
+            }
+        }
+
+        with (
+            self.settings(
+                SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
+            ),
+            self.assertLogs(self.logger_string) as mock_log,
+        ):
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attributes=dict(
+                    zulip_groups=["testgroup1", "samlgroup2", "samlgroup3", "samlgroup99"]
+                ),
+            )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(result.status_code, 302)
+
+        self.assertTrue(
+            is_user_in_group(
+                testgroup1.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertTrue(
+            is_user_in_group(
+                testgroup2.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+
+        # newtestgroup exists now. It was created because the zulip_groups attribute implied the user should
+        # be a member of the group.
+        new_test_group = NamedUserGroup.objects.get(name="newtestgroup", realm_for_sharding=realm)
+        self.assertTrue(
+            is_user_in_group(
+                new_test_group.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        # samlgroup99 is not listed in the configuration, so doesn't get created, despite being passed in
+        # the zulip_groups attribute.
+        self.assertFalse(
+            NamedUserGroup.objects.filter(name="samlgroup99", realm_for_sharding=realm).exists()
+        )
+
+        # Verify the expected log line revealing the internal details of the incoming groups -> Zulip groups translation.
+        self.assertIn(
+            self.logger_output(
+                f"social_auth_sync_user_attributes:<user:{hamlet.id}>: received group names: ['samlgroup2', 'samlgroup3', 'samlgroup99', 'testgroup1']|intended Zulip groups: ['newtestgroup', 'testgroup1', 'testgroup2']. group mapping used: {{'testgroup1': 'testgroup1', 'samlgroup2': 'testgroup2', 'samlgroup3': 'newtestgroup'}}",
+                type="info",
+            ),
+            mock_log.output,
+        )
+        self.assertIn(
+            self.logger_output(
+                f"User {hamlet.id} should be added to groups ['newtestgroup'], but they don't exist. Creating them first.",
+                type="info",
+            ),
+            mock_log.output,
+        )
+
+        with self.settings(
+            SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
+        ):
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attributes=dict(zulip_groups=["testgroup1"]),
+            )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(result.status_code, 302)
+
+        self.assertTrue(
+            is_user_in_group(
+                testgroup1.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                testgroup2.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                new_test_group.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+
+        with self.settings(
+            SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
+        ):
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attributes=dict(zulip_groups=[]),
+            )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(result.status_code, 302)
+
+        self.assertFalse(
+            is_user_in_group(
+                testgroup1.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                testgroup2.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                new_test_group.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+
+        bulk_add_members_to_user_groups([testgroup1, testgroup2], [hamlet.id], acting_user=None)
+
+        with self.settings(
+            # If the realm is not configured for group sync, group memberships of course should be
+            # unaffected by zulip_groups attr.
+            SOCIAL_AUTH_SYNC_ATTRS_DICT={"zulip": {"saml": {}}},
+        ):
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attributes=dict(zulip_groups=[]),
+            )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(result.status_code, 302)
+
+        self.assertTrue(
+            is_user_in_group(
+                testgroup1.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertTrue(
+            is_user_in_group(
+                testgroup2.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+
+        with self.settings(
+            SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
+        ):
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            # Simulate a SAMLResponse without zulip_groups attribute being specified in it at all.
+            # As the realm is configured for group sync, that should be treated as
+            # "user should not be a member of any of the groups configured for sync"
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+            )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(result.status_code, 302)
+
+        self.assertFalse(
+            is_user_in_group(
+                testgroup1.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                testgroup2.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                new_test_group.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+
+    def test_social_auth_group_sync_sync_all_groups_mode(self) -> None:
+        realm = get_realm("zulip")
+        hamlet = self.example_user("hamlet")
+        testgroup1 = create_user_group_in_database("testgroup1", [], realm, acting_user=hamlet)
+        testgroup2 = create_user_group_in_database("testgroup2", [], realm, acting_user=hamlet)
+
+        hamletcharacters_group = NamedUserGroup.objects.get(
+            name="hamletcharacters", realm_for_sharding=realm
+        )
+        # Sanity assert. We'll use this group name to verify that groups get created on demand by group sync.
+        assert not NamedUserGroup.objects.filter(
+            name="newtestgroup", realm_for_sharding=realm
+        ).exists()
+
+        sync_custom_attrs_dict = {
+            "zulip": {
+                "saml": {
+                    "role": "zulip_role",
+                    # This config syntax enables the "sync all groups" mode.
+                    "groups": "*",
+                }
+            }
+        }
+
+        with (
+            self.settings(
+                SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
+            ),
+            self.assertLogs(self.logger_string) as mock_log,
+        ):
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                extra_attributes=dict(
+                    zulip_groups=[
+                        "testgroup1",
+                        "testgroup2",
+                        "newtestgroup",
+                        # Not a valid group name. We will want to verify it gets logged and ignored.
+                        "@@@@",
+                    ]
+                ),
+            )
+        data = load_subdomain_token(result)
+        self.assertEqual(data["email"], self.email)
+        self.assertEqual(result.status_code, 302)
+
+        self.assertTrue(
+            is_user_in_group(
+                testgroup1.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertTrue(
+            is_user_in_group(
+                testgroup2.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                hamletcharacters_group.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+
+        # newtestgroup exists now. It was created because the zulip_groups attribute implied the user should
+        # be a member of the group.
+        new_test_group = NamedUserGroup.objects.get(name="newtestgroup", realm_for_sharding=realm)
+        self.assertTrue(
+            is_user_in_group(
+                new_test_group.id,
+                hamlet,
+                direct_member_only=True,
+            )
+        )
+
+        # Verify the expected log line revealing the internal details of the incoming groups -> Zulip groups translation.
+        self.assertIn(
+            self.logger_output(
+                f"social_auth_sync_user_attributes:<user:{hamlet.id}>: received group names: ['@@@@', 'newtestgroup', 'testgroup1', 'testgroup2']|intended Zulip groups: ['@@@@', 'newtestgroup', 'testgroup1', 'testgroup2']. group mapping used: {{'hamletcharacters': 'hamletcharacters', 'testgroup1': 'testgroup1', 'testgroup2': 'testgroup2', 'newtestgroup': 'newtestgroup', '@@@@': '@@@@'}}",
+                type="info",
+            ),
+            mock_log.output,
+        )
+        self.assertIn(
+            self.logger_output(
+                f"User {hamlet.id} should be added to groups ['@@@@', 'newtestgroup'], but they don't exist. Creating them first.",
+                type="info",
+            ),
+            mock_log.output,
+        )
+        self.assertIn(
+            self.logger_output(
+                "ensure_missing_groups: received invalid groups names: ['@@@@']",
+                type="warning",
+            ),
+            mock_log.output,
+        )
+
+    @override_settings(TERMS_OF_SERVICE_VERSION=None)
+    def test_social_auth_create_user_with_synced_role_and_groups(self) -> None:
+        email = "newuser@zulip.com"
+        name = "Full Name"
+        subdomain = "zulip"
+        desdemona = self.example_user("desdemona")
+        realm = get_realm("zulip")
+
+        account_data_dict = self.get_account_data_dict(email=email, name=name)
+        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
+        idps_dict["test_idp"]["extra_attrs"] = ["zulip_role"]
+
+        testgroup1 = create_user_group_in_database("testgroup1", [], realm, acting_user=desdemona)
+        testgroup2 = create_user_group_in_database("testgroup2", [], realm, acting_user=desdemona)
+
+        # Sanity assert. We'll use this group name to verify that groups get created on demand by group sync.
+        assert not NamedUserGroup.objects.filter(
+            name="newtestgroup", realm_for_sharding=realm
+        ).exists()
+
+        sync_custom_attrs_dict = {
+            "zulip": {
+                "saml": {
+                    "role": "zulip_role",
+                    "groups": [
+                        "testgroup1",
+                        ("samlgroup2", "testgroup2"),
+                        ("samlgroup3", "newtestgroup"),
+                    ],
+                }
+            }
+        }
+
+        with (
+            self.settings(
+                SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
+                SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
+            ),
+            self.assertLogs(self.logger_string, level="INFO") as mock_logger,
+        ):
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                is_signup=True,
+                extra_attributes=dict(
+                    mobilePhone=["123412341234"],
+                    birthday=["2021-01-01"],
+                    zulip_role=["owner"],
+                    zulip_groups=["testgroup1", "samlgroup3", "samlgroup99"],
+                ),
+            )
+
+        with self.assertLogs("zulip.ldap", level="INFO") as mock_ldap_logger:
+            self.stage_two_of_registration(
+                result, realm, subdomain, email, name, name, self.BACKEND_CLASS.full_name_validated
+            )
+        user_profile = get_user_by_delivery_email(email, realm)
+        self.assertEqual(user_profile.role, UserProfile.ROLE_REALM_OWNER)
+        self.assertTrue(
+            is_user_in_group(
+                testgroup1.id,
+                user_profile,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                testgroup2.id,
+                user_profile,
+                direct_member_only=True,
+            )
+        )
+
+        # newtestgroup exists now. It was created because the zulip_groups attribute implied the user should
+        # be a member of the group.
+        new_test_group = NamedUserGroup.objects.get(name="newtestgroup", realm_for_sharding=realm)
+        self.assertTrue(
+            is_user_in_group(
+                new_test_group.id,
+                user_profile,
+                direct_member_only=True,
+            )
+        )
+        # samlgroup99 is not listed in the configuration, so doesn't get created, despite being passed in
+        # the zulip_groups attribute.
+        self.assertFalse(
+            NamedUserGroup.objects.filter(name="samlgroup99", realm_for_sharding=realm).exists()
+        )
+
+        self.assertEqual(
+            mock_logger.output[0],
+            self.logger_output(
+                "social_auth_sync_user_attributes:<new user signup>: received group names: ['samlgroup3', 'samlgroup99', 'testgroup1']|intended Zulip groups: ['newtestgroup', 'testgroup1']. group mapping used: {'testgroup1': 'testgroup1', 'samlgroup2': 'testgroup2', 'samlgroup3': 'newtestgroup'}",
+                type="info",
+            ),
+        )
+        self.assertEqual(
+            mock_logger.output[1],
+            self.logger_output("Returning role owner for user creation", type="info"),
+        )
+
+        prereg_user = PreregistrationUser.objects.last()
+        assert prereg_user is not None
+        self.assertEqual(
+            mock_ldap_logger.output[0],
+            f"INFO:zulip.ldap:PreregistrationUser {prereg_user.id} should be added to groups ['newtestgroup'], but they don't exist. Creating them first.",
+        )
+
+        self.assertEqual(
+            mock_ldap_logger.output[1],
+            f"INFO:zulip.ldap:Synced user groups for PreregistrationUser {prereg_user.id} in {realm.id}: "
+            '{"newtestgroup": true, "testgroup1": true, "testgroup2": false}. Final groups set: [\'newtestgroup\', \'testgroup1\']',
+        )
+
+    @override_settings(TERMS_OF_SERVICE_VERSION=None)
+    def test_social_auth_create_user_from_multiuse_invite_role_and_group_sync(self) -> None:
+        email = "newuser@zulip.com"
+        name = "Full Name"
+        subdomain = "zulip"
+        desdemona = self.example_user("desdemona")
+        realm = get_realm("zulip")
+
+        account_data_dict = self.get_account_data_dict(email=email, name=name)
+        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
+        idps_dict["test_idp"]["extra_attrs"] = ["zulip_role"]
+
+        testgroup1 = create_user_group_in_database("testgroup1", [], realm, acting_user=desdemona)
+        testgroup2 = create_user_group_in_database("testgroup2", [], realm, acting_user=desdemona)
+
+        sync_custom_attrs_dict = {
+            "zulip": {
+                "saml": {
+                    "role": "zulip_role",
+                    "groups": ["testgroup1", ("samlgroup2", "testgroup2")],
+                }
+            }
+        }
+
+        invite = MultiuseInvite.objects.create(
+            realm=realm,
+            referred_by=desdemona,
+            # Set a role on the invite to verify that it gets ignored in favor
+            # of the role implied by the zulip_role attribute.
+            invited_as=PreregistrationUser.INVITE_AS["REALM_ADMIN"],
+        )
+        invite.groups.set([testgroup1, testgroup2])
+        create_confirmation_link(invite, Confirmation.MULTIUSE_INVITE)
+        multiuse_confirmation = Confirmation.objects.all().last()
+        assert multiuse_confirmation is not None
+        multiuse_object_key = multiuse_confirmation.confirmation_key
+        account_data_dict = self.get_account_data_dict(email=email, name=name)
+        with (
+            self.settings(
+                SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
+                SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
+            ),
+        ):
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                is_signup=True,
+                multiuse_object_key=multiuse_object_key,
+                extra_attributes=dict(
+                    zulip_role=["member"],
+                    zulip_groups=["testgroup1"],
+                ),
+            )
+        with self.assertLogs("zulip.ldap", level="INFO") as mock_logger:
+            self.stage_two_of_registration(
+                result, realm, subdomain, email, name, name, self.BACKEND_CLASS.full_name_validated
+            )
+        user_profile = get_user_by_delivery_email(email, realm)
+        self.assertEqual(user_profile.role, UserProfile.ROLE_MEMBER)
+        self.assertTrue(
+            is_user_in_group(
+                testgroup1.id,
+                user_profile,
+                direct_member_only=True,
+            )
+        )
+        self.assertFalse(
+            is_user_in_group(
+                testgroup2.id,
+                user_profile,
+                direct_member_only=True,
+            )
+        )
+
+        prereg_user = PreregistrationUser.objects.last()
+        assert prereg_user is not None
+        self.assertEqual(
+            f"INFO:zulip.ldap:Synced user groups for PreregistrationUser {prereg_user.id} in {realm.id}: "
+            '{"testgroup1": true, "testgroup2": false}. Final groups set: [\'testgroup1\']',
+            mock_logger.output[0],
+        )
+
+    @override_settings(TERMS_OF_SERVICE_VERSION=None)
+    def test_social_auth_create_user_with_synced_role_only(self) -> None:
+        email = "newuser@zulip.com"
+        name = "Full Name"
+        subdomain = "zulip"
+        realm = get_realm("zulip")
+
+        account_data_dict = self.get_account_data_dict(email=email, name=name)
+
+        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
+        idps_dict["test_idp"]["extra_attrs"] = ["zulip_role"]
+        sync_custom_attrs_dict = {
+            "zulip": {
+                "saml": {
+                    "role": "zulip_role",
+                }
+            }
+        }
+
+        with (
+            self.settings(
+                SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
+                SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
+            ),
+            self.assertLogs(self.logger_string, level="INFO") as mock_logger,
+        ):
+            result = self.social_auth_test(
+                account_data_dict,
+                subdomain="zulip",
+                is_signup=True,
+                extra_attributes=dict(
+                    zulip_role=["owner"],
+                    # Groups won't get synced, despite being passed - group sync
+                    # is not configured.
+                    zulip_groups=["samlgroup1"],
+                ),
+            )
+            self.stage_two_of_registration(
+                result, realm, subdomain, email, name, name, self.BACKEND_CLASS.full_name_validated
+            )
+
+        user_profile = get_user_by_delivery_email(email, realm)
+        self.assertEqual(user_profile.role, UserProfile.ROLE_REALM_OWNER)
+        self.assertEqual(
+            mock_logger.output[0],
+            self.logger_output("Returning role owner for user creation", type="info"),
+        )
+
+    def test_social_auth_sync_field_not_existing(self) -> None:
+        sync_custom_attrs_dict = {
+            "zulip": {
+                "saml": {
+                    "custom__title": "title",
+                    "custom__phone_number": "mobilePhone",
+                    "wrongfield": "wrongfield",
                 }
             }
         }
@@ -2920,14 +4011,16 @@ class SAMLAuthBackendTest(SocialAuthBase):
 
         with self.settings(
             SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
-            SOCIAL_AUTH_SYNC_CUSTOM_ATTRS_DICT=sync_custom_attrs_dict,
+            SOCIAL_AUTH_SYNC_ATTRS_DICT=sync_custom_attrs_dict,
         ):
             account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
             with self.assertLogs(self.logger_string, level="WARNING") as m:
                 result = self.social_auth_test(
                     account_data_dict,
                     subdomain="zulip",
-                    extra_attributes=dict(mobilePhone=["123412341234"], birthday=["2021-01-01"]),
+                    extra_attributes=dict(
+                        mobilePhone=["123412341234"], title=["some title"], birthday=["2021-01-01"]
+                    ),
                 )
         data = load_subdomain_token(result)
         self.assertEqual(data["email"], self.email)
@@ -2939,25 +4032,28 @@ class SAMLAuthBackendTest(SocialAuthBase):
             m.output,
             [
                 self.logger_output(
+                    "Ignoring unsupported UserProfile field wrongfield in SOCIAL_AUTH_SYNC_ATTRS_DICT",
+                    "warning",
+                ),
+                self.logger_output(
                     (
                         "Exception while syncing custom profile fields for user"
                         f" {self.user_profile.id}: Custom profile field with name title not found."
                     ),
                     "warning",
-                )
+                ),
             ],
         )
 
 
 class AppleAuthMixin:
-    BACKEND_CLASS = AppleAuthBackend
     CLIENT_KEY_SETTING = "SOCIAL_AUTH_APPLE_KEY"
     AUTHORIZATION_URL = "https://appleid.apple.com/auth/authorize"
     ACCESS_TOKEN_URL = "https://appleid.apple.com/auth/token"
     AUTH_FINISH_URL = "/complete/apple/"
 
     def generate_id_token(
-        self, account_data_dict: Dict[str, str], audience: Optional[str] = None
+        self, account_data_dict: dict[str, str], audience: str | None = None
     ) -> str:
         payload = dict(email=account_data_dict["email"])
 
@@ -2976,7 +4072,7 @@ class AppleAuthMixin:
 
         return id_token
 
-    def get_account_data_dict(self, email: str, name: str) -> Dict[str, Any]:
+    def get_account_data_dict(self, email: str, name: str) -> dict[str, Any]:
         name_parts = name.split(" ")
         first_name = name_parts[0]
         last_name = ""
@@ -2987,6 +4083,7 @@ class AppleAuthMixin:
 
 
 class AppleIdAuthBackendTest(AppleAuthMixin, SocialAuthBase):
+    BACKEND_CLASS = AppleAuthBackend
     LOGIN_URL = "/accounts/login/social/apple"
     SIGNUP_URL = "/accounts/register/social/apple"
 
@@ -2994,16 +4091,17 @@ class AppleIdAuthBackendTest(AppleAuthMixin, SocialAuthBase):
     # dummy value to keep SocialAuthBase common code happy.
     USER_INFO_URL = "/invalid-unused-url"
 
+    @override
     def social_auth_test_finish(
         self,
         result: "TestHttpResponse",
-        account_data_dict: Dict[str, str],
+        account_data_dict: dict[str, str],
         expect_choose_email_screen: bool,
         headers: Any,
         **extra_data: Any,
     ) -> "TestHttpResponse":
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        state = urllib.parse.parse_qs(parsed_url.query)["state"]
+        parsed_url = urlsplit(result["Location"])
+        state = parse_qs(parsed_url.query)["state"]
         user_param = json.dumps(account_data_dict)
         self.client.session.flush()
         result = self.client_post(
@@ -3011,10 +4109,11 @@ class AppleIdAuthBackendTest(AppleAuthMixin, SocialAuthBase):
         )
         return result
 
+    @override
     def register_extra_endpoints(
         self,
         requests_mock: responses.RequestsMock,
-        account_data_dict: Dict[str, str],
+        account_data_dict: dict[str, str],
         **extra_data: Any,
     ) -> None:
         # This is an URL of an endpoint on Apple servers that returns
@@ -3027,7 +4126,8 @@ class AppleIdAuthBackendTest(AppleAuthMixin, SocialAuthBase):
             json=json.loads(EXAMPLE_JWK),
         )
 
-    def generate_access_token_url_payload(self, account_data_dict: Dict[str, str]) -> str:
+    @override
+    def generate_access_token_url_payload(self, account_data_dict: dict[str, str]) -> str:
         # The ACCESS_TOKEN_URL endpoint works a bit different than in standard Oauth2,
         # and here, similarly to OIDC, id_token is also returned in the response.
         # In Apple auth, all the user information is carried in the id_token.
@@ -3070,14 +4170,16 @@ class AppleIdAuthBackendTest(AppleAuthMixin, SocialAuthBase):
 
     def test_id_token_verification_failure(self) -> None:
         account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
-        with self.assertLogs(self.logger_string, level="INFO") as m:
-            with mock.patch("jwt.decode", side_effect=PyJWTError):
-                result = self.social_auth_test(
-                    account_data_dict,
-                    expect_choose_email_screen=True,
-                    subdomain="zulip",
-                    is_signup=True,
-                )
+        with (
+            self.assertLogs(self.logger_string, level="INFO") as m,
+            mock.patch("jwt.decode", side_effect=PyJWTError),
+        ):
+            result = self.social_auth_test(
+                account_data_dict,
+                expect_choose_email_screen=True,
+                subdomain="zulip",
+                is_signup=True,
+            )
         self.assertEqual(result.status_code, 302)
         self.assertEqual(result["Location"], "/login/")
         self.assertEqual(
@@ -3115,23 +4217,26 @@ class AppleIdAuthBackendTest(AppleAuthMixin, SocialAuthBase):
 
 
 class AppleAuthBackendNativeFlowTest(AppleAuthMixin, SocialAuthBase):
+    BACKEND_CLASS = AppleAuthBackend
     SIGNUP_URL = "/complete/apple/"
     LOGIN_URL = "/complete/apple/"
 
+    @override
     def prepare_login_url_and_headers(
         self,
         subdomain: str,
-        mobile_flow_otp: Optional[str] = None,
-        desktop_flow_otp: Optional[str] = None,
+        mobile_flow_otp: str | None = None,
+        desktop_flow_otp: str | None = None,
         is_signup: bool = False,
         next: str = "",
         multiuse_object_key: str = "",
-        alternative_start_url: Optional[str] = None,
-        id_token: Optional[str] = None,
+        alternative_start_url: str | None = None,
+        id_token: str | None = None,
         account_data_dict: Mapping[str, str] = {},
         *,
-        user_agent: Optional[str] = None,
-    ) -> Tuple[str, Dict[str, Any]]:
+        user_agent: str | None = None,
+        extra_headers: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         url, headers = super().prepare_login_url_and_headers(
             subdomain,
             mobile_flow_otp,
@@ -3141,6 +4246,7 @@ class AppleAuthBackendNativeFlowTest(AppleAuthMixin, SocialAuthBase):
             multiuse_object_key,
             alternative_start_url=alternative_start_url,
             user_agent=user_agent,
+            extra_headers=extra_headers,
         )
 
         params = {"native_flow": "true"}
@@ -3159,19 +4265,21 @@ class AppleAuthBackendNativeFlowTest(AppleAuthMixin, SocialAuthBase):
         url += f"&{urlencode(params)}"
         return url, headers
 
+    @override
     def social_auth_test(
         self,
-        account_data_dict: Dict[str, str],
+        account_data_dict: dict[str, str],
         *,
         subdomain: str,
-        mobile_flow_otp: Optional[str] = None,
-        desktop_flow_otp: Optional[str] = None,
+        mobile_flow_otp: str | None = None,
+        desktop_flow_otp: str | None = None,
         is_signup: bool = False,
         next: str = "",
         multiuse_object_key: str = "",
-        alternative_start_url: Optional[str] = None,
+        alternative_start_url: str | None = None,
         skip_id_token: bool = False,
-        user_agent: Optional[str] = None,
+        user_agent: str | None = None,
+        extra_headers: dict[str, Any] | None = None,
         **extra_data: Any,
     ) -> "TestHttpResponse":
         """In Apple's native authentication flow, the client app authenticates
@@ -3187,7 +4295,7 @@ class AppleAuthBackendNativeFlowTest(AppleAuthMixin, SocialAuthBase):
         """
 
         if not skip_id_token:
-            id_token: Optional[str] = self.generate_id_token(
+            id_token: str | None = self.generate_id_token(
                 account_data_dict, settings.SOCIAL_AUTH_APPLE_APP_ID
             )
         else:
@@ -3204,6 +4312,7 @@ class AppleAuthBackendNativeFlowTest(AppleAuthMixin, SocialAuthBase):
             user_agent=user_agent,
             id_token=id_token,
             account_data_dict=account_data_dict,
+            extra_headers=extra_headers,
         )
 
         with self.apple_jwk_url_mock():
@@ -3236,11 +4345,12 @@ class AppleAuthBackendNativeFlowTest(AppleAuthMixin, SocialAuthBase):
         )
         self.assert_json_error(result, "Missing id_token parameter")
 
+    @override
     def test_social_auth_session_fields_cleared_correctly(self) -> None:
         mobile_flow_otp = "1234abcd" * 8
         account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
 
-        def initiate_auth(mobile_flow_otp: Optional[str] = None) -> None:
+        def initiate_auth(mobile_flow_otp: str | None = None) -> None:
             url, headers = self.prepare_login_url_and_headers(
                 subdomain="zulip",
                 id_token="invalid",
@@ -3298,18 +4408,20 @@ class AppleAuthBackendNativeFlowTest(AppleAuthMixin, SocialAuthBase):
             m.output,
             [
                 self.logger_output(
-                    "/complete/apple/: Authentication failed: Token validation failed by Invalid audience",
+                    "/complete/apple/: Authentication failed: Token validation failed by Audience doesn't match",
                     "info",
                 )
             ],
         )
 
+    @override
     def test_social_auth_desktop_success(self) -> None:
         """
         The desktop app doesn't use the native flow currently and the desktop app flow in its
         current form happens in the browser, thus only the web flow is viable there.
         """
 
+    @override
     def test_social_auth_no_key(self) -> None:
         """
         The basic validation of server configuration is handled on the
@@ -3321,8 +4433,8 @@ class GenericOpenIdConnectTest(SocialAuthBase):
     BACKEND_CLASS = GenericOpenIdConnectBackend
     CLIENT_KEY_SETTING = "SOCIAL_AUTH_TESTOIDC_KEY"
     CLIENT_SECRET_SETTING = "SOCIAL_AUTH_TESTOIDC_SECRET"
-    LOGIN_URL = "/accounts/login/social/oidc"
-    SIGNUP_URL = "/accounts/register/social/oidc"
+    LOGIN_URL = "/accounts/login/social/oidc/testoidc"
+    SIGNUP_URL = "/accounts/register/social/oidc/testoidc"
 
     BASE_OIDC_URL = "https://example.com/api/openid"
     AUTHORIZATION_URL = f"{BASE_OIDC_URL}/authorize"
@@ -3331,22 +4443,19 @@ class GenericOpenIdConnectTest(SocialAuthBase):
     USER_INFO_URL = f"{BASE_OIDC_URL}/userinfo"
     AUTH_FINISH_URL = "/complete/oidc/"
 
-    def social_auth_test(
-        self,
-        *args: Any,
-        **kwargs: Any,
-    ) -> "TestHttpResponse":
+    def _default_discovery_payload(self, base_oidc_url: str) -> dict[str, Any]:
         # Example payload of the discovery endpoint (with appropriate values filled
         # in to match our test setup).
         # All the attributes below are REQUIRED per OIDC specification:
         # https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderMetadata
         # or at least required for the `code` flow with userinfo - that this implementation uses.
         # Other flows are not supported right now.
-        idp_discovery_endpoint_payload_dict = {
-            "issuer": self.BASE_OIDC_URL,
-            "authorization_endpoint": self.AUTHORIZATION_URL,
-            "token_endpoint": self.ACCESS_TOKEN_URL,
-            "userinfo_endpoint": self.USER_INFO_URL,
+        return {
+            "issuer": base_oidc_url,
+            "authorization_endpoint": f"{base_oidc_url}/authorize",
+            "token_endpoint": f"{base_oidc_url}/token",
+            "userinfo_endpoint": f"{base_oidc_url}/userinfo",
+            "jwks_uri": f"{base_oidc_url}/jwks.json",
             "response_types_supported": [
                 "code",
                 "id_token",
@@ -3355,25 +4464,47 @@ class GenericOpenIdConnectTest(SocialAuthBase):
                 "code id_token",
                 "code id_token token",
             ],
-            "jwks_uri": self.JWKS_URL,
             "id_token_signing_alg_values_supported": ["HS256", "RS256"],
             "subject_types_supported": ["public"],
         }
 
+    @contextmanager
+    def mock_oidc_discovery(
+        self,
+        base_oidc_url: str,
+        *,
+        assert_all_requests_are_fired: bool = False,
+    ) -> Iterator[responses.RequestsMock]:
+        discovery_url = f"{base_oidc_url}/.well-known/openid-configuration"
+        body = json.dumps(self._default_discovery_payload(base_oidc_url))
+
+        with responses.RequestsMock(
+            assert_all_requests_are_fired=assert_all_requests_are_fired
+        ) as requests_mock:
+            requests_mock.add(
+                method=responses.GET,
+                url=discovery_url,
+                status=200,
+                body=body,
+                content_type="application/json",
+            )
+            yield requests_mock
+
+    @override
+    def social_auth_test(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> "TestHttpResponse":
         # We need to run the social_auth_test procedure with a mock response set up for the
         # OIDC discovery endpoint as that's the first thing requested by the server when a user
         # starts trying to authenticate.
-        with responses.RequestsMock(assert_all_requests_are_fired=False) as requests_mock:
-            requests_mock.add(
-                requests_mock.GET,
-                f"{self.BASE_OIDC_URL}/.well-known/openid-configuration",
-                status=200,
-                body=json.dumps(idp_discovery_endpoint_payload_dict),
-            )
+        with self.mock_oidc_discovery(self.BASE_OIDC_URL):
             result = super().social_auth_test(*args, **kwargs)
 
         return result
 
+    @override
     def social_auth_test_finish(self, *args: Any, **kwargs: Any) -> "TestHttpResponse":
         # Trying to generate a (access_token, id_token) pair here in tests that would
         # successfully pass validation by validate_and_return_id_token is impractical
@@ -3386,10 +4517,11 @@ class GenericOpenIdConnectTest(SocialAuthBase):
         ):
             return super().social_auth_test_finish(*args, **kwargs)
 
+    @override
     def register_extra_endpoints(
         self,
         requests_mock: responses.RequestsMock,
-        account_data_dict: Dict[str, str],
+        account_data_dict: dict[str, str],
         **extra_data: Any,
     ) -> None:
         requests_mock.add(
@@ -3399,7 +4531,18 @@ class GenericOpenIdConnectTest(SocialAuthBase):
             json=json.loads(EXAMPLE_JWK),
         )
 
-    def generate_access_token_url_payload(self, account_data_dict: Dict[str, str]) -> str:
+        discovery_url = f"{self.BASE_OIDC_URL}/.well-known/openid-configuration"
+        body = json.dumps(self._default_discovery_payload(self.BASE_OIDC_URL))
+        requests_mock.add(
+            method=responses.GET,
+            url=discovery_url,
+            status=200,
+            body=body,
+            content_type="application/json",
+        )
+
+    @override
+    def generate_access_token_url_payload(self, account_data_dict: dict[str, str]) -> str:
         return json.dumps(
             {
                 "access_token": "foobar",
@@ -3409,7 +4552,8 @@ class GenericOpenIdConnectTest(SocialAuthBase):
             }
         )
 
-    def get_account_data_dict(self, email: str, name: Optional[str]) -> Dict[str, Any]:
+    @override
+    def get_account_data_dict(self, email: str, name: str | None) -> dict[str, Any]:
         if name is not None:
             name_parts = name.split(" ")
             given_name = name_parts[0]
@@ -3438,7 +4582,7 @@ class GenericOpenIdConnectTest(SocialAuthBase):
         account_data_dict = self.get_account_data_dict(email=email, name=name)
 
         oidc_setting_dict = copy.deepcopy(settings.SOCIAL_AUTH_OIDC_ENABLED_IDPS)
-        idp_settings_dict = list(oidc_setting_dict.values())[0]
+        [idp_settings_dict] = oidc_setting_dict.values()
         idp_settings_dict["auto_signup"] = True
         with mock.patch.object(GenericOpenIdConnectBackend, "settings_dict", new=idp_settings_dict):
             result = self.social_auth_test(
@@ -3480,6 +4624,7 @@ class GenericOpenIdConnectTest(SocialAuthBase):
             expect_full_name_prepopulated=False,
         )
 
+    @override
     def test_social_auth_no_key(self) -> None:
         """
         Requires overriding because client key/secret are configured
@@ -3488,29 +4633,155 @@ class GenericOpenIdConnectTest(SocialAuthBase):
         account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
 
         mock_oidc_setting_dict = copy.deepcopy(settings.SOCIAL_AUTH_OIDC_ENABLED_IDPS)
-        idp_config_dict = list(mock_oidc_setting_dict.values())[0]
+        [idp_config_dict] = mock_oidc_setting_dict.values()
         del idp_config_dict["client_id"]
-        with self.settings(SOCIAL_AUTH_OIDC_ENABLED_IDPS=mock_oidc_setting_dict):
+        with (
+            self.settings(SOCIAL_AUTH_OIDC_ENABLED_IDPS=mock_oidc_setting_dict),
+            self.assertLogs("django.request", level="ERROR") as m,
+        ):
             result = self.social_auth_test(
                 account_data_dict, subdomain="zulip", next="/user_uploads/image"
             )
-            self.assert_in_success_response(["Configuration error", "OpenID Connect"], result)
-
-    def test_too_many_idps(self) -> None:
-        """
-        Only one IdP is supported for now.
-        """
-        account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
-
-        mock_oidc_setting_dict = copy.deepcopy(settings.SOCIAL_AUTH_OIDC_ENABLED_IDPS)
-        idp_config_dict = list(mock_oidc_setting_dict.values())[0]
-        mock_oidc_setting_dict["secondprovider"] = idp_config_dict
-        with self.settings(SOCIAL_AUTH_OIDC_ENABLED_IDPS=mock_oidc_setting_dict):
-            result = self.social_auth_test(
-                account_data_dict, subdomain="zulip", next="/user_uploads/image"
+            self.assertEqual(result.status_code, 500)
+            self.assert_in_response("Configuration error", result)
+            self.assert_in_response("OpenID Connect", result)
+            self.assertEqual(
+                m.output,
+                [f"ERROR:django.request:Internal Server Error: {self.LOGIN_URL}"],
             )
-            self.assert_in_success_response(["Configuration error", "OpenID Connect"], result)
 
+        with (
+            self.settings(SOCIAL_AUTH_OIDC_ENABLED_IDPS=mock_oidc_setting_dict),
+            self.assertLogs("django.request", level="ERROR") as m,
+        ):
+            result = self.social_auth_test(
+                account_data_dict, is_signup=True, subdomain="zulip", next="/user_uploads/image"
+            )
+            self.assertEqual(result.status_code, 500)
+            self.assert_in_response("Configuration error", result)
+            self.assert_in_response("OpenID Connect", result)
+            self.assertEqual(
+                m.output, [f"ERROR:django.request:Internal Server Error: {self.SIGNUP_URL}"]
+            )
+
+    def test_social_auth_oidc_multiple_idps_configured(self) -> None:
+        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_OIDC_ENABLED_IDPS)
+        idps_dict["testoidc2"] = copy.deepcopy(idps_dict["testoidc"])
+        idps_dict["testoidc2"]["oidc_url"] = "https://example.com/idp2/api/openid"
+        idps_dict["testoidc2"]["display_name"] = "Second Test IdP"
+        idps_dict["testoidc2"]["limit_to_subdomains"] = ["zulip"]
+        with self.settings(SOCIAL_AUTH_OIDC_ENABLED_IDPS=idps_dict):
+            # Go to the login page and check that buttons to log in show up for both IdPs:
+            result = self.client_get("/accounts/login/")
+            self.assert_in_success_response(["Log in with Test IdP"], result)
+            self.assert_in_success_response(["/accounts/login/social/oidc/testoidc"], result)
+            self.assert_in_success_response(["Log in with Second Test IdP"], result)
+            self.assert_in_success_response(["/accounts/login/social/oidc/testoidc2"], result)
+
+            # Try successful authentication with the regular idp from all previous tests:
+            self.test_social_auth_success()
+
+            # Now test with the second idp:
+            original_LOGIN_URL = self.LOGIN_URL
+            original_SIGNUP_URL = self.SIGNUP_URL
+            original_AUTHORIZATION_URL = self.AUTHORIZATION_URL
+            original_BASE_OIDC_URL = self.BASE_OIDC_URL
+            original_ACCESS_TOKEN_URL = self.ACCESS_TOKEN_URL
+            original_JWKS_URL = self.JWKS_URL
+            original_USER_INFO_URL = self.USER_INFO_URL
+            original_AUTH_FINISH_URL = self.AUTH_FINISH_URL
+            self.LOGIN_URL = "/accounts/login/social/oidc/testoidc2"
+            self.SIGNUP_URL = "/accounts/register/social/oidc/testoidc2"
+            self.BASE_OIDC_URL = idps_dict["testoidc2"]["oidc_url"]
+            self.AUTHORIZATION_URL = f"{self.BASE_OIDC_URL}/authorize"
+            self.ACCESS_TOKEN_URL = f"{self.BASE_OIDC_URL}/token"
+            self.JWKS_URL = f"{self.BASE_OIDC_URL}/jwks"
+            self.USER_INFO_URL = f"{self.BASE_OIDC_URL}/userinfo"
+            try:
+                self.test_social_auth_success()
+            finally:
+                # Restore original values at the end, regardless of what happens
+                # in the block above, to avoid affecting other tests in unpredictable
+                # ways.
+                self.LOGIN_URL = original_LOGIN_URL
+                self.SIGNUP_URL = original_SIGNUP_URL
+                self.AUTHORIZATION_URL = original_AUTHORIZATION_URL
+                self.BASE_OIDC_URL = original_BASE_OIDC_URL
+                self.ACCESS_TOKEN_URL = original_ACCESS_TOKEN_URL
+                self.JWKS_URL = original_JWKS_URL
+                self.USER_INFO_URL = original_USER_INFO_URL
+                self.AUTH_FINISH_URL = original_AUTH_FINISH_URL
+
+    def test_no_idp_parameter(self) -> None:
+        with self.assertLogs(self.logger_string, level="INFO") as m:
+            result = self.client_get(reverse("social:begin", args=[self.backend.name]))
+        self.assert_json_error(result, "Missing idp param")
+        self.assertEqual(
+            m.output, [self.logger_output("/login/oidc/: Missing idp param.", type="info")]
+        )
+
+    def test_social_auth_oidc_idp_limited_to_subdomains_attempt_wrong_realm(self) -> None:
+        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_OIDC_ENABLED_IDPS)
+        idps_dict["testoidc"]["limit_to_subdomains"] = ["zulip"]
+        with self.settings(SOCIAL_AUTH_OIDC_ENABLED_IDPS=idps_dict):
+            account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
+            with self.assertLogs(self.logger_string, level="INFO") as m:
+                result = self.social_auth_test(account_data_dict, subdomain="zephyr")
+        self.assertEqual(result.status_code, 302)
+        self.assertEqual("/login/", result["Location"])
+        self.assertEqual(
+            m.output,
+            [
+                self.logger_output(
+                    "/complete/oidc/: Authentication request with IdP testoidc but this provider is not enabled "
+                    "for this subdomain zephyr.",
+                    "info",
+                )
+            ],
+        )
+
+    @override
+    def test_social_auth_complete(self) -> None:
+        def mock_process_error(backend: BaseOAuth2, data: Mapping[str, object]) -> None:
+            raise AuthFailed(backend, "Not found")
+
+        with (
+            mock.patch(
+                "social_core.backends.oauth.BaseOAuth2.process_error",
+                autospec=True,
+                side_effect=mock_process_error,
+            ),
+            self.assertLogs(self.logger_string, level="INFO") as m,
+        ):
+            result = self.client_get(reverse("social:complete", args=[self.backend.name]))
+            self.assertEqual(result.status_code, 302)
+            self.assertIn("login", result["Location"])
+        self.assertEqual(
+            m.output,
+            [
+                self.logger_output("AuthFailed: Authentication failed: Not found", "info"),
+            ],
+        )
+
+        with (
+            self.assertLogs(self.logger_string, level="WARNING") as m,
+        ):
+            result = self.client_get(reverse("social:complete", args=[self.backend.name]))
+            self.assertEqual(result.status_code, 302)
+            self.assertIn("login", result["Location"])
+        self.assertEqual(
+            m.output,
+            [
+                self.logger_output("Missing needed parameter state", "warning"),
+            ],
+        )
+
+    @override
+    def test_social_auth_session_fields_cleared_correctly(self) -> None:
+        with self.mock_oidc_discovery(self.BASE_OIDC_URL):
+            super().test_social_auth_session_fields_cleared_correctly()
+
+    @override
     def test_config_error_development(self) -> None:
         """
         This test is redundant for now, as test_social_auth_no_key already
@@ -3519,6 +4790,7 @@ class GenericOpenIdConnectTest(SocialAuthBase):
         """
         return
 
+    @override
     def test_config_error_production(self) -> None:
         """
         This test is redundant for now, as test_social_auth_no_key already
@@ -3538,19 +4810,20 @@ class GitHubAuthBackendTest(SocialAuthBase):
     ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
     USER_INFO_URL = "https://api.github.com/user"
     AUTH_FINISH_URL = "/complete/github/"
-    email_data: List[Dict[str, Any]] = []
+    email_data: list[dict[str, Any]] = []
 
+    @override
     def social_auth_test_finish(
         self,
         result: "TestHttpResponse",
-        account_data_dict: Dict[str, str],
+        account_data_dict: dict[str, str],
         expect_choose_email_screen: bool,
         headers: Any,
         expect_noreply_email_allowed: bool = False,
         **extra_data: Any,
     ) -> "TestHttpResponse":
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        csrf_state = urllib.parse.parse_qs(parsed_url.query)["state"]
+        parsed_url = urlsplit(result["Location"])
+        csrf_state = parse_qs(parsed_url.query)["state"]
         result = self.client_get(self.AUTH_FINISH_URL, dict(state=csrf_state), **headers)
 
         if expect_choose_email_screen:
@@ -3590,10 +4863,11 @@ class GitHubAuthBackendTest(SocialAuthBase):
 
         return result
 
+    @override
     def register_extra_endpoints(
         self,
         requests_mock: responses.RequestsMock,
-        account_data_dict: Dict[str, str],
+        account_data_dict: dict[str, str],
         **extra_data: Any,
     ) -> None:
         # Keeping a verified email before the primary email makes sure
@@ -3616,9 +4890,10 @@ class GitHubAuthBackendTest(SocialAuthBase):
 
         self.email_data = email_data
 
+    @override
     def get_account_data_dict(
         self, email: str, name: str, user_avatar_url: str = ""
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         return dict(email=email, name=name, user_avatar_url=user_avatar_url)
 
     def test_social_auth_email_not_verified(self) -> None:
@@ -3633,7 +4908,7 @@ class GitHubAuthBackendTest(SocialAuthBase):
                 account_data_dict, subdomain=subdomain, email_data=email_data
             )
             self.assertEqual(result.status_code, 302)
-            self.assertEqual(result["Location"], realm.uri + "/login/")
+            self.assertEqual(result["Location"], realm.url + "/login/")
         self.assertEqual(
             m.output,
             [
@@ -3646,16 +4921,23 @@ class GitHubAuthBackendTest(SocialAuthBase):
 
     @override_settings(SOCIAL_AUTH_GITHUB_TEAM_ID="51246")
     def test_social_auth_github_team_not_member_failed(self) -> None:
+        def mock_user_data(backend: GithubTeamOAuth2, *args: object, **kwargs: object) -> object:
+            raise AuthFailed(backend, "Not found")
+
         account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
         subdomain = "zulip"
         realm = get_realm(subdomain)
-        with mock.patch(
-            "social_core.backends.github.GithubTeamOAuth2.user_data",
-            side_effect=AuthFailed("Not found"),
-        ), self.assertLogs(self.logger_string, level="INFO") as mock_info:
+        with (
+            mock.patch(
+                "social_core.backends.github.GithubTeamOAuth2.user_data",
+                autospec=True,
+                side_effect=mock_user_data,
+            ),
+            self.assertLogs(self.logger_string, level="INFO") as mock_info,
+        ):
             result = self.social_auth_test(account_data_dict, subdomain=subdomain)
             self.assertEqual(result.status_code, 302)
-            self.assertEqual(result["Location"], realm.uri + "/login/")
+            self.assertEqual(result["Location"], realm.url + "/login/")
         self.assertEqual(
             mock_info.output,
             [
@@ -3682,16 +4964,25 @@ class GitHubAuthBackendTest(SocialAuthBase):
 
     @override_settings(SOCIAL_AUTH_GITHUB_ORG_NAME="Zulip")
     def test_social_auth_github_organization_not_member_failed(self) -> None:
+        def mock_user_data(
+            backend: GithubOrganizationOAuth2, *args: object, **kwargs: object
+        ) -> object:
+            raise AuthFailed(backend, "Not found")
+
         account_data_dict = self.get_account_data_dict(email=self.email, name=self.name)
         subdomain = "zulip"
         realm = get_realm(subdomain)
-        with mock.patch(
-            "social_core.backends.github.GithubOrganizationOAuth2.user_data",
-            side_effect=AuthFailed("Not found"),
-        ), self.assertLogs(self.logger_string, level="INFO") as mock_info:
+        with (
+            mock.patch(
+                "social_core.backends.github.GithubOrganizationOAuth2.user_data",
+                autospec=True,
+                side_effect=mock_user_data,
+            ),
+            self.assertLogs(self.logger_string, level="INFO") as mock_info,
+        ):
             result = self.social_auth_test(account_data_dict, subdomain=subdomain)
             self.assertEqual(result.status_code, 302)
-            self.assertEqual(result["Location"], realm.uri + "/login/")
+            self.assertEqual(result["Location"], realm.url + "/login/")
         self.assertEqual(
             mock_info.output,
             [
@@ -3744,9 +5035,9 @@ class GitHubAuthBackendTest(SocialAuthBase):
         self.assertEqual(data["subdomain"], "zulip")
         self.assertEqual(data["redirect_to"], "/user_uploads/image")
         self.assertEqual(result.status_code, 302)
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        uri = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        self.assertTrue(uri.startswith("http://zulip.testserver/accounts/login/subdomain/"))
+        parsed_url = urlsplit(result["Location"])
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
 
     def test_github_oauth2_success_single_email(self) -> None:
         # If the user has a single email associated with its GitHub account,
@@ -3769,9 +5060,9 @@ class GitHubAuthBackendTest(SocialAuthBase):
         self.assertEqual(data["subdomain"], "zulip")
         self.assertEqual(data["redirect_to"], "/user_uploads/image")
         self.assertEqual(result.status_code, 302)
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        uri = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        self.assertTrue(uri.startswith("http://zulip.testserver/accounts/login/subdomain/"))
+        parsed_url = urlsplit(result["Location"])
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
 
     def test_github_oauth2_login_only_one_account_exists(self) -> None:
         # In a login flow, if only one of the user's verified emails
@@ -3798,9 +5089,9 @@ class GitHubAuthBackendTest(SocialAuthBase):
         self.assertEqual(data["subdomain"], "zulip")
         self.assertEqual(data["redirect_to"], "/user_uploads/image")
         self.assertEqual(result.status_code, 302)
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        uri = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        self.assertTrue(uri.startswith("http://zulip.testserver/accounts/login/subdomain/"))
+        parsed_url = urlsplit(result["Location"])
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
 
     def test_github_oauth2_login_multiple_accounts_exist(self) -> None:
         # In the login flow, if multiple of the user's verified emails
@@ -3827,9 +5118,9 @@ class GitHubAuthBackendTest(SocialAuthBase):
         self.assertEqual(data["subdomain"], "zulip")
         self.assertEqual(data["redirect_to"], "/user_uploads/image")
         self.assertEqual(result.status_code, 302)
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        uri = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        self.assertTrue(uri.startswith("http://zulip.testserver/accounts/login/subdomain/"))
+        parsed_url = urlsplit(result["Location"])
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
 
     def test_github_oauth2_login_no_account_exists(self) -> None:
         # In the login flow, if the user has multiple verified emails,
@@ -3888,9 +5179,9 @@ class GitHubAuthBackendTest(SocialAuthBase):
         self.assertEqual(data["subdomain"], "zulip")
         self.assertEqual(data["redirect_to"], "/user_uploads/image")
         self.assertEqual(result.status_code, 302)
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        uri = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        self.assertTrue(uri.startswith("http://zulip.testserver/accounts/login/subdomain/"))
+        parsed_url = urlsplit(result["Location"])
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
 
     def test_github_oauth2_signup_choose_new_email_to_register(self) -> None:
         # In the sign up flow, if the user has multiple verified
@@ -3941,7 +5232,7 @@ class GitHubAuthBackendTest(SocialAuthBase):
                 email_data=email_data,
             )
             self.assertEqual(result.status_code, 302)
-            self.assertEqual(result["Location"], realm.uri + "/login/")
+            self.assertEqual(result["Location"], realm.url + "/login/")
         self.assertEqual(
             m.output,
             [
@@ -3971,9 +5262,9 @@ class GitHubAuthBackendTest(SocialAuthBase):
         self.assertEqual(data["full_name"], account_data_dict["name"])
         self.assertEqual(data["subdomain"], "zulip")
         self.assertEqual(result.status_code, 302)
-        parsed_url = urllib.parse.urlparse(result["Location"])
-        uri = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        self.assertTrue(uri.startswith("http://zulip.testserver/accounts/login/subdomain/"))
+        parsed_url = urlsplit(result["Location"])
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        self.assertTrue(url.startswith("http://zulip.testserver/accounts/login/subdomain/"))
 
     def test_github_oauth2_email_not_associated(self) -> None:
         account_data_dict = self.get_account_data_dict(
@@ -3994,7 +5285,7 @@ class GitHubAuthBackendTest(SocialAuthBase):
                 email_data=email_data,
             )
             self.assertEqual(result.status_code, 302)
-            self.assertEqual(result["Location"], realm.uri + "/login/")
+            self.assertEqual(result["Location"], realm.url + "/login/")
         self.assertEqual(
             m.output,
             [
@@ -4026,7 +5317,7 @@ class GitHubAuthBackendTest(SocialAuthBase):
                 email_data=email_data,
             )
             self.assertEqual(result.status_code, 302)
-            self.assertEqual(result["Location"], realm.uri + "/login/")
+            self.assertEqual(result["Location"], realm.url + "/login/")
         self.assertEqual(
             m.output,
             [
@@ -4055,7 +5346,8 @@ class GitLabAuthBackendTest(SocialAuthBase):
         with self.settings(AUTHENTICATION_BACKENDS=("zproject.backends.GitLabAuthBackend",)):
             self.assertTrue(gitlab_auth_enabled())
 
-    def get_account_data_dict(self, email: str, name: str) -> Dict[str, Any]:
+    @override
+    def get_account_data_dict(self, email: str, name: str) -> dict[str, Any]:
         return dict(email=email, name=name, email_verified=True)
 
 
@@ -4070,7 +5362,8 @@ class GoogleAuthBackendTest(SocialAuthBase):
     USER_INFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
     AUTH_FINISH_URL = "/complete/google/"
 
-    def get_account_data_dict(self, email: str, name: str) -> Dict[str, Any]:
+    @override
+    def get_account_data_dict(self, email: str, name: str) -> dict[str, Any]:
         return dict(email=email, name=name, email_verified=True)
 
     def test_social_auth_email_not_verified(self) -> None:
@@ -4080,7 +5373,7 @@ class GoogleAuthBackendTest(SocialAuthBase):
         with self.assertLogs(self.logger_string, level="WARNING") as m:
             result = self.social_auth_test(account_data_dict, subdomain=subdomain)
             self.assertEqual(result.status_code, 302)
-            self.assertEqual(result["Location"], realm.uri + "/login/")
+            self.assertEqual(result["Location"], realm.url + "/login/")
         self.assertEqual(
             m.output,
             [
@@ -4091,7 +5384,7 @@ class GoogleAuthBackendTest(SocialAuthBase):
             ],
         )
 
-    def test_social_auth_mobile_realm_uri(self) -> None:
+    def test_social_auth_mobile_realm_url(self) -> None:
         mobile_flow_otp = "1234abcd" * 8
         account_data_dict = self.get_account_data_dict(email=self.email, name="Full Name")
 
@@ -4108,20 +5401,22 @@ class GoogleAuthBackendTest(SocialAuthBase):
 
         self.assertEqual(result.status_code, 302)
         redirect_url = result["Location"]
-        parsed_url = urllib.parse.urlparse(redirect_url)
-        query_params = urllib.parse.parse_qs(parsed_url.query)
+        parsed_url = urlsplit(redirect_url)
+        query_params = parse_qs(parsed_url.query)
         self.assertEqual(parsed_url.scheme, "zulip")
         self.assertEqual(query_params["realm"], ["http://zulip-mobile.testserver"])
         self.assertEqual(query_params["email"], [self.example_email("hamlet")])
         encrypted_api_key = query_params["otp_encrypted_api_key"][0]
-        hamlet_api_keys = get_all_api_keys(self.example_user("hamlet"))
-        self.assertIn(otp_decrypt_api_key(encrypted_api_key, mobile_flow_otp), hamlet_api_keys)
+        self.assertEqual(
+            otp_decrypt_api_key(encrypted_api_key, mobile_flow_otp),
+            self.example_user("hamlet").api_key,
+        )
 
     def test_social_auth_mobile_success_legacy_url(self) -> None:
         mobile_flow_otp = "1234abcd" * 8
         account_data_dict = self.get_account_data_dict(email=self.email, name="Full Name")
         self.assert_length(mail.outbox, 0)
-        self.user_profile.date_joined = timezone_now() - datetime.timedelta(
+        self.user_profile.date_joined = timezone_now() - timedelta(
             seconds=JUST_CREATED_THRESHOLD + 1
         )
         self.user_profile.save()
@@ -4153,14 +5448,16 @@ class GoogleAuthBackendTest(SocialAuthBase):
             )
         self.assertEqual(result.status_code, 302)
         redirect_url = result["Location"]
-        parsed_url = urllib.parse.urlparse(redirect_url)
-        query_params = urllib.parse.parse_qs(parsed_url.query)
+        parsed_url = urlsplit(redirect_url)
+        query_params = parse_qs(parsed_url.query)
         self.assertEqual(parsed_url.scheme, "zulip")
         self.assertEqual(query_params["realm"], ["http://zulip.testserver"])
         self.assertEqual(query_params["email"], [self.example_email("hamlet")])
         encrypted_api_key = query_params["otp_encrypted_api_key"][0]
-        hamlet_api_keys = get_all_api_keys(self.example_user("hamlet"))
-        self.assertIn(otp_decrypt_api_key(encrypted_api_key, mobile_flow_otp), hamlet_api_keys)
+        self.assertIn(
+            otp_decrypt_api_key(encrypted_api_key, mobile_flow_otp),
+            self.example_user("hamlet").api_key,
+        )
         self.assert_length(mail.outbox, 1)
         self.assertIn("Zulip on Android", mail.outbox[0].body)
 
@@ -4173,7 +5470,7 @@ class GoogleAuthBackendTest(SocialAuthBase):
         data: ExternalAuthDataDict,
         *,
         subdomain: str = "zulip",
-        force_token: Optional[str] = None,
+        force_token: str | None = None,
     ) -> "TestHttpResponse":
         if force_token is None:
             token = ExternalAuthResult(data_dict=data).store_data()
@@ -4192,9 +5489,11 @@ class GoogleAuthBackendTest(SocialAuthBase):
                 "redirect_to": next,
             }
             user_profile = self.example_user("hamlet")
-            with mock.patch("zerver.views.auth.authenticate", return_value=user_profile):
-                with mock.patch("zerver.views.auth.do_login"):
-                    result = self.get_log_into_subdomain(data)
+            with (
+                mock.patch("zerver.views.auth.authenticate", return_value=user_profile),
+                mock.patch("zerver.views.auth.do_login"),
+            ):
+                result = self.get_log_into_subdomain(data)
             return result
 
         res = test_redirect_to_next_url()
@@ -4204,9 +5503,9 @@ class GoogleAuthBackendTest(SocialAuthBase):
         self.assertEqual(res.status_code, 302)
         self.assertEqual(res["Location"], "http://zulip.testserver/user_uploads/path_to_image")
 
-        res = test_redirect_to_next_url("/#narrow/stream/7-test-here")
+        res = test_redirect_to_next_url("/#narrow/channel/7-test-here")
         self.assertEqual(res.status_code, 302)
-        self.assertEqual(res["Location"], "http://zulip.testserver/#narrow/stream/7-test-here")
+        self.assertEqual(res["Location"], "http://zulip.testserver/#narrow/channel/7-test-here")
 
     def test_log_into_subdomain_when_token_is_malformed(self) -> None:
         data: ExternalAuthDataDict = {
@@ -4282,7 +5581,7 @@ class GoogleAuthBackendTest(SocialAuthBase):
             "key": confirmation_key,
         }
         result = self.client_post("/accounts/register/", confirmation_data, subdomain="zulip")
-        self.assert_in_response("We just need you to do one last thing", result)
+        self.assert_in_response("Enter your account details to complete registration.", result)
 
         # Verify that the user is asked for name but not password
         self.assert_not_in_success_response(["id_password"], result)
@@ -4303,7 +5602,7 @@ class GoogleAuthBackendTest(SocialAuthBase):
         self.assert_in_response('action="http://zulip.testserver/accounts/do_confirm/', result)
 
         url = re.findall(
-            'action="(http://zulip.testserver/accounts/do_confirm[^"]*)"',
+            r'action="(http://zulip.testserver/accounts/do_confirm[^"]*)"',
             result.content.decode(),
         )[0]
         confirmation = Confirmation.objects.all().first()
@@ -4318,7 +5617,7 @@ class GoogleAuthBackendTest(SocialAuthBase):
             "key": confirmation_key,
         }
         result = self.client_post("/accounts/register/", confirmation_data, subdomain="zulip")
-        self.assert_in_response("We just need you to do one last thing", result)
+        self.assert_in_response("Enter your account details to complete registration.", result)
 
         # Verify that the user is asked for name but not password
         self.assert_not_in_success_response(["id_password"], result)
@@ -4338,10 +5637,9 @@ class GoogleAuthBackendTest(SocialAuthBase):
         realm.save()
 
         stream_names = ["new_stream_1", "new_stream_2"]
-        streams = []
-        for stream_name in set(stream_names):
-            stream = ensure_stream(realm, stream_name, acting_user=None)
-            streams.append(stream)
+        streams = [
+            ensure_stream(realm, stream_name, acting_user=None) for stream_name in stream_names
+        ]
 
         # Without the invite link, we can't create an account due to invite_required
         result = self.get_log_into_subdomain(data)
@@ -4350,7 +5648,9 @@ class GoogleAuthBackendTest(SocialAuthBase):
 
         # Now confirm an invitation link works
         referrer = self.example_user("hamlet")
-        multiuse_obj = MultiuseInvite.objects.create(realm=realm, referred_by=referrer)
+        multiuse_obj = MultiuseInvite.objects.create(
+            realm=realm, referred_by=referrer, include_realm_default_subscriptions=False
+        )
         multiuse_obj.streams.set(streams)
         validity_in_minutes = 2 * 24 * 60
         create_confirmation_link(
@@ -4372,7 +5672,7 @@ class GoogleAuthBackendTest(SocialAuthBase):
         self.assert_in_response('action="/accounts/register/"', result)
         data2 = {"from_confirmation": "1", "full_name": data["full_name"], "key": confirmation_key}
         result = self.client_post("/accounts/register/", data2, subdomain="zulip")
-        self.assert_in_response("We just need you to do one last thing", result)
+        self.assert_in_response("Enter your account details to complete registration.", result)
 
         # Verify that the user is asked for name but not password
         self.assert_not_in_success_response(["id_password"], result)
@@ -4403,6 +5703,7 @@ class GoogleAuthBackendTest(SocialAuthBase):
             m.output, [f"WARNING:root:log_into_subdomain: Invalid token given: {token}"]
         )
 
+    @override
     def test_user_cannot_log_into_wrong_subdomain(self) -> None:
         data: ExternalAuthDataDict = {
             "full_name": "Full Name",
@@ -4450,6 +5751,7 @@ class JSONFetchAPIKeyTest(ZulipTestCase):
 
 
 class FetchAPIKeyTest(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.user_profile = self.example_user("hamlet")
@@ -4460,7 +5762,8 @@ class FetchAPIKeyTest(ZulipTestCase):
             "/api/v1/fetch_api_key",
             dict(username=self.email, password=initial_password(self.email)),
         )
-        self.assert_json_success(result)
+        json_response = self.assert_json_success(result)
+        self.assertEqual(json_response["user_id"], self.user_profile.id)
 
     def test_invalid_email(self) -> None:
         result = self.client_post(
@@ -4482,6 +5785,22 @@ class FetchAPIKeyTest(ZulipTestCase):
             )
         self.assert_json_error(result, "Invalid subdomain", 404)
 
+    def test_login_wrong_subdomain(self) -> None:
+        user = self.mit_user("starnine")
+        result = self.client_post(
+            "/api/v1/fetch_api_key",
+            dict(username=user.email, password=initial_password(user.email)),
+            subdomain="zulip",
+        )
+        self.assert_json_error(result, "Your username or password is incorrect", 401)
+
+        result = self.client_post(
+            "/api/v1/fetch_api_key",
+            dict(username=user.email, password="wrongpass"),
+            subdomain="zulip",
+        )
+        self.assert_json_error(result, "Your username or password is incorrect", 401)
+
     def test_password_auth_disabled(self) -> None:
         with mock.patch("zproject.backends.password_auth_enabled", return_value=False):
             result = self.client_post(
@@ -4500,7 +5819,8 @@ class FetchAPIKeyTest(ZulipTestCase):
                 "/api/v1/fetch_api_key",
                 dict(username=self.example_email("hamlet"), password=self.ldap_password("hamlet")),
             )
-        self.assert_json_success(result)
+        json_response = self.assert_json_success(result)
+        self.assertEqual(json_response["user_id"], self.user_profile.id)
 
     @override_settings(
         AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",),
@@ -4512,17 +5832,19 @@ class FetchAPIKeyTest(ZulipTestCase):
         # We do test two combinations here:
         # The first user has no (department) attribute set
         # The second user has one set, but to a different value
-        result = self.client_post(
-            "/api/v1/fetch_api_key",
-            dict(username="hamlet", password=self.ldap_password("hamlet")),
-        )
+        with self.artificial_transaction_savepoint():
+            result = self.client_post(
+                "/api/v1/fetch_api_key",
+                dict(username="hamlet", password=self.ldap_password("hamlet")),
+            )
         self.assert_json_error(result, "Your username or password is incorrect", 401)
 
         self.change_ldap_user_attr("hamlet", "department", "testWrongRealm")
-        result = self.client_post(
-            "/api/v1/fetch_api_key",
-            dict(username="hamlet", password=self.ldap_password("hamlet")),
-        )
+        with self.artificial_transaction_savepoint():
+            result = self.client_post(
+                "/api/v1/fetch_api_key",
+                dict(username="hamlet", password=self.ldap_password("hamlet")),
+            )
         self.assert_json_error(result, "Your username or password is incorrect", 401)
 
         self.change_ldap_user_attr("hamlet", "department", "zulip")
@@ -4530,7 +5852,8 @@ class FetchAPIKeyTest(ZulipTestCase):
             "/api/v1/fetch_api_key",
             dict(username="hamlet", password=self.ldap_password("hamlet")),
         )
-        self.assert_json_success(result)
+        json_response = self.assert_json_success(result)
+        self.assertEqual(json_response["user_id"], self.user_profile.id)
 
     @override_settings(
         AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",),
@@ -4545,18 +5868,20 @@ class FetchAPIKeyTest(ZulipTestCase):
         self.init_default_ldap_database()
 
         # The first user has no attribute set
-        result = self.client_post(
-            "/api/v1/fetch_api_key",
-            dict(username="hamlet", password=self.ldap_password("hamlet")),
-        )
+        with self.artificial_transaction_savepoint():
+            result = self.client_post(
+                "/api/v1/fetch_api_key",
+                dict(username="hamlet", password=self.ldap_password("hamlet")),
+            )
         self.assert_json_error(result, "Your username or password is incorrect", 401)
 
         self.change_ldap_user_attr("hamlet", "test2", "testing")
         # Check with only one set
-        result = self.client_post(
-            "/api/v1/fetch_api_key",
-            dict(username="hamlet", password=self.ldap_password("hamlet")),
-        )
+        with self.artificial_transaction_savepoint():
+            result = self.client_post(
+                "/api/v1/fetch_api_key",
+                dict(username="hamlet", password=self.ldap_password("hamlet")),
+            )
         self.assert_json_error(result, "Your username or password is incorrect", 401)
 
         self.change_ldap_user_attr("hamlet", "test1", "test")
@@ -4588,10 +5913,11 @@ class FetchAPIKeyTest(ZulipTestCase):
 
         # Setting test1 to wrong value
         self.change_ldap_user_attr("hamlet", "test1", "invalid")
-        result = self.client_post(
-            "/api/v1/fetch_api_key",
-            dict(username="hamlet", password=self.ldap_password("hamlet")),
-        )
+        with self.artificial_transaction_savepoint():
+            result = self.client_post(
+                "/api/v1/fetch_api_key",
+                dict(username="hamlet", password=self.ldap_password("hamlet")),
+            )
         self.assert_json_error(result, "Your username or password is incorrect", 401)
 
         # Override access with `org_membership`
@@ -4603,7 +5929,8 @@ class FetchAPIKeyTest(ZulipTestCase):
         self.assert_json_success(result)
         self.remove_ldap_user_attr("hamlet", "department")
 
-        # Test wrong configuration
+        # Test a realm that's not configured in the setting. Such a realm should not be affected,
+        # and just allow normal ldap login.
         with override_settings(
             AUTH_LDAP_ADVANCED_REALM_ACCESS_CONTROL={"not_zulip": [{"department": "zulip"}]}
         ):
@@ -4611,7 +5938,7 @@ class FetchAPIKeyTest(ZulipTestCase):
                 "/api/v1/fetch_api_key",
                 dict(username="hamlet", password=self.ldap_password("hamlet")),
             )
-            self.assert_json_error(result, "Your username or password is incorrect", 401)
+        self.assert_json_success(result)
 
     def test_inactive_user(self) -> None:
         do_deactivate_user(self.user_profile, acting_user=None)
@@ -4622,7 +5949,12 @@ class FetchAPIKeyTest(ZulipTestCase):
         self.assert_json_error_contains(result, "Account is deactivated", 401)
 
     def test_deactivated_realm(self) -> None:
-        do_deactivate_realm(self.user_profile.realm, acting_user=None)
+        do_deactivate_realm(
+            self.user_profile.realm,
+            acting_user=None,
+            deactivation_reason="owner_request",
+            email_owners=False,
+        )
         result = self.client_post(
             "/api/v1/fetch_api_key",
             dict(username=self.email, password=initial_password(self.email)),
@@ -4633,17 +5965,20 @@ class FetchAPIKeyTest(ZulipTestCase):
         user_profile = self.example_user("hamlet")
         password = "a_password_of_22_chars"
 
-        with self.settings(PASSWORD_HASHERS=("django.contrib.auth.hashers.SHA1PasswordHasher",)):
+        with self.settings(PASSWORD_HASHERS=("django.contrib.auth.hashers.MD5PasswordHasher",)):
             user_profile.set_password(password)
             user_profile.save()
 
-        with self.settings(
-            PASSWORD_HASHERS=(
-                "django.contrib.auth.hashers.MD5PasswordHasher",
-                "django.contrib.auth.hashers.SHA1PasswordHasher",
+        with (
+            self.settings(
+                PASSWORD_HASHERS=(
+                    "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+                    "django.contrib.auth.hashers.MD5PasswordHasher",
+                ),
+                PASSWORD_MIN_LENGTH=30,
             ),
-            PASSWORD_MIN_LENGTH=30,
-        ), self.assertLogs("zulip.auth.email", level="INFO"):
+            self.assertLogs("zulip.auth.email", level="INFO"),
+        ):
             result = self.client_post(
                 "/api/v1/fetch_api_key",
                 dict(username=self.email, password=password),
@@ -4654,6 +5989,7 @@ class FetchAPIKeyTest(ZulipTestCase):
 
 
 class DevFetchAPIKeyTest(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.user_profile = self.example_user("hamlet")
@@ -4663,8 +5999,8 @@ class DevFetchAPIKeyTest(ZulipTestCase):
         result = self.client_post("/api/v1/dev_fetch_api_key", dict(username=self.email))
         data = self.assert_json_success(result)
         self.assertEqual(data["email"], self.email)
-        user_api_keys = get_all_api_keys(self.user_profile)
-        self.assertIn(data["api_key"], user_api_keys)
+        self.assertEqual(data["user_id"], self.user_profile.id)
+        self.assertEqual(data["api_key"], self.user_profile.api_key)
 
     def test_invalid_email(self) -> None:
         email = "hamlet"
@@ -4682,7 +6018,12 @@ class DevFetchAPIKeyTest(ZulipTestCase):
         self.assert_json_error_contains(result, "Account is deactivated", 401)
 
     def test_deactivated_realm(self) -> None:
-        do_deactivate_realm(self.user_profile.realm, acting_user=None)
+        do_deactivate_realm(
+            self.user_profile.realm,
+            acting_user=None,
+            deactivation_reason="owner_request",
+            email_owners=False,
+        )
         result = self.client_post("/api/v1/dev_fetch_api_key", dict(username=self.email))
         self.assert_json_error_contains(result, "This organization has been deactivated", 401)
 
@@ -4735,7 +6076,7 @@ class ExternalMethodDictsTests(ZulipTestCase):
             ),
         ):
             external_auth_methods = get_external_method_dicts()
-            external_auth_backends: List[Type[ExternalAuthMethod]] = [
+            external_auth_backends: list[type[ExternalAuthMethod]] = [
                 ZulipRemoteUserBackend,
                 GitHubAuthBackend,
                 AzureADAuthBackend,
@@ -4768,9 +6109,8 @@ class ExternalMethodDictsTests(ZulipTestCase):
             expected_button_id_strings = [
                 'id="{}_auth_button_github"',
                 'id="{}_auth_button_google"',
+                *(f'id="{{}}_auth_button_saml:{name}"' for name in saml_idp_names),
             ]
-            for name in saml_idp_names:
-                expected_button_id_strings.append(f'id="{{}}_auth_button_saml:{name}"')
 
             result = self.client_get("/login/")
             self.assert_in_success_response(
@@ -4782,57 +6122,69 @@ class ExternalMethodDictsTests(ZulipTestCase):
                 [string.format("register") for string in expected_button_id_strings], result
             )
 
-    def test_get_external_method_dicts_multiple_saml_idps(self) -> None:
-        idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
+    def test_get_external_method_dicts_multiple_saml_oidc_idps(self) -> None:
+        saml_idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_SAML_ENABLED_IDPS)
         # Create another IdP config, by copying the original one and changing some details.idps_dict['test_idp'])
-        idps_dict["test_idp2"] = copy.deepcopy(idps_dict["test_idp"])
-        idps_dict["test_idp2"]["url"] = "https://idp2.example.com/idp/profile/SAML2/Redirect/SSO"
-        idps_dict["test_idp2"]["display_name"] = "Second Test IdP"
-        idps_dict["test_idp2"]["limit_to_subdomains"] = ["zephyr"]
+        saml_idps_dict["test_idp2"] = copy.deepcopy(saml_idps_dict["test_idp"])
+        saml_idps_dict["test_idp2"]["url"] = (
+            "https://idp2.example.com/idp/profile/SAML2/Redirect/SSO"
+        )
+        saml_idps_dict["test_idp2"]["display_name"] = "Second Test IdP"
+        saml_idps_dict["test_idp2"]["limit_to_subdomains"] = ["zephyr"]
+
+        oidc_idps_dict = copy.deepcopy(settings.SOCIAL_AUTH_OIDC_ENABLED_IDPS)
+        oidc_idps_dict["testoidc2"] = copy.deepcopy(oidc_idps_dict["testoidc"])
+        oidc_idps_dict["testoidc2"]["oidc_url"] = "https://example.com/idp2/api/openid"
+        oidc_idps_dict["testoidc2"]["display_name"] = "Second Test IdP"
+        oidc_idps_dict["testoidc2"]["limit_to_subdomains"] = ["zephyr"]
         with self.settings(
-            SOCIAL_AUTH_SAML_ENABLED_IDPS=idps_dict,
+            SOCIAL_AUTH_SAML_ENABLED_IDPS=saml_idps_dict,
+            SOCIAL_AUTH_OIDC_ENABLED_IDPS=oidc_idps_dict,
             AUTHENTICATION_BACKENDS=(
                 "zproject.backends.EmailAuthBackend",
                 "zproject.backends.GitHubAuthBackend",
                 "zproject.backends.SAMLAuthBackend",
+                "zproject.backends.GenericOpenIdConnectBackend",
             ),
         ):
             # Calling get_external_method_dicts without a realm returns all methods configured on the server:
             external_auth_methods = get_external_method_dicts()
-            # 1 IdP enabled for all realms + a dict for GitHub auth
-            self.assert_length(external_auth_methods, 2)
+            # 1 IdP enabled for all realms for SAML as well as OIDC + a dict for GitHub auth
+            self.assert_length(external_auth_methods, 3)
             self.assertEqual(
-                [external_auth_methods[0]["name"], external_auth_methods[1]["name"]],
-                ["saml:test_idp", "github"],
+                {method["name"] for method in external_auth_methods},
+                {"saml:test_idp", "oidc:testoidc", "github"},
             )
 
             external_auth_methods = get_external_method_dicts(get_realm("zulip"))
-            # Only test_idp enabled for the zulip realm, + GitHub auth.
-            self.assert_length(external_auth_methods, 2)
+            # Only test_idp end testoidc nabled for the zulip realm, + GitHub auth.
+            self.assert_length(external_auth_methods, 3)
             self.assertEqual(
-                [external_auth_methods[0]["name"], external_auth_methods[1]["name"]],
-                ["saml:test_idp", "github"],
+                {method["name"] for method in external_auth_methods},
+                {"saml:test_idp", "oidc:testoidc", "github"},
             )
 
             external_auth_methods = get_external_method_dicts(get_realm("zephyr"))
             # Both idps enabled for the zephyr realm, + GitHub auth.
-            self.assert_length(external_auth_methods, 3)
+            self.assert_length(external_auth_methods, 5)
             self.assertEqual(
-                {external_auth_methods[0]["name"], external_auth_methods[1]["name"]},
-                {"saml:test_idp", "saml:test_idp2"},
+                {method["name"] for method in external_auth_methods},
+                {"saml:test_idp", "saml:test_idp2", "oidc:testoidc", "oidc:testoidc2", "github"},
             )
 
 
 class FetchAuthBackends(ZulipTestCase):
     def test_get_server_settings(self) -> None:
         def check_result(
-            result: "TestHttpResponse", extra_fields: Sequence[Tuple[str, Validator[object]]] = []
+            result: "TestHttpResponse", extra_fields: Sequence[tuple[str, Validator[object]]] = []
         ) -> None:
             authentication_methods_list = [
                 ("password", check_bool),
+                *(
+                    (backend_name_with_case.lower(), check_bool)
+                    for backend_name_with_case in AUTH_BACKEND_NAME_MAP
+                ),
             ]
-            for backend_name_with_case in AUTH_BACKEND_NAME_MAP:
-                authentication_methods_list.append((backend_name_with_case.lower(), check_bool))
             external_auth_methods = get_external_method_dicts()
 
             response_dict = self.assert_json_success(result)
@@ -4857,6 +6209,7 @@ class FetchAuthBackends(ZulipTestCase):
                     ("email_auth_enabled", check_bool),
                     ("is_incompatible", check_bool),
                     ("require_email_format_usernames", check_bool),
+                    ("realm_url", check_string),
                     ("realm_uri", check_string),
                     ("zulip_version", check_string),
                     ("zulip_merge_base", check_string),
@@ -4880,6 +6233,7 @@ class FetchAuthBackends(ZulipTestCase):
         result = self.client_get(
             "/api/v1/server_settings", subdomain="", HTTP_USER_AGENT="ZulipInvalid"
         )
+
         response_dict = self.assert_json_success(result)
         self.assertTrue(response_dict["is_incompatible"])
 
@@ -4980,11 +6334,11 @@ class TestTwoFactor(ZulipTestCase):
             self.assertEqual(result.status_code, 302)
             self.assertEqual(result["Location"], "http://zulip.testserver")
 
-            # Going to login page should redirect to `realm.uri` if user is
+            # Going to login page should redirect to `realm.url` if user is
             # already logged in.
             result = self.client_get("/accounts/login/")
             self.assertEqual(result.status_code, 302)
-            self.assertEqual(result["Location"], "http://zulip.testserver")
+            self.assertEqual(result["Location"], "http://zulip.testserver/")
 
 
 class TestDevAuthBackend(ZulipTestCase):
@@ -5012,7 +6366,7 @@ class TestDevAuthBackend(ZulipTestCase):
         self.assertEqual(result.status_code, 302)
         self.assertEqual(result["Location"], "http://zulip.testserver/")
         self.assert_logged_in_user_id(user_profile.id)
-        self.assertIn("otp_device_id", list(self.client.session.keys()))
+        self.assertIn("otp_device_id", self.client.session.keys())
 
     def test_redirect_to_next_url(self) -> None:
         def do_local_login(formaction: str) -> "TestHttpResponse":
@@ -5032,7 +6386,7 @@ class TestDevAuthBackend(ZulipTestCase):
         # to the backend. Rather we depend upon the browser's behaviour of persisting
         # hash anchors in between redirect requests. See below stackoverflow conversation
         # https://stackoverflow.com/questions/5283395/url-hash-is-persisting-between-redirects
-        res = do_local_login("/accounts/login/local/?next=#narrow/stream/7-test-here")
+        res = do_local_login("/accounts/login/local/?next=#narrow/channel/7-test-here")
         self.assertEqual(res.status_code, 302)
         self.assertEqual(res["Location"], "http://zulip.testserver")
 
@@ -5100,21 +6454,40 @@ class TestDevAuthBackend(ZulipTestCase):
     def test_login_failure(self) -> None:
         email = self.example_email("hamlet")
         data = {"direct_email": email}
-        with self.settings(AUTHENTICATION_BACKENDS=("zproject.backends.EmailAuthBackend",)):
+        with (
+            self.settings(AUTHENTICATION_BACKENDS=("zproject.backends.EmailAuthBackend",)),
+            self.assertLogs("django.request", level="ERROR") as m,
+        ):
             response = self.client_post("/accounts/login/local/", data)
-        self.assert_in_success_response(["Configuration error", "DevAuthBackend"], response)
+        self.assertEqual(response.status_code, 500)
+        self.assert_in_response("Configuration error", response)
+        self.assert_in_response("DevAuthBackend", response)
+        self.assertEqual(
+            m.output, ["ERROR:django.request:Internal Server Error: /accounts/login/local/"]
+        )
 
     def test_dev_direct_production_config_error(self) -> None:
-        result = self.client_get("/config-error/dev")
-        self.assertEqual(result.status_code, 200)
-        self.assert_in_success_response(["DevAuthBackend"], result)
+        with self.assertLogs("django.request", level="ERROR") as m:
+            result = self.client_get("/config-error/dev_not_supported")
+        self.assertEqual(result.status_code, 500)
+        self.assert_in_response("DevAuthBackend", result)
+        self.assertEqual(
+            m.output,
+            ["ERROR:django.request:Internal Server Error: /config-error/dev_not_supported"],
+        )
 
     def test_login_failure_due_to_nonexistent_user(self) -> None:
         email = "nonexisting@zulip.com"
         data = {"direct_email": email}
 
-        response = self.client_post("/accounts/login/local/", data)
-        self.assert_in_success_response(["Configuration error", "DevAuthBackend"], response)
+        with self.assertLogs("django.request", level="ERROR") as m:
+            response = self.client_post("/accounts/login/local/", data)
+        self.assertEqual(response.status_code, 500)
+        self.assert_in_response("Configuration error", response)
+        self.assert_in_response("DevAuthBackend", response)
+        self.assertEqual(
+            m.output, ["ERROR:django.request:Internal Server Error: /accounts/login/local/"]
+        )
 
 
 class TestZulipRemoteUserBackend(DesktopFlowTestingLib, ZulipTestCase):
@@ -5125,7 +6498,7 @@ class TestZulipRemoteUserBackend(DesktopFlowTestingLib, ZulipTestCase):
         self.assertEqual(result.status_code, 302)
 
         url = result["Location"]
-        parsed_url = urllib.parse.urlparse(url)
+        parsed_url = urlsplit(url)
         self.assertEqual(parsed_url.path, "/accounts/login/sso/")
         self.assertEqual(parsed_url.query, "param1=value1&params=value2")
 
@@ -5138,7 +6511,12 @@ class TestZulipRemoteUserBackend(DesktopFlowTestingLib, ZulipTestCase):
     def test_login_success(self) -> None:
         user_profile = self.example_user("hamlet")
         email = user_profile.delivery_email
-        with self.settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipRemoteUserBackend",)):
+        with self.settings(
+            AUTHENTICATION_BACKENDS=(
+                "zproject.backends.ZulipRemoteUserBackend",
+                "zproject.backends.ZulipDummyBackend",
+            )
+        ):
             result = self.client_get("/accounts/login/sso/", REMOTE_USER=email)
             self.assertEqual(result.status_code, 302)
             self.assert_logged_in_user_id(user_profile.id)
@@ -5147,7 +6525,10 @@ class TestZulipRemoteUserBackend(DesktopFlowTestingLib, ZulipTestCase):
         username = "hamlet"
         user_profile = self.example_user("hamlet")
         with self.settings(
-            AUTHENTICATION_BACKENDS=("zproject.backends.ZulipRemoteUserBackend",),
+            AUTHENTICATION_BACKENDS=(
+                "zproject.backends.ZulipRemoteUserBackend",
+                "zproject.backends.ZulipDummyBackend",
+            ),
             SSO_APPEND_DOMAIN="zulip.com",
         ):
             result = self.client_get("/accounts/login/sso/", REMOTE_USER=username)
@@ -5157,22 +6538,36 @@ class TestZulipRemoteUserBackend(DesktopFlowTestingLib, ZulipTestCase):
     def test_login_case_insensitive(self) -> None:
         user_profile = self.example_user("hamlet")
         email_upper = user_profile.delivery_email.upper()
-        with self.settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipRemoteUserBackend",)):
+        with self.settings(
+            AUTHENTICATION_BACKENDS=(
+                "zproject.backends.ZulipRemoteUserBackend",
+                "zproject.backends.ZulipDummyBackend",
+            )
+        ):
             result = self.client_get("/accounts/login/sso/", REMOTE_USER=email_upper)
             self.assertEqual(result.status_code, 302)
             self.assert_logged_in_user_id(user_profile.id)
 
     def test_login_failure(self) -> None:
         email = self.example_email("hamlet")
-        result = self.client_get("/accounts/login/sso/", REMOTE_USER=email)
-        self.assert_in_success_response(
-            ["Configuration error", "Authentication via the REMOTE_USER header is"], result
-        )
+        with self.assertLogs("django.request", level="ERROR") as m:
+            result = self.client_get("/accounts/login/sso/", REMOTE_USER=email)
+        self.assertEqual(result.status_code, 500)
+        self.assert_in_response("Configuration error", result)
+        self.assert_in_response("Authentication via the REMOTE_USER header is", result)
         self.assert_logged_in_user_id(None)
+        self.assertEqual(
+            m.output, ["ERROR:django.request:Internal Server Error: /accounts/login/sso/"]
+        )
 
     def test_login_failure_due_to_nonexisting_user(self) -> None:
         email = "nonexisting@zulip.com"
-        with self.settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipRemoteUserBackend",)):
+        with self.settings(
+            AUTHENTICATION_BACKENDS=(
+                "zproject.backends.ZulipRemoteUserBackend",
+                "zproject.backends.ZulipDummyBackend",
+            )
+        ):
             result = self.client_get("/accounts/login/sso/", REMOTE_USER=email)
             self.assertEqual(result.status_code, 200)
             self.assert_logged_in_user_id(None)
@@ -5180,56 +6575,96 @@ class TestZulipRemoteUserBackend(DesktopFlowTestingLib, ZulipTestCase):
 
     def test_login_failure_due_to_invalid_email(self) -> None:
         email = "hamlet"
-        with self.settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipRemoteUserBackend",)):
+        with self.settings(
+            AUTHENTICATION_BACKENDS=(
+                "zproject.backends.ZulipRemoteUserBackend",
+                "zproject.backends.ZulipDummyBackend",
+            )
+        ):
             result = self.client_get("/accounts/login/sso/", REMOTE_USER=email)
             self.assert_json_error_contains(result, "Enter a valid email address.", 400)
 
     def test_login_failure_due_to_missing_field(self) -> None:
-        with self.settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipRemoteUserBackend",)):
+        with (
+            self.settings(
+                AUTHENTICATION_BACKENDS=(
+                    "zproject.backends.ZulipRemoteUserBackend",
+                    "zproject.backends.ZulipDummyBackend",
+                )
+            ),
+            self.assertLogs("django.request", level="ERROR") as m,
+        ):
             result = self.client_get("/accounts/login/sso/")
-            self.assert_in_success_response(
-                ["Configuration error", "The REMOTE_USER header is not set."], result
+            self.assertEqual(result.status_code, 500)
+            self.assert_in_response("Configuration error", result)
+            self.assert_in_response("The REMOTE_USER header is not set.", result)
+            self.assertEqual(
+                m.output, ["ERROR:django.request:Internal Server Error: /accounts/login/sso/"]
             )
 
     def test_login_failure_due_to_wrong_subdomain(self) -> None:
         email = self.example_email("hamlet")
-        with self.settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipRemoteUserBackend",)):
-            with mock.patch("zerver.views.auth.get_subdomain", return_value="acme"):
-                result = self.client_get(
-                    "http://testserver:9080/accounts/login/sso/", REMOTE_USER=email
+        with (
+            self.settings(
+                AUTHENTICATION_BACKENDS=(
+                    "zproject.backends.ZulipRemoteUserBackend",
+                    "zproject.backends.ZulipDummyBackend",
                 )
-                self.assertEqual(result.status_code, 200)
-                self.assert_logged_in_user_id(None)
-                self.assert_in_response("You need an invitation to join this organization.", result)
+            ),
+            mock.patch("zerver.views.auth.get_subdomain", return_value="acme"),
+        ):
+            result = self.client_get(
+                "http://testserver:9080/accounts/login/sso/", REMOTE_USER=email
+            )
+            self.assertEqual(result.status_code, 200)
+            self.assert_logged_in_user_id(None)
+            self.assert_in_response("You need an invitation to join this organization.", result)
 
     def test_login_failure_due_to_empty_subdomain(self) -> None:
         email = self.example_email("hamlet")
-        with self.settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipRemoteUserBackend",)):
-            with mock.patch("zerver.views.auth.get_subdomain", return_value=""):
-                result = self.client_get(
-                    "http://testserver:9080/accounts/login/sso/", REMOTE_USER=email
+        with (
+            self.settings(
+                AUTHENTICATION_BACKENDS=(
+                    "zproject.backends.ZulipRemoteUserBackend",
+                    "zproject.backends.ZulipDummyBackend",
                 )
-                self.assertEqual(result.status_code, 200)
-                self.assert_logged_in_user_id(None)
-                self.assert_in_response("You need an invitation to join this organization.", result)
+            ),
+            mock.patch("zerver.views.auth.get_subdomain", return_value=""),
+        ):
+            result = self.client_get(
+                "http://testserver:9080/accounts/login/sso/", REMOTE_USER=email
+            )
+            self.assertEqual(result.status_code, 200)
+            self.assert_logged_in_user_id(None)
+            self.assert_in_response("You need an invitation to join this organization.", result)
 
     def test_login_success_under_subdomains(self) -> None:
         user_profile = self.example_user("hamlet")
         email = user_profile.delivery_email
-        with mock.patch("zerver.views.auth.get_subdomain", return_value="zulip"):
-            with self.settings(
-                AUTHENTICATION_BACKENDS=("zproject.backends.ZulipRemoteUserBackend",)
-            ):
-                result = self.client_get("/accounts/login/sso/", REMOTE_USER=email)
-                self.assertEqual(result.status_code, 302)
-                self.assert_logged_in_user_id(user_profile.id)
+        with (
+            mock.patch("zerver.views.auth.get_subdomain", return_value="zulip"),
+            self.settings(
+                AUTHENTICATION_BACKENDS=(
+                    "zproject.backends.ZulipRemoteUserBackend",
+                    "zproject.backends.ZulipDummyBackend",
+                )
+            ),
+        ):
+            result = self.client_get("/accounts/login/sso/", REMOTE_USER=email)
+            self.assertEqual(result.status_code, 302)
+            self.assert_logged_in_user_id(user_profile.id)
 
     @override_settings(SEND_LOGIN_EMAILS=True)
-    @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipRemoteUserBackend",))
+    @override_settings(
+        AUTHENTICATION_BACKENDS=(
+            "zproject.backends.ZulipRemoteUserBackend",
+            "zproject.backends.ZulipDummyBackend",
+        )
+    )
     def test_login_mobile_flow_otp_success_email(self) -> None:
         user_profile = self.example_user("hamlet")
         email = user_profile.delivery_email
-        user_profile.date_joined = timezone_now() - datetime.timedelta(seconds=61)
+        user_profile.date_joined = timezone_now() - timedelta(seconds=61)
         user_profile.save()
         mobile_flow_otp = "1234abcd" * 8
 
@@ -5260,25 +6695,32 @@ class TestZulipRemoteUserBackend(DesktopFlowTestingLib, ZulipTestCase):
         )
         self.assertEqual(result.status_code, 302)
         redirect_url = result["Location"]
-        parsed_url = urllib.parse.urlparse(redirect_url)
-        query_params = urllib.parse.parse_qs(parsed_url.query)
+        parsed_url = urlsplit(redirect_url)
+        query_params = parse_qs(parsed_url.query)
         self.assertEqual(parsed_url.scheme, "zulip")
         self.assertEqual(query_params["realm"], ["http://zulip.testserver"])
         self.assertEqual(query_params["email"], [self.example_email("hamlet")])
         encrypted_api_key = query_params["otp_encrypted_api_key"][0]
-        hamlet_api_keys = get_all_api_keys(self.example_user("hamlet"))
-        self.assertIn(otp_decrypt_api_key(encrypted_api_key, mobile_flow_otp), hamlet_api_keys)
+        self.assertIn(
+            otp_decrypt_api_key(encrypted_api_key, mobile_flow_otp),
+            self.example_user("hamlet").api_key,
+        )
         self.assert_length(mail.outbox, 1)
         self.assertIn("Zulip on Android", mail.outbox[0].body)
 
     @override_settings(SEND_LOGIN_EMAILS=True)
     @override_settings(SSO_APPEND_DOMAIN="zulip.com")
-    @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipRemoteUserBackend",))
+    @override_settings(
+        AUTHENTICATION_BACKENDS=(
+            "zproject.backends.ZulipRemoteUserBackend",
+            "zproject.backends.ZulipDummyBackend",
+        )
+    )
     def test_login_mobile_flow_otp_success_username(self) -> None:
         user_profile = self.example_user("hamlet")
         email = user_profile.delivery_email
         remote_user = Address(addr_spec=email).username
-        user_profile.date_joined = timezone_now() - datetime.timedelta(seconds=61)
+        user_profile.date_joined = timezone_now() - timedelta(seconds=61)
         user_profile.save()
         mobile_flow_otp = "1234abcd" * 8
 
@@ -5309,14 +6751,16 @@ class TestZulipRemoteUserBackend(DesktopFlowTestingLib, ZulipTestCase):
         )
         self.assertEqual(result.status_code, 302)
         redirect_url = result["Location"]
-        parsed_url = urllib.parse.urlparse(redirect_url)
-        query_params = urllib.parse.parse_qs(parsed_url.query)
+        parsed_url = urlsplit(redirect_url)
+        query_params = parse_qs(parsed_url.query)
         self.assertEqual(parsed_url.scheme, "zulip")
         self.assertEqual(query_params["realm"], ["http://zulip.testserver"])
         self.assertEqual(query_params["email"], [self.example_email("hamlet")])
         encrypted_api_key = query_params["otp_encrypted_api_key"][0]
-        hamlet_api_keys = get_all_api_keys(self.example_user("hamlet"))
-        self.assertIn(otp_decrypt_api_key(encrypted_api_key, mobile_flow_otp), hamlet_api_keys)
+        self.assertIn(
+            otp_decrypt_api_key(encrypted_api_key, mobile_flow_otp),
+            self.example_user("hamlet").api_key,
+        )
         self.assert_length(mail.outbox, 1)
         self.assertIn("Zulip on Android", mail.outbox[0].body)
 
@@ -5330,7 +6774,7 @@ class TestZulipRemoteUserBackend(DesktopFlowTestingLib, ZulipTestCase):
     def test_login_desktop_flow_otp_success_email(self) -> None:
         user_profile = self.example_user("hamlet")
         email = user_profile.delivery_email
-        user_profile.date_joined = timezone_now() - datetime.timedelta(seconds=61)
+        user_profile.date_joined = timezone_now() - timedelta(seconds=61)
         user_profile.save()
         desktop_flow_otp = "1234abcd" * 8
 
@@ -5364,7 +6808,7 @@ class TestZulipRemoteUserBackend(DesktopFlowTestingLib, ZulipTestCase):
         user_profile = self.example_user("hamlet")
         email = user_profile.delivery_email
         remote_user = Address(addr_spec=email).username
-        user_profile.date_joined = timezone_now() - datetime.timedelta(seconds=61)
+        user_profile.date_joined = timezone_now() - timedelta(seconds=61)
         user_profile.save()
         desktop_flow_otp = "1234abcd" * 8
 
@@ -5394,7 +6838,10 @@ class TestZulipRemoteUserBackend(DesktopFlowTestingLib, ZulipTestCase):
             user_profile = self.example_user("hamlet")
             email = user_profile.delivery_email
             with self.settings(
-                AUTHENTICATION_BACKENDS=("zproject.backends.ZulipRemoteUserBackend",)
+                AUTHENTICATION_BACKENDS=(
+                    "zproject.backends.ZulipRemoteUserBackend",
+                    "zproject.backends.ZulipDummyBackend",
+                )
             ):
                 result = self.client_get("/accounts/login/sso/", {"next": next}, REMOTE_USER=email)
             return result
@@ -5430,7 +6877,7 @@ class TestJWTLogin(ZulipTestCase):
             self.assert_logged_in_user_id(user_profile.id)
 
     def test_login_failure_when_email_is_missing(self) -> None:
-        payload: Dict[str, str] = {}
+        payload: dict[str, str] = {}
         with self.settings(JWT_AUTH_KEYS={"zulip": {"key": "key", "algorithms": ["HS256"]}}):
             key = settings.JWT_AUTH_KEYS["zulip"]["key"]
             [algorithm] = settings.JWT_AUTH_KEYS["zulip"]["algorithms"]
@@ -5475,34 +6922,40 @@ class TestJWTLogin(ZulipTestCase):
 
     def test_login_failure_due_to_wrong_subdomain(self) -> None:
         payload = {"email": "hamlet@zulip.com"}
-        with self.settings(JWT_AUTH_KEYS={"acme": {"key": "key", "algorithms": ["HS256"]}}):
-            with mock.patch("zerver.views.auth.get_realm_from_request", return_value=None):
-                key = settings.JWT_AUTH_KEYS["acme"]["key"]
-                [algorithm] = settings.JWT_AUTH_KEYS["acme"]["algorithms"]
-                web_token = jwt.encode(payload, key, algorithm)
+        with (
+            self.settings(JWT_AUTH_KEYS={"acme": {"key": "key", "algorithms": ["HS256"]}}),
+            mock.patch("zerver.views.auth.get_realm_from_request", return_value=None),
+        ):
+            key = settings.JWT_AUTH_KEYS["acme"]["key"]
+            [algorithm] = settings.JWT_AUTH_KEYS["acme"]["algorithms"]
+            web_token = jwt.encode(payload, key, algorithm)
 
-                data = {"token": web_token}
-                result = self.client_post("/accounts/login/jwt/", data)
-                self.assert_json_error_contains(result, "Invalid subdomain", 404)
-                self.assert_logged_in_user_id(None)
+            data = {"token": web_token}
+            result = self.client_post("/accounts/login/jwt/", data)
+            self.assert_json_error_contains(result, "Invalid subdomain", 404)
+            self.assert_logged_in_user_id(None)
 
     def test_login_success_under_subdomains(self) -> None:
         payload = {"email": "hamlet@zulip.com"}
-        with self.settings(JWT_AUTH_KEYS={"zulip": {"key": "key", "algorithms": ["HS256"]}}):
-            with mock.patch("zerver.views.auth.get_subdomain", return_value="zulip"):
-                key = settings.JWT_AUTH_KEYS["zulip"]["key"]
-                [algorithm] = settings.JWT_AUTH_KEYS["zulip"]["algorithms"]
-                web_token = jwt.encode(payload, key, algorithm)
+        with (
+            self.settings(JWT_AUTH_KEYS={"zulip": {"key": "key", "algorithms": ["HS256"]}}),
+            mock.patch("zerver.views.auth.get_subdomain", return_value="zulip"),
+        ):
+            key = settings.JWT_AUTH_KEYS["zulip"]["key"]
+            [algorithm] = settings.JWT_AUTH_KEYS["zulip"]["algorithms"]
+            web_token = jwt.encode(payload, key, algorithm)
 
-                data = {"token": web_token}
-                result = self.client_post("/accounts/login/jwt/", data)
-                self.assertEqual(result.status_code, 302)
-                user_profile = self.example_user("hamlet")
-                self.assert_logged_in_user_id(user_profile.id)
+            data = {"token": web_token}
+            result = self.client_post("/accounts/login/jwt/", data)
+            self.assertEqual(result.status_code, 302)
+            user_profile = self.example_user("hamlet")
+            self.assert_logged_in_user_id(user_profile.id)
 
 
 class DjangoToLDAPUsernameTests(ZulipTestCase):
+    @override
     def setUp(self) -> None:
+        super().setUp()
         self.init_default_ldap_database()
         self.backend = ZulipLDAPAuthBackend()
 
@@ -5545,13 +6998,15 @@ class DjangoToLDAPUsernameTests(ZulipTestCase):
             self.backend.django_to_ldap_username("aaron@zulip.com"), self.ldap_username("aaron")
         )
 
-        with self.assertLogs(level="WARNING") as m:
-            with self.assertRaises(NoMatchingLDAPUserError):
-                self.backend.django_to_ldap_username("shared_email@zulip.com")
+        with (
+            self.assertLogs("zulip.ldap", level="WARNING") as m,
+            self.assertRaises(NoMatchingLDAPUserError),
+        ):
+            self.backend.django_to_ldap_username("shared_email@zulip.com")
         self.assertEqual(
             m.output,
             [
-                "WARNING:root:Multiple users with email {} found in LDAP.".format(
+                "WARNING:zulip.ldap:Multiple users with email {} found in LDAP.".format(
                     "shared_email@zulip.com"
                 )
             ],
@@ -5641,6 +7096,7 @@ class DjangoToLDAPUsernameTests(ZulipTestCase):
 
 
 class ZulipLDAPTestCase(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
 
@@ -5655,6 +7111,7 @@ class ZulipLDAPTestCase(ZulipTestCase):
         # method separately, we need to set them manually.
         self.backend._realm = get_realm("zulip")
         self.backend._prereg_user = None
+        self.backend._prereg_realm = None
 
     def setup_subdomain(self, user_profile: UserProfile) -> None:
         realm = user_profile.realm
@@ -5669,11 +7126,11 @@ class TestLDAP(ZulipLDAPTestCase):
         regex = re.compile(
             r"(uid\=)+[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+(\,ou\=users\,dc\=zulip\,dc\=com)"
         )
-        common_attrs = ["cn", "userPassword", "phoneNumber", "birthDate"]
+        common_attrs = {"cn", "userPassword", "phoneNumber", "birthDate"}
         for key, value in ldap_dir.items():
             self.assertTrue(regex.match(key))
-            self.assertCountEqual(
-                list(value.keys()), [*common_attrs, "uid", "thumbnailPhoto", "userAccountControl"]
+            self.assertEqual(
+                value.keys(), common_attrs | {"uid", "thumbnailPhoto", "userAccountControl"}
             )
 
         ldap_dir = generate_dev_ldap_dir("b", 9)
@@ -5681,14 +7138,14 @@ class TestLDAP(ZulipLDAPTestCase):
         regex = re.compile(r"(uid\=)+[a-zA-Z0-9_.+-]+(\,ou\=users\,dc\=zulip\,dc\=com)")
         for key, value in ldap_dir.items():
             self.assertTrue(regex.match(key))
-            self.assertCountEqual(list(value.keys()), [*common_attrs, "uid", "jpegPhoto"])
+            self.assertEqual(value.keys(), common_attrs | {"uid", "jpegPhoto"})
 
         ldap_dir = generate_dev_ldap_dir("c", 8)
         self.assert_length(ldap_dir, 8)
         regex = re.compile(r"(uid\=)+[a-zA-Z0-9_.+-]+(\,ou\=users\,dc\=zulip\,dc\=com)")
         for key, value in ldap_dir.items():
             self.assertTrue(regex.match(key))
-            self.assertCountEqual(list(value.keys()), [*common_attrs, "uid", "email"])
+            self.assertEqual(value.keys(), common_attrs | {"uid", "email"})
 
     @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",))
     def test_dev_ldap_fail_login(self) -> None:
@@ -5754,6 +7211,167 @@ class TestLDAP(ZulipLDAPTestCase):
             self.assertEqual(user_profile, self.example_user("aaron"))
 
     @override_settings(
+        AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",),
+        LDAP_EMAIL_ATTR="mail",
+        AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "unique_account_id": "dn"},
+    )
+    def test_external_auth_id_login(self) -> None:
+        realm = get_realm("zulip")
+        hamlet = self.example_user("hamlet")
+        username = self.ldap_username("hamlet")
+
+        self.assertEqual(ExternalAuthID.objects.filter(user=hamlet).count(), 0)
+
+        user_profile = self.backend.authenticate(
+            request=mock.MagicMock(),
+            username=username,
+            password=self.ldap_password("hamlet"),
+            realm=get_realm("zulip"),
+        )
+        self.assertEqual(hamlet.id, user_profile.id)
+
+        external_auth_ids = list(ExternalAuthID.objects.filter(user=hamlet))
+        self.assert_length(external_auth_ids, 1)
+        new_external_auth_id = external_auth_ids[0]
+        self.assertEqual(new_external_auth_id.realm_id, realm.id)
+        self.assertEqual(new_external_auth_id.external_auth_method_name, "ldap")
+        self.assertEqual(
+            new_external_auth_id.external_auth_id, "uid=hamlet,ou=users,dc=zulip,dc=com"
+        )
+
+        # The user's email changes in LDAP. The user should still be
+        # able to successfully log in with their ldap credential: The
+        # account will be found based on the ExternalAuthID.
+        # And the Zulip email is updated to match the new LDAP email.
+        self.change_ldap_user_attr(username, "mail", "new-hamlet-email@zulip.com")
+        with self.assertLogs("zulip.auth.ldap", level="INFO") as mock_log:
+            user_profile = self.backend.authenticate(
+                request=mock.MagicMock(),
+                username=username,
+                password=self.ldap_password("hamlet"),
+                realm=get_realm("zulip"),
+            )
+        self.assertEqual(hamlet.id, user_profile.id)
+        self.assertEqual(user_profile.delivery_email, "new-hamlet-email@zulip.com")
+        self.assertEqual(ExternalAuthID.objects.filter(user=hamlet).count(), 1)
+        self.assertIn(
+            f"INFO:zulip.auth.ldap:User {hamlet.id}, logged in via ExternalAuthId uid=hamlet,ou=users,dc=zulip,dc=com, has mismatched email. Syncing: hamlet@zulip.com => new-hamlet-email@zulip.com",
+            mock_log.output,
+        )
+
+        # Here the user's ldap email is changed to an email that
+        # matches another user already existing in LDAP.
+        #
+        # Expected outcome: The user can still log in to their Zulip
+        # account with their ldap credentials, but their account's
+        # email is not changed due to the conflict.
+        cordelia = self.example_user("cordelia")
+        self.change_ldap_user_attr(username, "mail", cordelia.delivery_email)
+        with self.assertLogs("zulip.auth.ldap", level="WARNING") as mock_log:
+            user_profile = self.backend.authenticate(
+                request=mock.MagicMock(),
+                username=username,
+                password=self.ldap_password("hamlet"),
+                realm=get_realm("zulip"),
+            )
+        self.assertEqual(hamlet.id, user_profile.id)
+        self.assertEqual(user_profile.delivery_email, "new-hamlet-email@zulip.com")
+        self.assertEqual(ExternalAuthID.objects.filter(user=hamlet).count(), 1)
+        self.assertEqual(
+            mock_log.output,
+            [
+                f"WARNING:zulip.auth.ldap:Can't sync email for user {hamlet.id}: another user exists with target email {cordelia.delivery_email}"
+            ],
+        )
+
+        # If the capitalization of the current email changes in ldap,
+        # the capitalization of the Zulip email should be synced.
+        self.change_ldap_user_attr(username, "mail", "New-Hamlet-email@zulip.com")
+        with self.assertLogs("zulip.auth.ldap", level="INFO") as mock_log:
+            user_profile = self.backend.authenticate(
+                request=mock.MagicMock(),
+                username=username,
+                password=self.ldap_password("hamlet"),
+                realm=get_realm("zulip"),
+            )
+        self.assertEqual(hamlet.id, user_profile.id)
+        self.assertEqual(user_profile.delivery_email, "New-Hamlet-email@zulip.com")
+        self.assertEqual(ExternalAuthID.objects.filter(user=hamlet).count(), 1)
+        self.assertIn(
+            f"INFO:zulip.auth.ldap:User {hamlet.id}, logged in via ExternalAuthId uid=hamlet,ou=users,dc=zulip,dc=com, has mismatched email. Syncing: new-hamlet-email@zulip.com => New-Hamlet-email@zulip.com",
+            mock_log.output,
+        )
+
+        # Can't log into a deactivated account - make sure that authentication involving
+        # ExternalAuthID doesn't skip these kinds of checks.
+        do_deactivate_user(user_profile, acting_user=None)
+        user_profile = self.backend.authenticate(
+            request=mock.MagicMock(),
+            username=username,
+            password=self.ldap_password("hamlet"),
+            realm=get_realm("zulip"),
+        )
+        self.assertEqual(user_profile, None)
+
+    @override_settings(
+        AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",),
+        LDAP_EMAIL_ATTR="mail",
+        AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "unique_account_id": "homePhone"},
+    )
+    def test_external_auth_id_login_with_custom_unique_account_id_attribute(self) -> None:
+        """
+        The default recommended value for the unique_account_id attribute is the DN, but we also
+        support using a different attr - as long as its values are unique and stable.
+        For this test we'll use the silly example of the phone number attribute.
+        """
+        realm = get_realm("zulip")
+        hamlet = self.example_user("hamlet")
+        username = self.ldap_username("hamlet")
+
+        self.assertEqual(ExternalAuthID.objects.filter(user=hamlet).count(), 0)
+
+        user_profile = self.backend.authenticate(
+            request=mock.MagicMock(),
+            username=username,
+            password=self.ldap_password("hamlet"),
+            realm=get_realm("zulip"),
+        )
+        self.assertEqual(hamlet.id, user_profile.id)
+
+        external_auth_ids = list(ExternalAuthID.objects.filter(user=hamlet))
+        self.assert_length(external_auth_ids, 1)
+        new_external_auth_id = external_auth_ids[0]
+        self.assertEqual(new_external_auth_id.realm_id, realm.id)
+        self.assertEqual(new_external_auth_id.external_auth_method_name, "ldap")
+        self.assertEqual(new_external_auth_id.external_auth_id, "123456789")
+
+    @override_settings(
+        AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",),
+        LDAP_EMAIL_ATTR="mail",
+        AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "unique_account_id": "dn"},
+    )
+    def test_external_auth_id_user_creation(self) -> None:
+        realm = get_realm("zulip")
+        username = "newuser_with_email"
+
+        user_profile = self.backend.authenticate(
+            request=mock.MagicMock(),
+            username=username,
+            password=self.ldap_password("newuser_with_email"),
+            realm=get_realm("zulip"),
+        )
+        assert user_profile is not None
+
+        external_auth_ids = list(ExternalAuthID.objects.filter(user=user_profile))
+        self.assert_length(external_auth_ids, 1)
+        new_external_auth_id = external_auth_ids[0]
+        self.assertEqual(new_external_auth_id.realm_id, realm.id)
+        self.assertEqual(new_external_auth_id.external_auth_method_name, "ldap")
+        self.assertEqual(
+            new_external_auth_id.external_auth_id, "uid=newuser_with_email,ou=users,dc=zulip,dc=com"
+        )
+
+    @override_settings(
         AUTHENTICATION_BACKENDS=(
             "zproject.backends.EmailAuthBackend",
             "zproject.backends.ZulipLDAPAuthBackend",
@@ -5803,11 +7421,27 @@ class TestLDAP(ZulipLDAPTestCase):
             )
             self.assertIs(user, None)
 
+        with (
+            self.settings(LDAP_APPEND_DOMAIN="zulip.com"),
+            self.assertLogs("zulip.auth.ldap", level="DEBUG") as log_debug,
+        ):
+            user = self.backend.authenticate(
+                request=mock.MagicMock(),
+                username=self.example_email("hamlet"),
+                password="",
+                realm=get_realm("zulip"),
+            )
+            self.assertIs(user, None)
+            self.assertEqual(
+                log_debug.output[0], "DEBUG:zulip.auth.ldap:Rejecting empty password for hamlet"
+            )
+
     @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",))
     def test_login_failure_due_to_nonexistent_user(self) -> None:
-        with self.settings(LDAP_APPEND_DOMAIN="zulip.com"), self.assertLogs(
-            "zulip.ldap", level="DEBUG"
-        ) as log_debug:
+        with (
+            self.settings(LDAP_APPEND_DOMAIN="zulip.com"),
+            self.assertLogs("zulip.ldap", level="DEBUG") as log_debug,
+        ):
             user = self.backend.authenticate(
                 request=mock.MagicMock(),
                 username="nonexistent@zulip.com",
@@ -5841,76 +7475,71 @@ class TestLDAP(ZulipLDAPTestCase):
 
     @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",))
     def test_get_or_build_user_when_user_exists(self) -> None:
-        class _LDAPUser:
-            attrs = {"fn": ["Full Name"], "sn": ["Short Name"]}
-
         backend = self.backend
         email = self.example_email("hamlet")
-        user_profile, created = backend.get_or_build_user(str(email), _LDAPUser())
+        ldap_user = ZulipLDAPUser(backend, email, realm=backend._realm)
+        user_profile, created = backend.get_or_build_user(email, ldap_user)
         self.assertFalse(created)
         self.assertEqual(user_profile.delivery_email, email)
 
     @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",))
     def test_get_or_build_user_when_user_does_not_exist(self) -> None:
-        class _LDAPUser:
-            attrs = {"fn": ["Full Name"]}
-
         ldap_user_attr_map = {"full_name": "fn"}
 
         with self.settings(AUTH_LDAP_USER_ATTR_MAP=ldap_user_attr_map):
             backend = self.backend
             email = "newuser@zulip.com"
-            user_profile, created = backend.get_or_build_user(email, _LDAPUser())
+            ldap_user = ZulipLDAPUser(backend, email, realm=backend._realm)
+            ldap_user._user_attrs = {"fn": ["Full Name"]}
+            user_profile, created = backend.get_or_build_user(email, ldap_user)
             self.assertTrue(created)
             self.assertEqual(user_profile.delivery_email, email)
             self.assertEqual(user_profile.full_name, "Full Name")
 
     @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",))
     def test_get_or_build_user_when_user_has_invalid_name(self) -> None:
-        class _LDAPUser:
-            attrs = {"fn": ["<invalid name>"]}
-
         ldap_user_attr_map = {"full_name": "fn"}
 
         with self.settings(AUTH_LDAP_USER_ATTR_MAP=ldap_user_attr_map):
             backend = self.backend
             email = "nonexisting@zulip.com"
+            ldap_user = ZulipLDAPUser(backend, email, realm=backend._realm)
+            ldap_user._user_attrs = {"fn": ["<invalid name>"]}
             with self.assertRaisesRegex(Exception, "Invalid characters in name!"):
-                backend.get_or_build_user(email, _LDAPUser())
+                backend.get_or_build_user(email, ldap_user)
 
     @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",))
     def test_get_or_build_user_when_realm_is_deactivated(self) -> None:
-        class _LDAPUser:
-            attrs = {"fn": ["Full Name"]}
-
         ldap_user_attr_map = {"full_name": "fn"}
 
         with self.settings(AUTH_LDAP_USER_ATTR_MAP=ldap_user_attr_map):
             backend = self.backend
             email = "nonexisting@zulip.com"
-            do_deactivate_realm(backend._realm, acting_user=None)
+            ldap_user = ZulipLDAPUser(backend, email, realm=backend._realm)
+            do_deactivate_realm(
+                backend._realm,
+                acting_user=None,
+                deactivation_reason="owner_request",
+                email_owners=False,
+            )
             with self.assertRaisesRegex(Exception, "Realm has been deactivated"):
-                backend.get_or_build_user(email, _LDAPUser())
+                backend.get_or_build_user(email, ldap_user)
 
     @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",))
     def test_get_or_build_user_when_ldap_has_no_email_attr(self) -> None:
-        class _LDAPUser:
-            attrs = {"fn": ["Full Name"], "sn": ["Short Name"]}
-
         nonexisting_attr = "email"
         with self.settings(LDAP_EMAIL_ATTR=nonexisting_attr):
             backend = self.backend
             email = "nonexisting@zulip.com"
+            ldap_user = ZulipLDAPUser(backend, email, realm=backend._realm)
+            ldap_user._user_attrs = {"fn": ["Full Name"], "sn": ["Short Name"]}
             with self.assertRaisesRegex(
                 Exception, "LDAP user doesn't have the needed email attribute"
             ):
-                backend.get_or_build_user(email, _LDAPUser())
+                backend.get_or_build_user(email, ldap_user)
 
     @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",))
     def test_get_or_build_user_email(self) -> None:
-        class _LDAPUser:
-            attrs = {"fn": ["Test User"]}
-
         ldap_user_attr_map = {"full_name": "fn"}
 
         with self.settings(AUTH_LDAP_USER_ATTR_MAP=ldap_user_attr_map):
@@ -5920,38 +7549,40 @@ class TestLDAP(ZulipLDAPTestCase):
             realm.save()
 
             email = "spam@mailnator.com"
+            ldap_user = ZulipLDAPUser(self.backend, email, realm=realm)
             with self.assertRaisesRegex(ZulipLDAPError, "Email validation failed."):
-                self.backend.get_or_build_user(email, _LDAPUser())
+                self.backend.get_or_build_user(email, ldap_user)
 
             realm.emails_restricted_to_domains = True
             realm.save(update_fields=["emails_restricted_to_domains"])
 
             email = "spam+spam@mailnator.com"
+            ldap_user = ZulipLDAPUser(self.backend, email, realm=realm)
             with self.assertRaisesRegex(ZulipLDAPError, "Email validation failed."):
-                self.backend.get_or_build_user(email, _LDAPUser())
+                self.backend.get_or_build_user(email, ldap_user)
 
             email = "spam@acme.com"
+            ldap_user = ZulipLDAPUser(self.backend, email, realm=realm)
             with self.assertRaisesRegex(
                 ZulipLDAPError, "This email domain isn't allowed in this organization."
             ):
-                self.backend.get_or_build_user(email, _LDAPUser())
+                self.backend.get_or_build_user(email, ldap_user)
 
     @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",))
     def test_get_or_build_user_when_ldap_has_no_full_name_mapping(self) -> None:
-        class _LDAPUser:
-            attrs = {"fn": ["Full Name"], "sn": ["Short Name"]}
-
         with self.settings(AUTH_LDAP_USER_ATTR_MAP={}):
             backend = self.backend
             email = "nonexisting@zulip.com"
+            ldap_user = ZulipLDAPUser(backend, email, realm=backend._realm)
             with self.assertRaisesRegex(Exception, "Missing required mapping for user's full name"):
-                backend.get_or_build_user(email, _LDAPUser())
+                backend.get_or_build_user(email, ldap_user)
 
     @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",))
     def test_login_failure_when_domain_does_not_match(self) -> None:
-        with self.settings(LDAP_APPEND_DOMAIN="acme.com"), self.assertLogs(
-            "zulip.ldap", "DEBUG"
-        ) as debug_log:
+        with (
+            self.settings(LDAP_APPEND_DOMAIN="acme.com"),
+            self.assertLogs("zulip.ldap", "DEBUG") as debug_log,
+        ):
             user_profile = self.backend.authenticate(
                 request=mock.MagicMock(),
                 username=self.example_email("hamlet"),
@@ -6008,6 +7639,29 @@ class TestLDAP(ZulipLDAPTestCase):
             self.assertIs(user_profile, None)
 
     @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",))
+    def test_login_failure_user_account_control(self) -> None:
+        self.change_ldap_user_attr("hamlet", "userAccountControl", "2")
+
+        with (
+            self.settings(
+                LDAP_APPEND_DOMAIN="zulip.com",
+                AUTH_LDAP_USER_ATTR_MAP={"userAccountControl": "userAccountControl"},
+            ),
+            self.assertLogs("django_auth_ldap", "DEBUG") as debug_log,
+        ):
+            user_profile = self.backend.authenticate(
+                request=mock.MagicMock(),
+                username=self.example_email("hamlet"),
+                password=self.ldap_password("hamlet"),
+                realm=get_realm("zulip"),
+            )
+            self.assertIs(user_profile, None)
+            self.assertIn(
+                "DEBUG:django_auth_ldap:Authentication failed for hamlet: User has been deactivated",
+                debug_log.output,
+            )
+
+    @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",))
     @override_settings(
         AUTH_LDAP_USER_ATTR_MAP={
             "full_name": "cn",
@@ -6015,7 +7669,9 @@ class TestLDAP(ZulipLDAPTestCase):
         }
     )
     def test_login_success_when_user_does_not_exist_with_valid_subdomain(self) -> None:
-        RealmDomain.objects.create(realm=self.backend._realm, domain="acme.com")
+        realm = self.backend._realm
+        do_set_realm_property(realm, "default_language", "ja", acting_user=None)
+        RealmDomain.objects.create(realm=realm, domain="acme.com")
         with self.settings(LDAP_APPEND_DOMAIN="acme.com"):
             user_profile = self.backend.authenticate(
                 request=mock.MagicMock(),
@@ -6027,6 +7683,8 @@ class TestLDAP(ZulipLDAPTestCase):
             self.assertEqual(user_profile.delivery_email, "newuser@acme.com")
             self.assertEqual(user_profile.full_name, "New LDAP fullname")
             self.assertEqual(user_profile.realm.string_id, "zulip")
+            # Verify the user got the realm's default language.
+            self.assertEqual(user_profile.default_language, "ja")
 
             # Verify avatar gets created
             self.assertEqual(user_profile.avatar_source, UserProfile.AVATAR_FROM_USER)
@@ -6042,8 +7700,8 @@ class TestLDAP(ZulipLDAPTestCase):
                 "rb",
             ) as f:
                 example_avatar = f.read()
-            self.assert_streaming_content(
-                response, resize_avatar(example_avatar, DEFAULT_AVATAR_SIZE)
+            self.assertEqual(
+                response.getvalue(), resize_avatar(example_avatar, DEFAULT_AVATAR_SIZE)
             )
 
     @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",))
@@ -6087,26 +7745,44 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
         LDAP_DEACTIVATE_NON_MATCHING_USERS was True.
         Details: https://github.com/zulip/zulip/issues/13130
         """
-        with self.settings(
-            LDAP_DEACTIVATE_NON_MATCHING_USERS=True,
-            LDAP_APPEND_DOMAIN="zulip.com",
-            AUTH_LDAP_BIND_PASSWORD="wrongpass",
+        with (
+            self.settings(
+                LDAP_DEACTIVATE_NON_MATCHING_USERS=True,
+                LDAP_APPEND_DOMAIN="zulip.com",
+                AUTH_LDAP_BIND_PASSWORD="wrongpass",
+            ),
+            self.assertLogs("django_auth_ldap", "WARN") as django_ldap_log,
+            self.assertRaisesRegex(PopulateUserLDAPError, r"^INVALID_CREDENTIALS$"),
         ):
-            with self.assertRaises(ldap.INVALID_CREDENTIALS):
-                sync_user_from_ldap(self.example_user("hamlet"), mock.Mock())
-            mock_deactivate.assert_not_called()
+            sync_user_from_ldap(self.example_user("hamlet"), mock.Mock())
+        mock_deactivate.assert_not_called()
+        self.assertEqual(
+            django_ldap_log.output,
+            [
+                "WARNING:django_auth_ldap:Caught LDAPError looking up user: INVALID_CREDENTIALS(':wrongpass')"
+            ],
+        )
 
         # Make sure other types of LDAPError won't cause deactivation either:
-        with mock.patch.object(_LDAPUser, "_get_or_create_user", side_effect=ldap.LDAPError):
-            with self.assertRaises(PopulateUserLDAPError):
-                sync_user_from_ldap(self.example_user("hamlet"), mock.Mock())
-            mock_deactivate.assert_not_called()
+        with (
+            mock.patch.object(_LDAPUser, "_get_or_create_user", side_effect=ldap.LDAPError),
+            self.assertLogs("django_auth_ldap", "WARN") as django_ldap_log,
+            self.assertRaises(PopulateUserLDAPError),
+        ):
+            sync_user_from_ldap(self.example_user("hamlet"), mock.Mock())
+        mock_deactivate.assert_not_called()
+        self.assertEqual(
+            django_ldap_log.output,
+            ["WARNING:django_auth_ldap:Caught LDAPError populating user info: LDAPError()"],
+        )
 
     @override_settings(LDAP_EMAIL_ATTR="mail")
     def test_populate_user_returns_none(self) -> None:
-        with mock.patch.object(ZulipLDAPUser, "populate_user", return_value=None):
-            with self.assertRaises(PopulateUserLDAPError):
-                sync_user_from_ldap(self.example_user("hamlet"), mock.Mock())
+        with (
+            mock.patch.object(ZulipLDAPUser, "populate_user", return_value=None),
+            self.assertRaises(PopulateUserLDAPError),
+        ):
+            sync_user_from_ldap(self.example_user("hamlet"), mock.Mock())
 
     def test_update_full_name(self) -> None:
         self.change_ldap_user_attr("hamlet", "cn", "New Name")
@@ -6114,6 +7790,10 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
         self.perform_ldap_sync(self.example_user("hamlet"))
         hamlet = self.example_user("hamlet")
         self.assertEqual(hamlet.full_name, "New Name")
+        message = most_recent_message(hamlet)
+        self.assertIn("The following changes have been made to your account", message.content)
+        self.assertIn("**Old full name:** King Hamlet", message.content)
+        self.assertIn("**New full name:** New Name", message.content)
 
     def test_update_with_hidden_emails(self) -> None:
         hamlet = self.example_user("hamlet")
@@ -6145,24 +7825,31 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
             self.perform_ldap_sync(self.example_user("hamlet"))
             fn.assert_not_called()
 
-    def test_too_short_name(self) -> None:
-        self.change_ldap_user_attr("hamlet", "cn", "a")
+    def test_empty_name(self) -> None:
+        self.change_ldap_user_attr("hamlet", "cn", "")
 
-        with self.assertRaises(ZulipLDAPError), self.assertLogs(
-            "django_auth_ldap", "WARNING"
-        ) as warn_log:
+        with (
+            self.assertRaises(ZulipLDAPError),
+            self.assertLogs("django_auth_ldap", "DEBUG") as debug_log,
+        ):
             self.perform_ldap_sync(self.example_user("hamlet"))
-        self.assertEqual(
-            warn_log.output,
-            ["WARNING:django_auth_ldap:Name too short! while authenticating hamlet"],
+        self.assertIn(
+            "DEBUG:django_auth_ldap:Failed to populate user hamlet: Name must not be empty!",
+            debug_log.output,
         )
 
     def test_deactivate_user_with_useraccountcontrol_attr(self) -> None:
         self.change_ldap_user_attr("hamlet", "userAccountControl", "2")
 
-        with self.settings(
-            AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "userAccountControl": "userAccountControl"}
-        ), self.assertLogs("zulip.ldap") as info_logs:
+        with (
+            self.settings(
+                AUTH_LDAP_USER_ATTR_MAP={
+                    "full_name": "cn",
+                    "userAccountControl": "userAccountControl",
+                }
+            ),
+            self.assertLogs("zulip.ldap") as info_logs,
+        ):
             self.perform_ldap_sync(self.example_user("hamlet"))
         hamlet = self.example_user("hamlet")
         self.assertFalse(hamlet.is_active)
@@ -6176,9 +7863,12 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
     def test_deactivate_reactivate_user_with_deactivated_attr(self) -> None:
         self.change_ldap_user_attr("hamlet", "someCustomAttr", "TRUE")
 
-        with self.settings(
-            AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "deactivated": "someCustomAttr"}
-        ), self.assertLogs("zulip.ldap") as info_logs:
+        with (
+            self.settings(
+                AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "deactivated": "someCustomAttr"}
+            ),
+            self.assertLogs("zulip.ldap") as info_logs,
+        ):
             self.perform_ldap_sync(self.example_user("hamlet"))
         hamlet = self.example_user("hamlet")
         self.assertFalse(hamlet.is_active)
@@ -6190,9 +7880,12 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
         )
 
         self.change_ldap_user_attr("hamlet", "someCustomAttr", "FALSE")
-        with self.settings(
-            AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "deactivated": "someCustomAttr"}
-        ), self.assertLogs("zulip.ldap") as info_logs:
+        with (
+            self.settings(
+                AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "deactivated": "someCustomAttr"}
+            ),
+            self.assertLogs("zulip.ldap") as info_logs,
+        ):
             self.perform_ldap_sync(self.example_user("hamlet"))
         hamlet.refresh_from_db()
         self.assertTrue(hamlet.is_active)
@@ -6204,9 +7897,14 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
         )
 
         self.change_ldap_user_attr("hamlet", "someCustomAttr", "YESSS")
-        with self.settings(
-            AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "deactivated": "someCustomAttr"}
-        ), self.assertLogs("django_auth_ldap") as ldap_logs, self.assertRaises(AssertionError):
+        with (
+            self.settings(
+                AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "deactivated": "someCustomAttr"}
+            ),
+            self.assertLogs("django_auth_ldap") as ldap_logs,
+            self.assertRaises(AssertionError),
+            self.artificial_transaction_savepoint(),
+        ):
             self.perform_ldap_sync(self.example_user("hamlet"))
         hamlet.refresh_from_db()
         self.assertTrue(hamlet.is_active)
@@ -6221,9 +7919,15 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
     def test_dont_sync_disabled_ldap_user(self, fake_sync: mock.MagicMock) -> None:
         self.change_ldap_user_attr("hamlet", "userAccountControl", "2")
 
-        with self.settings(
-            AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "userAccountControl": "userAccountControl"}
-        ), self.assertLogs("zulip.ldap") as info_logs:
+        with (
+            self.settings(
+                AUTH_LDAP_USER_ATTR_MAP={
+                    "full_name": "cn",
+                    "userAccountControl": "userAccountControl",
+                }
+            ),
+            self.assertLogs("zulip.ldap") as info_logs,
+        ):
             self.perform_ldap_sync(self.example_user("hamlet"))
             fake_sync.assert_not_called()
         self.assertEqual(
@@ -6236,9 +7940,15 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
     def test_reactivate_user(self) -> None:
         do_deactivate_user(self.example_user("hamlet"), acting_user=None)
 
-        with self.settings(
-            AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "userAccountControl": "userAccountControl"}
-        ), self.assertLogs("zulip.ldap") as info_logs:
+        with (
+            self.settings(
+                AUTH_LDAP_USER_ATTR_MAP={
+                    "full_name": "cn",
+                    "userAccountControl": "userAccountControl",
+                }
+            ),
+            self.assertLogs("zulip.ldap") as info_logs,
+        ):
             self.perform_ldap_sync(self.example_user("hamlet"))
         hamlet = self.example_user("hamlet")
         self.assertTrue(hamlet.is_active)
@@ -6257,17 +7967,19 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
 
         self.change_ldap_user_attr("hamlet", "cn", "Second Hamlet")
         expected_call_args = [hamlet2, "Second Hamlet", None]
-        with self.settings(AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn"}):
-            with mock.patch("zerver.actions.user_settings.do_change_full_name") as f:
-                self.perform_ldap_sync(hamlet2)
-                f.assert_called_once_with(*expected_call_args)
+        with (
+            self.settings(AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn"}),
+            mock.patch("zerver.actions.user_settings.do_change_full_name") as f,
+        ):
+            self.perform_ldap_sync(hamlet2)
+            f.assert_called_once_with(*expected_call_args, notify=True)
 
-                # Get the updated model and make sure the full name is changed correctly:
-                hamlet2 = get_user_by_delivery_email(email, test_realm)
-                self.assertEqual(hamlet2.full_name, "Second Hamlet")
-                # Now get the original hamlet and make he still has his name unchanged:
-                hamlet = self.example_user("hamlet")
-                self.assertEqual(hamlet.full_name, "King Hamlet")
+            # Get the updated model and make sure the full name is changed correctly:
+            hamlet2 = get_user_by_delivery_email(email, test_realm)
+            self.assertEqual(hamlet2.full_name, "Second Hamlet")
+            # Now get the original hamlet and make he still has his name unchanged:
+            hamlet = self.example_user("hamlet")
+            self.assertEqual(hamlet.full_name, "King Hamlet")
 
     def test_user_not_found_in_ldap(self) -> None:
         with self.settings(
@@ -6290,8 +8002,9 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
 
     def test_update_user_avatar(self) -> None:
         # Hamlet has jpegPhoto set in our test directory by default.
-        with mock.patch("zerver.lib.upload.upload_avatar_image") as fn, self.settings(
-            AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "avatar": "jpegPhoto"}
+        with (
+            mock.patch("zerver.lib.upload.upload_avatar_image") as fn,
+            self.settings(AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "avatar": "jpegPhoto"}),
         ):
             self.perform_ldap_sync(self.example_user("hamlet"))
             fn.assert_called_once()
@@ -6309,8 +8022,9 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
         self.change_ldap_user_attr(
             "hamlet", "jpegPhoto", static_path("images/logo/zulip-icon-512x512.png"), binary=True
         )
-        with mock.patch("zerver.lib.upload.upload_avatar_image") as fn, self.settings(
-            AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "avatar": "jpegPhoto"}
+        with (
+            mock.patch("zerver.lib.upload.upload_avatar_image") as fn,
+            self.settings(AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "avatar": "jpegPhoto"}),
         ):
             self.perform_ldap_sync(self.example_user("hamlet"))
             fn.assert_called_once()
@@ -6343,12 +8057,12 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
         # Try to use invalid data as the image:
         self.change_ldap_user_attr("hamlet", "jpegPhoto", b"00" + test_image_data)
         with self.settings(AUTH_LDAP_USER_ATTR_MAP={"full_name": "cn", "avatar": "jpegPhoto"}):
-            with self.assertLogs(level="WARNING") as m:
+            with self.assertLogs("zulip.ldap", level="WARNING") as m:
                 self.perform_ldap_sync(self.example_user("hamlet"))
             self.assertEqual(
                 m.output,
                 [
-                    "WARNING:root:Could not parse {} field for user {}".format(
+                    "WARNING:zulip.ldap:Could not parse {} field for user {}".format(
                         "jpegPhoto", hamlet.id
                     )
                 ],
@@ -6389,44 +8103,55 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
                 user_profile=hamlet, field=field
             ).value
             self.assertEqual(field_value, test_case["expected_value"])
+        # Verify that notification was sent for custom profile field updates
+        message = most_recent_message(hamlet)
+        self.assertIn("The following changes have been made to your account", message.content)
+        # Check that both fields are mentioned in the notification
+        for data in test_data:
+            self.assertIn(f"**Old {data['field_name']}:**", message.content)
+            self.assertIn(
+                f"**New {data['field_name']}:** {data['expected_value']}", message.content
+            )
 
     def test_update_non_existent_profile_field(self) -> None:
-        with self.settings(
-            AUTH_LDAP_USER_ATTR_MAP={
-                "full_name": "cn",
-                "custom_profile_field__non_existent": "homePhone",
-            }
+        with (
+            self.settings(
+                AUTH_LDAP_USER_ATTR_MAP={
+                    "full_name": "cn",
+                    "custom_profile_field__non_existent": "homePhone",
+                }
+            ),
+            self.assertRaisesRegex(
+                PopulateUserLDAPError, r"^populate_user unexpectedly returned None$"
+            ),
+            self.assertLogs("django_auth_ldap", "DEBUG") as debug_log,
         ):
-            with self.assertRaisesRegex(
-                ZulipLDAPError, "Custom profile field with name non_existent not found"
-            ), self.assertLogs("django_auth_ldap", "WARNING") as warn_log:
-                self.perform_ldap_sync(self.example_user("hamlet"))
-            self.assertEqual(
-                warn_log.output,
-                [
-                    "WARNING:django_auth_ldap:Custom profile field with name non_existent not found. while authenticating hamlet"
-                ],
-            )
+            self.perform_ldap_sync(self.example_user("hamlet"))
+        self.assertIn(
+            "DEBUG:django_auth_ldap:Failed to populate user hamlet: Custom profile field with name non_existent not found.",
+            debug_log.output,
+        )
 
     def test_update_custom_profile_field_invalid_data(self) -> None:
         self.change_ldap_user_attr("hamlet", "birthDate", "9999")
 
-        with self.settings(
-            AUTH_LDAP_USER_ATTR_MAP={
-                "full_name": "cn",
-                "custom_profile_field__birthday": "birthDate",
-            }
+        with (
+            self.settings(
+                AUTH_LDAP_USER_ATTR_MAP={
+                    "full_name": "cn",
+                    "custom_profile_field__birthday": "birthDate",
+                }
+            ),
+            self.assertRaisesRegex(
+                PopulateUserLDAPError, r"^populate_user unexpectedly returned None$"
+            ),
+            self.assertLogs("django_auth_ldap", "DEBUG") as debug_log,
         ):
-            with self.assertRaisesRegex(
-                ZulipLDAPError, "Invalid data for birthday field"
-            ), self.assertLogs("django_auth_ldap", "WARNING") as warn_log:
-                self.perform_ldap_sync(self.example_user("hamlet"))
-            self.assertEqual(
-                warn_log.output,
-                [
-                    "WARNING:django_auth_ldap:Invalid data for birthday field: Birthday is not a date while authenticating hamlet"
-                ],
-            )
+            self.perform_ldap_sync(self.example_user("hamlet"))
+        self.assertIn(
+            "DEBUG:django_auth_ldap:Failed to populate user hamlet: Invalid data for birthday field: Birthday is not a date",
+            debug_log.output,
+        )
 
     def test_update_custom_profile_field_no_mapping(self) -> None:
         hamlet = self.example_user("hamlet")
@@ -6448,35 +8173,6 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
         ).value
         self.assertEqual(actual_value, expected_value)
 
-    def test_update_custom_profile_field_no_update(self) -> None:
-        hamlet = self.example_user("hamlet")
-        phone_number_field = CustomProfileField.objects.get(realm=hamlet.realm, name="Phone number")
-        birthday_field = CustomProfileField.objects.get(realm=hamlet.realm, name="Birthday")
-        phone_number_field_value = CustomProfileFieldValue.objects.get(
-            user_profile=hamlet, field=phone_number_field
-        )
-        phone_number_field_value.value = "123456789"
-        phone_number_field_value.save(update_fields=["value"])
-        expected_call_args = [
-            hamlet,
-            [
-                {
-                    "id": birthday_field.id,
-                    "value": "1900-09-08",
-                },
-            ],
-        ]
-        with self.settings(
-            AUTH_LDAP_USER_ATTR_MAP={
-                "full_name": "cn",
-                "custom_profile_field__birthday": "birthDate",
-                "custom_profile_field__phone_number": "homePhone",
-            }
-        ):
-            with mock.patch("zproject.backends.do_update_user_custom_profile_data_if_changed") as f:
-                self.perform_ldap_sync(self.example_user("hamlet"))
-                f.assert_called_once_with(*expected_call_args)
-
     def test_update_custom_profile_field_not_present_in_ldap(self) -> None:
         hamlet = self.example_user("hamlet")
         no_op_field = CustomProfileField.objects.get(realm=hamlet.realm, name="Birthday")
@@ -6484,12 +8180,15 @@ class TestZulipLDAPUserPopulator(ZulipLDAPTestCase):
             user_profile=hamlet, field=no_op_field
         ).value
 
-        with self.settings(
-            AUTH_LDAP_USER_ATTR_MAP={
-                "full_name": "cn",
-                "custom_profile_field__birthday": "nonExistentAttr",
-            }
-        ), self.assertLogs("django_auth_ldap", "WARNING") as warn_log:
+        with (
+            self.settings(
+                AUTH_LDAP_USER_ATTR_MAP={
+                    "full_name": "cn",
+                    "custom_profile_field__birthday": "nonExistentAttr",
+                }
+            ),
+            self.assertLogs("django_auth_ldap", "WARNING") as warn_log,
+        ):
             self.perform_ldap_sync(self.example_user("hamlet"))
 
         actual_value = CustomProfileFieldValue.objects.get(
@@ -6701,24 +8400,93 @@ class TestAdminSetBackends(ZulipTestCase):
         self.assertTrue(password_auth_enabled(realm))
         self.assertTrue(dev_auth_enabled(realm))
 
-    def test_supported_backends_only_updated(self) -> None:
+    def test_only_supported_backends_allowed(self) -> None:
         # Log in as admin
         self.login("desdemona")
-        # Set some supported and unsupported backends
-        result = self.client_patch(
-            "/json/realm",
-            {
-                "authentication_methods": orjson.dumps(
-                    {"Email": False, "Dev": True, "GitHub": False}
-                ).decode()
-            },
-        )
-        self.assert_json_success(result)
-        realm = get_realm("zulip")
-        # Check that unsupported backend is not enabled
-        self.assertFalse(github_auth_enabled(realm))
-        self.assertTrue(dev_auth_enabled(realm))
-        self.assertFalse(password_auth_enabled(realm))
+
+        with self.settings(
+            AUTHENTICATION_BACKENDS=(
+                "zproject.backends.EmailAuthBackend",
+                "zproject.backends.DevAuthBackend",
+            )
+        ):
+            result = self.client_patch(
+                "/json/realm",
+                {
+                    "authentication_methods": orjson.dumps(
+                        # Github is not a supported authentication backend right now.
+                        {"Email": False, "Dev": True, "GitHub": False}
+                    ).decode()
+                },
+            )
+            self.assert_json_error(
+                result, "Invalid authentication method: GitHub. Valid methods are: ['Dev', 'Email']"
+            )
+
+            # Also protects from completely invalid input like a backend name that doesn't exist.
+            result = self.client_patch(
+                "/json/realm",
+                {"authentication_methods": orjson.dumps({"NoSuchBackend": True}).decode()},
+            )
+            self.assert_json_error(
+                result,
+                "Invalid authentication method: NoSuchBackend. Valid methods are: ['Dev', 'Email']",
+            )
+
+        with self.settings(
+            AUTHENTICATION_BACKENDS=(
+                "zproject.backends.EmailAuthBackend",
+                "zproject.backends.DevAuthBackend",
+                "zproject.backends.AzureADAuthBackend",
+            ),
+        ):
+            realm = get_realm("zulip")
+            self.assertEqual(
+                realm.authentication_methods_dict(), {"Dev": True, "Email": True, "AzureAD": True}
+            )
+
+            # AzureAD is not available without a Standard plan, but we start off with it enabled.
+            # Disabling the backend should work.
+            result = self.client_patch(
+                "/json/realm",
+                {
+                    "authentication_methods": orjson.dumps(
+                        {"Email": True, "Dev": True, "AzureAD": False}
+                    ).decode()
+                },
+            )
+            self.assert_json_success(result)
+            self.assertEqual(
+                realm.authentication_methods_dict(), {"Dev": True, "Email": True, "AzureAD": False}
+            )
+
+            # However, due to the lack of the necessary plan, enabling will fail.
+            result = self.client_patch(
+                "/json/realm",
+                {
+                    "authentication_methods": orjson.dumps(
+                        {"Email": True, "Dev": True, "AzureAD": True}
+                    ).decode()
+                },
+            )
+            self.assert_json_error(
+                result, "Authentication method AzureAD is not available on your current plan."
+            )
+
+            # With BILLING_ENABLED=False, no such restrictions apply.
+            with self.settings(BILLING_ENABLED=False):
+                result = self.client_patch(
+                    "/json/realm",
+                    {
+                        "authentication_methods": orjson.dumps(
+                            {"Email": True, "Dev": True, "AzureAD": True}
+                        ).decode()
+                    },
+                )
+            self.assert_json_success(result)
+            self.assertEqual(
+                realm.authentication_methods_dict(), {"Dev": True, "Email": True, "AzureAD": True}
+            )
 
 
 class EmailValidatorTestCase(ZulipTestCase):
@@ -6744,20 +8512,39 @@ class EmailValidatorTestCase(ZulipTestCase):
         self.assertIn("containing + are not allowed", error)
 
         cordelia_email = cordelia.delivery_email
-        errors = get_existing_user_errors(realm, {cordelia_email})
+        errors = get_existing_user_errors(
+            realm, {cordelia_email}, allow_inactive_mirror_dummies=True
+        )
         error, is_deactivated = errors[cordelia_email]
         self.assertEqual(False, is_deactivated)
         self.assertEqual(error, "Already has an account.")
 
         change_user_is_active(cordelia, False)
 
-        errors = get_existing_user_errors(realm, {cordelia_email})
+        errors = get_existing_user_errors(
+            realm, {cordelia_email}, allow_inactive_mirror_dummies=True
+        )
         error, is_deactivated = errors[cordelia_email]
         self.assertEqual(True, is_deactivated)
         self.assertEqual(error, "Account has been deactivated.")
 
-        errors = get_existing_user_errors(realm, {"fred-is-fine@zulip.com"})
+        errors = get_existing_user_errors(
+            realm, {"fred-is-fine@zulip.com"}, allow_inactive_mirror_dummies=True
+        )
         self.assertEqual(errors, {})
+
+        cordelia.is_mirror_dummy = True
+        cordelia.save()
+        errors = get_existing_user_errors(
+            realm, {cordelia_email}, allow_inactive_mirror_dummies=True
+        )
+        self.assertEqual(errors, {})
+        errors = get_existing_user_errors(
+            realm, {cordelia_email}, allow_inactive_mirror_dummies=False
+        )
+        error, is_deactivated = errors[cordelia_email]
+        self.assertEqual(True, is_deactivated)
+        self.assertEqual(error, "Account has been deactivated.")
 
 
 class LDAPBackendTest(ZulipTestCase):
@@ -6772,15 +8559,19 @@ class LDAPBackendTest(ZulipTestCase):
         )
         error_type = ZulipLDAPAuthBackend.REALM_IS_NONE_ERROR
         error = ZulipLDAPConfigurationError("Realm is None", error_type)
-        with mock.patch(
-            "zproject.backends.ZulipLDAPAuthBackend.get_or_build_user", side_effect=error
-        ), mock.patch("django_auth_ldap.backend._LDAPUser._authenticate_user_dn"), self.assertLogs(
-            "django_auth_ldap", "WARNING"
-        ) as warn_log:
+        with (
+            mock.patch(
+                "zproject.backends.ZulipLDAPAuthBackend.get_or_build_user", side_effect=error
+            ),
+            mock.patch("django_auth_ldap.backend._LDAPUser._authenticate_user_dn"),
+            self.assertLogs("django_auth_ldap", "WARNING") as warn_log,
+            self.assertLogs("django.request", level="ERROR"),
+        ):
             response = self.client_post("/login/", data)
-            self.assert_in_success_response(
-                ["Configuration error", "You are trying to log in using LDAP without creating an"],
-                response,
+            self.assertEqual(response.status_code, 500)
+            self.assert_in_response("Configuration error", response)
+            self.assert_in_response(
+                "You are trying to log in using LDAP without creating an", response
             )
         self.assertEqual(
             warn_log.output,
@@ -6789,13 +8580,14 @@ class LDAPBackendTest(ZulipTestCase):
 
 
 class JWTFetchAPIKeyTest(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.email = self.example_email("hamlet")
         self.realm = get_realm("zulip")
         self.user_profile = get_user_by_delivery_email(self.email, self.realm)
-        self.api_key = get_api_key(self.user_profile)
-        self.raw_user_data = get_raw_user_data(
+        self.api_key = self.user_profile.api_key
+        self.raw_user_data = get_users_for_api(
             self.user_profile.realm,
             self.user_profile,
             target_user=self.user_profile,
@@ -6853,14 +8645,16 @@ class JWTFetchAPIKeyTest(ZulipTestCase):
             self.assert_json_error_contains(result, "Invalid subdomain", 404)
 
     def test_jwt_key_not_found_failure(self) -> None:
-        with self.settings(JWT_AUTH_KEYS={"zulip": {"key": "key1", "algorithms": ["HS256"]}}):
-            with mock.patch(
+        with (
+            self.settings(JWT_AUTH_KEYS={"zulip": {"key": "key1", "algorithms": ["HS256"]}}),
+            mock.patch(
                 "zerver.views.auth.get_realm_from_request", return_value=get_realm("zephyr")
-            ):
-                result = self.client_post("/api/v1/jwt/fetch_api_key")
-                self.assert_json_error_contains(
-                    result, "JWT authentication is not enabled for this organization", 400
-                )
+            ),
+        ):
+            result = self.client_post("/api/v1/jwt/fetch_api_key")
+            self.assert_json_error_contains(
+                result, "JWT authentication is not enabled for this organization", 400
+            )
 
     def test_missing_jwt_payload_failure(self) -> None:
         with self.settings(JWT_AUTH_KEYS={"zulip": {"key": "key1", "algorithms": ["HS256"]}}):
@@ -6927,7 +8721,12 @@ class JWTFetchAPIKeyTest(ZulipTestCase):
 
     def test_inactive_realm_failure(self) -> None:
         payload = {"email": self.email}
-        do_deactivate_realm(self.user_profile.realm, acting_user=None)
+        do_deactivate_realm(
+            self.user_profile.realm,
+            acting_user=None,
+            deactivation_reason="owner_request",
+            email_owners=False,
+        )
         with self.settings(JWT_AUTH_KEYS={"zulip": {"key": "key1", "algorithms": ["HS256"]}}):
             key = settings.JWT_AUTH_KEYS["zulip"]["key"]
             [algorithm] = settings.JWT_AUTH_KEYS["zulip"]["algorithms"]
@@ -6944,8 +8743,297 @@ class JWTFetchAPIKeyTest(ZulipTestCase):
             web_token = jwt.encode(payload, key, algorithm)
             req_data = {"token": web_token}
             result = self.client_post("/api/v1/jwt/fetch_api_key", req_data)
-            self.assert_json_error_contains(result, "Invalid subdomain", 404)
+            self.assert_json_error_contains(result, "Your username or password is incorrect", 401)
+
+
+class LDAPGroupSyncTest(ZulipTestCase):
+    @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",))
+    def test_ldap_sync_role_from_groups(self) -> None:
+        self.init_default_ldap_database()
+
+        realm = get_realm("zulip")
+        hamlet = self.example_user("hamlet")
+        with (
+            self.settings(
+                LDAP_APPEND_DOMAIN="zulip.com",
+                AUTH_LDAP_GROUP_SEARCH=LDAPSearch(
+                    "ou=groups,dc=zulip,dc=com",
+                    ldap.SCOPE_ONELEVEL,
+                    "(objectClass=groupOfUniqueNames)",
+                ),
+                AUTH_LDAP_USER_FLAGS_BY_GROUP={
+                    "is_realm_admin": "cn=cool_test_group,ou=groups,dc=zulip,dc=com",
+                },
+            ),
+        ):
+            sync_user_from_ldap(hamlet, mock.Mock())
+            hamlet.refresh_from_db()
+            self.assertEqual(hamlet.role, UserProfile.ROLE_REALM_ADMINISTRATOR)
+
+            admin_group = get_system_user_group_by_name(SystemGroups.ADMINISTRATORS, realm.id)
+            self.assertEqual(get_system_user_group_for_user(hamlet), admin_group)
+
+            # Verify UserGroupMembership is set up correct - the user's direct membership should be the admins group.
+            self.assertIn(
+                admin_group.id,
+                set(
+                    UserGroupMembership.objects.filter(user_profile=hamlet).values_list(
+                        "user_group_id", flat=True
+                    )
+                ),
+            )
+
+            # Now test the just-in-time user creation codepath.
+            # A user with no Zulip account logs in for the first time with their LDAP credentials.
+            # The account is created on the fly and should the .role and system groups memberships
+            # set correctly from the start.
+            self.mock_ldap.directory["cn=cool_test_group,ou=groups,dc=zulip,dc=com"][
+                "uniqueMember"
+            ] = ["uid=newuser,ou=users,dc=zulip,dc=com"]
+            password = self.ldap_password("newuser")
+            email = "newuser@zulip.com"
+            self.login_with_return(email, password)
+            user_profile = UserProfile.objects.get(delivery_email=email)
+
+            self.assertEqual(user_profile.role, UserProfile.ROLE_REALM_ADMINISTRATOR)
+
+            admin_group = get_system_user_group_by_name(SystemGroups.ADMINISTRATORS, realm.id)
+            self.assertEqual(get_system_user_group_for_user(user_profile), admin_group)
+
+            self.assertIn(
+                admin_group.id,
+                set(
+                    UserGroupMembership.objects.filter(user_profile=user_profile).values_list(
+                        "user_group_id", flat=True
+                    )
+                ),
+            )
+
+    @override_settings(AUTHENTICATION_BACKENDS=("zproject.backends.ZulipLDAPAuthBackend",))
+    def test_ldap_group_sync(self) -> None:
+        self.init_default_ldap_database()
+
+        hamlet = self.example_user("hamlet")
+        with self.settings(LDAP_APPEND_DOMAIN="zulip.com"):
+            result = sync_user_from_ldap(hamlet, mock.Mock())
+            self.assertTrue(result)
+        self.assertTrue(hamlet.is_active)
+
+        realm = get_realm("zulip")
+
+        with (
+            self.settings(
+                AUTH_LDAP_GROUP_SEARCH=LDAPSearch(
+                    "ou=groups,dc=zulip,dc=com",
+                    ldap.SCOPE_ONELEVEL,
+                    "(objectClass=groupOfUniqueNames)",
+                ),
+                LDAP_SYNCHRONIZED_GROUPS_BY_REALM={
+                    "zulip": [
+                        "cool_test_group",
+                    ]
+                },
+                LDAP_APPEND_DOMAIN="zulip.com",
+            ),
+            self.assertLogs("zulip.ldap", "DEBUG") as zulip_ldap_log,
+        ):
+            self.assertFalse(
+                NamedUserGroup.objects.filter(
+                    realm_for_sharding=realm, name="cool_test_group"
+                ).exists()
+            )
+
+            create_user_group_in_database(
+                "cool_test_group", [], realm, acting_user=hamlet, description="Created by LDAP sync"
+            )
+
+            self.assertTrue(
+                NamedUserGroup.objects.filter(
+                    realm_for_sharding=realm, name="cool_test_group"
+                ).exists()
+            )
+
+            user_group = NamedUserGroup.objects.get(
+                realm_for_sharding=realm, name="cool_test_group"
+            )
+
+            self.assertFalse(
+                is_user_in_group(
+                    user_group.id,
+                    hamlet,
+                    direct_member_only=True,
+                )
+            )
+
+            sync_user_from_ldap(hamlet, mock.Mock())
+            self.assertTrue(
+                is_user_in_group(
+                    user_group.id,
+                    hamlet,
+                    direct_member_only=True,
+                )
+            )
+
+            # Add a user to a Zulip group that they are not member of in ldap.
+            # This implies that they should be deleted from the Zulip group
+            # upon the next sync.
+            cordelia = self.example_user("cordelia")
+            bulk_add_members_to_user_groups(
+                [user_group],
+                [cordelia.id],
+                acting_user=None,
+            )
+
+            self.assertTrue(
+                is_user_in_group(
+                    NamedUserGroup.objects.get(realm_for_sharding=realm, name="cool_test_group").id,
+                    cordelia,
+                    direct_member_only=True,
+                )
+            )
+
+            # This should remove cordelia from cool_test_group
+            sync_user_from_ldap(cordelia, mock.Mock())
+
+            self.assertFalse(
+                is_user_in_group(
+                    NamedUserGroup.objects.get(realm_for_sharding=realm, name="cool_test_group").id,
+                    cordelia,
+                    direct_member_only=True,
+                )
+            )
+
+        hamlet = self.example_user("hamlet")
+        cordelia = self.example_user("cordelia")
+
+        self.assertEqual(
+            zulip_ldap_log.output,
+            [
+                f"DEBUG:zulip.ldap:Starting group sync for user {hamlet.id} in realm {hamlet.realm.string_id}",
+                f"DEBUG:zulip.ldap:intended groups for user <{hamlet.id}>: {{'cool_test_group'}}; current groups: set()",
+                f"DEBUG:zulip.ldap:Adding user {hamlet.id} to groups {{'cool_test_group'}}",
+                f"DEBUG:zulip.ldap:Finished group sync for user {hamlet.id}",
+                f"DEBUG:zulip.ldap:Starting group sync for user {cordelia.id} in realm {cordelia.realm.string_id}",
+                f"DEBUG:zulip.ldap:intended groups for user <{cordelia.id}>: set(); current groups: {{'cool_test_group'}}",
+                f"DEBUG:zulip.ldap:Removing user {cordelia.id} from groups {{'cool_test_group'}}",
+                f"DEBUG:zulip.ldap:Finished group sync for user {cordelia.id}",
+            ],
+        )
+
+        # Test an exception using a malformed ldap group search setting.
+        with (
+            self.settings(
+                AUTH_LDAP_GROUP_SEARCH=LDAPSearch(
+                    "ou=groups,dc=zulip,dc=com",
+                    ldap.SCOPE_ONELEVEL,
+                    "(objectClass=groupOfUniqueNames",  # this is malformed, missing ")"
+                ),
+                LDAP_SYNCHRONIZED_GROUPS_BY_REALM={
+                    "zulip": [
+                        "cool_test_group",
+                    ]
+                },
+                LDAP_APPEND_DOMAIN="zulip.com",
+            ),
+            self.assertLogs("django_auth_ldap", "DEBUG") as django_ldap_log,
+            self.assertRaises(
+                PopulateUserLDAPError, msg="populate_user unexpectedly returned None"
+            ),
+        ):
+            sync_user_from_ldap(cordelia, mock.Mock())
+
+        self.assertIn(
+            'DEBUG:django_auth_ldap:Failed to populate user cordelia: search_s("ou=groups,dc=zulip,dc=com", 1, "(&(objectClass=groupOfUniqueNames(uniqueMember=uid=cordelia,ou=users,dc=zulip,dc=com))", "None", 0)',
+            django_ldap_log.output,
+        )
 
 
 # Don't load the base class as a test: https://bugs.python.org/issue17519.
 del SocialAuthBase
+
+
+class TestCustomAuthDecorator(ZulipTestCase):
+    def test_custom_auth_decorator(self) -> None:
+        call_count = 0
+        backends_with_restriction = []
+
+        def custom_auth_wrapper(
+            auth_func: AuthFuncT, *args: Any, **kwargs: Any
+        ) -> UserProfile | None:
+            nonlocal call_count, backends_with_restriction
+            call_count += 1
+
+            backend = args[0]
+            backend_name = backend.name
+            request = args[1]
+            test_header_value = request.headers.get("X-Test-Auth-Header")
+
+            user_profile = auth_func(*args, **kwargs)
+            if backend_name in backends_with_restriction and test_header_value != "allowed":
+                raise JsonableError("Forbidden header value")
+
+            return user_profile
+
+        with self.settings(CUSTOM_AUTHENTICATION_WRAPPER_FUNCTION=custom_auth_wrapper):
+            self.login("hamlet")
+            self.assertEqual(call_count, 1)
+
+            backends_with_restriction = ["email", "dummy"]
+
+            realm = get_realm("zulip")
+            hamlet = self.example_user("hamlet")
+            password = "testpassword"
+
+            request = mock.MagicMock()
+            request.headers = {"X-Test-Auth-Header": "allowed"}
+
+            # The wrapper structurally gets executed whenever .authenticate() for a backend
+            # is called, so it doesn't matter whether e.g. auth credentials are correct or not.
+            result = EmailAuthBackend().authenticate(
+                request, username=hamlet.delivery_email, password="wrong", realm=realm
+            )
+            self.assertEqual(result, None)
+            self.assertEqual(call_count, 2)
+
+            hamlet.set_password(password)
+            hamlet.save()
+            result = EmailAuthBackend().authenticate(
+                request, username=hamlet.delivery_email, password=password, realm=realm
+            )
+            self.assertEqual(result, hamlet)
+            self.assertEqual(call_count, 3)
+
+            # But without the appropriate header value, this fails.
+            request.headers = {}
+            with self.assertRaisesRegex(JsonableError, "Forbidden header value"):
+                EmailAuthBackend().authenticate(
+                    request, username=hamlet.delivery_email, password=password, realm=realm
+                )
+
+            self.assertEqual(call_count, 4)
+
+        # Now try the registration codepath.
+        alice_email = self.nonreg_email("alice")
+        password = "password"
+        inviter = self.example_user("iago")
+        prereg_user = PreregistrationUser.objects.create(
+            email=alice_email, referred_by=inviter, realm=realm
+        )
+
+        confirmation_link = create_confirmation_link(prereg_user, Confirmation.USER_REGISTRATION)
+        registration_key = confirmation_link.split("/")[-1]
+
+        url = "/accounts/register/"
+        with self.settings(CUSTOM_AUTHENTICATION_WRAPPER_FUNCTION=custom_auth_wrapper):
+            self.client_post(
+                url, {"key": registration_key, "from_confirmation": 1, "full_name": "alice"}
+            )
+            result = self.submit_reg_form_for_user(alice_email, password, key=registration_key)
+
+            # The account gets created, because it's the authentication layer that's wrapped
+            # with custom logic, so it doesn't affect the registration process itself - just
+            # the signing in of the user at the end. Ultimately, the user cannot acquire an
+            # authenticated session, so the objective of the functionality is accomplished.
+            self.assert_json_error(result, "Forbidden header value")
+            self.assertEqual(UserProfile.objects.latest("id").delivery_email, alice_email)
+            self.assertEqual(call_count, 5)

@@ -1,26 +1,28 @@
 # Webhooks for external integrations.
-from typing import Dict, List
+
+from typing import Annotated
 
 from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_string, to_wild_value
+from zerver.lib.typed_endpoint import ApiParamConfig, JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import UserProfile
 
 
 @webhook_view("Alertmanager")
-@has_request_variables
+@typed_endpoint
 def api_alertmanager_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
-    name_field: str = REQ("name", default="instance"),
-    desc_field: str = REQ("desc", default="alertname"),
+    *,
+    payload: JsonBodyPayload[WildValue],
+    name_field: Annotated[str, ApiParamConfig("name")] = "instance",
+    desc_field: Annotated[str, ApiParamConfig("desc")] = "alertname",
 ) -> HttpResponse:
-    topics: Dict[str, Dict[str, List[str]]] = {}
+    topics: dict[str, dict[str, list[str]]] = {}
 
     for alert in payload["alerts"]:
         labels = alert.get("labels", {})
@@ -33,12 +35,12 @@ def api_alertmanager_webhook(
 
         url = alert["generatorURL"].tame(check_string).replace("tab=1", "tab=0")
 
-        body = f"{desc} ([graph]({url}))"
+        body = f"{desc} ([source]({url}))"
         if name not in topics:
             topics[name] = {"firing": [], "resolved": []}
         topics[name][alert["status"].tame(check_string)].append(body)
 
-    for topic, statuses in topics.items():
+    for topic_name, statuses in topics.items():
         for status, messages in statuses.items():
             if len(messages) == 0:
                 continue
@@ -56,6 +58,6 @@ def api_alertmanager_webhook(
                 message_list = "\n".join(f"* {m}" for m in messages)
                 body = f"{icon} **{title}**\n{message_list}"
 
-            check_send_webhook_message(request, user_profile, topic, body)
+            check_send_webhook_message(request, user_profile, topic_name, body)
 
     return json_success(request)

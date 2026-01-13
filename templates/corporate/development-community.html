@@ -1,5 +1,4 @@
-{% extends "zerver/portico.html" %}
-{% set entrypoint = "landing-page" %}
+{% extends "zerver/marketing_page.html" %}
 
 {% set PAGE_TITLE = "Development community | Zulip" %}
 
@@ -7,14 +6,8 @@
   ask questions, or provide feedback to the creators of Zulip. Everyone is
   welcome!" %}
 
-{% block customhead %}
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-{% endblock %}
 
-{% block portico_content %}
-
-{% include 'zerver/landing_nav.html' %}
-
+{% block marketing_content %}
 
 <div class="portico-landing why-page solutions-page">
     <div class="hero bg-pycon">
@@ -23,7 +16,7 @@
             <h1 class="center">{% trans %}The Zulip development community{% endtrans %}</h1>
         </div>
         <div class="hero-text">
-            Join today! The buttons below provide customized stream subscriptions.
+            Join today! The buttons below provide customized channel subscriptions.
         </div>
         <div class="hero-buttons center">
             <a href="https://chat.zulip.org/join/t5crtoe62bpcxyisiyglmtvb/" class="button">
@@ -46,7 +39,7 @@
     </div>
 
     <div class="feature-end">
-        <div class="bottom-register-buttons">
+        <div class="bottom-register-buttons extra_margin_before_footer">
             <h1>
                 Join today!
             </h1>

@@ -1,28 +1,29 @@
-from typing import Callable, Dict, Optional
+from collections.abc import Callable
 
 from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
 from zerver.lib.exceptions import UnsupportedWebhookEventTypeError
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_int, check_string, to_wild_value
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_int, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.lib.webhooks.git import (
     TOPIC_WITH_BRANCH_TEMPLATE,
     TOPIC_WITH_PR_OR_ISSUE_INFO_TEMPLATE,
     get_pull_request_event_message,
     get_push_commits_event_message,
+    is_branch_name_notifiable,
 )
 from zerver.models import UserProfile
 
 
 def get_code_pull_request_updated_body(payload: WildValue) -> str:
     return get_pull_request_event_message(
-        get_code_pull_request_user_name(payload),
-        "updated",
-        get_code_pull_request_url(payload),
-        get_code_pull_request_id(payload),
+        user_name=get_code_pull_request_user_name(payload),
+        action="updated",
+        url=get_code_pull_request_url(payload),
+        number=get_code_pull_request_id(payload),
         message=payload["detailedMessage"]["markdown"].tame(check_string),
         title=get_code_pull_request_title(payload),
     )
@@ -30,10 +31,16 @@ def get_code_pull_request_updated_body(payload: WildValue) -> str:
 
 def get_code_pull_request_merged_body(payload: WildValue) -> str:
     return get_pull_request_event_message(
-        get_code_pull_request_user_name(payload),
-        "merged",
-        get_code_pull_request_url(payload),
-        get_code_pull_request_id(payload),
+        user_name=get_code_pull_request_user_name(payload),
+        action="merged",
+        url=get_code_pull_request_url(payload),
+        number=get_code_pull_request_id(payload),
+        target_branch=payload["resource"]["sourceRefName"]
+        .tame(check_string)
+        .replace("refs/heads/", ""),
+        base_branch=payload["resource"]["targetRefName"]
+        .tame(check_string)
+        .replace("refs/heads/", ""),
         title=get_code_pull_request_title(payload),
     )
 
@@ -44,13 +51,17 @@ def get_code_pull_request_opened_body(payload: WildValue) -> str:
     else:
         description = None
     return get_pull_request_event_message(
-        get_code_pull_request_user_name(payload),
-        "created",
-        get_code_pull_request_url(payload),
-        get_code_pull_request_id(payload),
-        payload["resource"]["sourceRefName"].tame(check_string).replace("refs/heads/", ""),
-        payload["resource"]["targetRefName"].tame(check_string).replace("refs/heads/", ""),
-        description,
+        user_name=get_code_pull_request_user_name(payload),
+        action="created",
+        url=get_code_pull_request_url(payload),
+        number=get_code_pull_request_id(payload),
+        target_branch=payload["resource"]["sourceRefName"]
+        .tame(check_string)
+        .replace("refs/heads/", ""),
+        base_branch=payload["resource"]["targetRefName"]
+        .tame(check_string)
+        .replace("refs/heads/", ""),
+        message=description,
         title=get_code_pull_request_title(payload),
     )
 
@@ -61,19 +72,17 @@ def get_code_push_commits_body(payload: WildValue) -> str:
         payload["resource"]["refUpdates"][0]["oldObjectId"].tame(check_string),
         payload["resource"]["refUpdates"][0]["newObjectId"].tame(check_string),
     )
-    commits_data = []
-    if payload["resource"].get("commits"):
-        for commit in payload["resource"]["commits"]:
-            commits_data.append(
-                {
-                    "name": commit["author"]["name"].tame(check_string),
-                    "sha": commit["commitId"].tame(check_string),
-                    "url": "{}/commit/{}".format(
-                        get_code_repository_url(payload), commit["commitId"].tame(check_string)
-                    ),
-                    "message": commit["comment"].tame(check_string),
-                }
-            )
+    commits_data = [
+        {
+            "name": commit["author"]["name"].tame(check_string),
+            "sha": commit["commitId"].tame(check_string),
+            "url": "{}/commit/{}".format(
+                get_code_repository_url(payload), commit["commitId"].tame(check_string)
+            ),
+            "message": commit["comment"].tame(check_string),
+        }
+        for commit in payload["resource"].get("commits", [])
+    ]
     return get_push_commits_event_message(
         get_code_push_user_name(payload),
         compare_url,
@@ -131,11 +140,11 @@ def get_topic_based_on_event(payload: WildValue, event: str) -> str:
     return get_code_repository_name(payload)  # nocoverage
 
 
-def get_event_name(payload: WildValue, branches: Optional[str]) -> Optional[str]:
+def get_event_name(payload: WildValue, branches: str | None) -> str | None:
     event_name = payload["eventType"].tame(check_string)
     if event_name == "git.push" and branches is not None:
         branch = get_code_push_branch_name(payload)
-        if branches.find(branch) == -1:
+        if not is_branch_name_notifiable(branch, branches):
             return None
     if event_name == "git.pullrequest.merged":
         status = payload["resource"]["status"].tame(check_string)
@@ -150,7 +159,7 @@ def get_event_name(payload: WildValue, branches: Optional[str]) -> Optional[str]
     raise UnsupportedWebhookEventTypeError(event_name)
 
 
-EVENT_FUNCTION_MAPPER: Dict[str, Callable[[WildValue], str]] = {
+EVENT_FUNCTION_MAPPER: dict[str, Callable[[WildValue], str]] = {
     "git.push": get_code_push_commits_body,
     "git.pullrequest.created": get_code_pull_request_opened_body,
     "git.pullrequest.merged": get_code_pull_request_merged_body,
@@ -161,21 +170,22 @@ ALL_EVENT_TYPES = list(EVENT_FUNCTION_MAPPER.keys())
 
 
 @webhook_view("AzureDevOps", all_event_types=ALL_EVENT_TYPES)
-@has_request_variables
+@typed_endpoint
 def api_azuredevops_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
-    branches: Optional[str] = REQ(default=None),
+    *,
+    payload: JsonBodyPayload[WildValue],
+    branches: str | None = None,
 ) -> HttpResponse:
     event = get_event_name(payload, branches)
     if event is None:
         return json_success(request)
 
-    topic = get_topic_based_on_event(payload, event)
+    topic_name = get_topic_based_on_event(payload, event)
 
     body_function = EVENT_FUNCTION_MAPPER[event]
     body = body_function(payload)
 
-    check_send_webhook_message(request, user_profile, topic, body)
+    check_send_webhook_message(request, user_profile, topic_name, body)
     return json_success(request)

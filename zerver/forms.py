@@ -1,10 +1,10 @@
+import base64
 import logging
 import re
-from email.errors import HeaderParseError
-from email.headerregistry import Address
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
-import DNS
+import orjson
+from altcha import verify_solution
 from django import forms
 from django.conf import settings
 from django.contrib.auth import authenticate, password_validation
@@ -12,73 +12,70 @@ from django.contrib.auth.forms import AuthenticationForm, PasswordResetForm, Set
 from django.contrib.auth.tokens import PasswordResetTokenGenerator, default_token_generator
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
+from django.forms.renderers import BaseRenderer
 from django.http import HttpRequest
-from django.urls import reverse
-from django.utils.http import urlsafe_base64_encode
-from django.utils.translation import get_language, gettext_lazy
+from django.utils.html import format_html
+from django.utils.safestring import SafeString
 from django.utils.translation import gettext as _
+from django.utils.translation import gettext_lazy
 from markupsafe import Markup
 from two_factor.forms import AuthenticationTokenForm as TwoFactorAuthenticationTokenForm
 from two_factor.utils import totp_digits
+from typing_extensions import override
 
-from zerver.actions.user_settings import do_change_password
+from zerver.actions.user_settings import do_change_password, do_change_user_setting
+from zerver.actions.users import do_send_password_reset_email
 from zerver.lib.email_validation import (
     email_allowed_for_realm,
     email_reserved_for_system_bots_error,
+    validate_is_not_disposable,
 )
 from zerver.lib.exceptions import JsonableError, RateLimitedError
-from zerver.lib.name_restrictions import is_disposable_domain, is_reserved_subdomain
-from zerver.lib.rate_limiter import RateLimitedObject, rate_limit_request_by_ip
-from zerver.lib.send_email import FromAddress, send_email
-from zerver.lib.soft_deactivation import queue_soft_reactivation
+from zerver.lib.i18n import get_language_list
+from zerver.lib.name_restrictions import is_reserved_subdomain
+from zerver.lib.rate_limiter import RateLimitedObject, rate_limit_request_by_ip, should_rate_limit
 from zerver.lib.subdomains import get_subdomain, is_root_domain_available
 from zerver.lib.users import check_full_name
-from zerver.models import (
+from zerver.models import PreregistrationRealm, Realm, UserProfile
+from zerver.models.realm_audit_logs import RealmAuditLog
+from zerver.models.realms import (
     DisposableEmailError,
     DomainNotAllowedForRealmError,
     EmailContainsPlusError,
-    Realm,
-    UserProfile,
     get_realm,
-    get_user_by_delivery_email,
-    is_cross_realm_bot_email,
 )
-from zproject.backends import check_password_strength, email_auth_enabled, email_belongs_to_ldap
-
-if settings.BILLING_ENABLED:
-    from corporate.lib.registration import check_spare_licenses_available_for_registering_new_user
-    from corporate.lib.stripe import LicenseLimitError
+from zerver.models.users import get_user_by_delivery_email, is_cross_realm_bot_email
+from zproject.backends import (
+    check_password_strength,
+    email_auth_enabled,
+    email_belongs_to_ldap,
+    password_auth_enabled,
+)
 
 # We don't mark this error for translation, because it's displayed
 # only to MIT users.
-MIT_VALIDATION_ERROR = (
+MIT_VALIDATION_ERROR = Markup(
     "That user does not exist at MIT or is a"
     ' <a href="https://ist.mit.edu/email-lists">mailing list</a>.'
     " If you want to sign up an alias for Zulip,"
     ' <a href="mailto:support@zulip.com">contact us</a>.'
 )
 
+INVALID_ACCOUNT_CREDENTIALS_ERROR = gettext_lazy("Incorrect email or password.")
 DEACTIVATED_ACCOUNT_ERROR = gettext_lazy(
     "Your account {username} has been deactivated."
     " Please contact your organization administrator to reactivate it."
 )
 PASSWORD_TOO_WEAK_ERROR = gettext_lazy("The password is too weak.")
 
+# Set Form.EmailField to match the default max_length on Model.EmailField,
+# can be removed when https://code.djangoproject.com/ticket/35119 is
+# completed.
+EMAIL_MAX_LENGTH = 254
 
-def email_is_not_mit_mailing_list(email: str) -> None:
-    """Prevent MIT mailing lists from signing up for Zulip"""
-    address = Address(addr_spec=email)
-    if address.domain == "mit.edu":
-        # Check whether the user exists and can get mail.
-        try:
-            DNS.dnslookup(f"{address.username}.pobox.ns.athena.mit.edu", DNS.Type.TXT)
-        except DNS.Base.ServerError as e:
-            if e.rcode == DNS.Status.NXDOMAIN:
-                # This error is Markup only because 1. it needs to render HTML
-                # 2. It's not formatted with any user input.
-                raise ValidationError(Markup(MIT_VALIDATION_ERROR))
-            else:
-                raise AssertionError("Unexpected DNS error")
+
+class OverridableValidationError(ValidationError):
+    pass
 
 
 def check_subdomain_available(subdomain: str, allow_reserved_subdomain: bool = False) -> None:
@@ -86,7 +83,8 @@ def check_subdomain_available(subdomain: str, allow_reserved_subdomain: bool = F
         "too short": _("Subdomain needs to have length 3 or greater."),
         "extremal dash": _("Subdomain cannot start or end with a '-'."),
         "bad character": _("Subdomain can only have lowercase letters, numbers, and '-'s."),
-        "unavailable": _("Subdomain unavailable. Please choose a different one."),
+        "unavailable": _("Subdomain is already in use. Please choose a different one."),
+        "reserved": _("Subdomain reserved. Please choose a different one."),
     }
 
     if subdomain == Realm.SUBDOMAIN_FOR_ROOT_DOMAIN:
@@ -95,54 +93,58 @@ def check_subdomain_available(subdomain: str, allow_reserved_subdomain: bool = F
         raise ValidationError(error_strings["unavailable"])
     if subdomain[0] == "-" or subdomain[-1] == "-":
         raise ValidationError(error_strings["extremal dash"])
-    if not re.match("^[a-z0-9-]*$", subdomain):
+    if not re.match(r"^[a-z0-9-]*$", subdomain):
         raise ValidationError(error_strings["bad character"])
     if len(subdomain) < 3:
         raise ValidationError(error_strings["too short"])
     if Realm.objects.filter(string_id=subdomain).exists():
         raise ValidationError(error_strings["unavailable"])
     if is_reserved_subdomain(subdomain) and not allow_reserved_subdomain:
-        raise ValidationError(error_strings["unavailable"])
+        raise OverridableValidationError(
+            error_strings["reserved"],
+            "Pass --allow-reserved-subdomain to override",
+        )
 
 
-class RegistrationForm(forms.Form):
-    MAX_PASSWORD_LENGTH = 100
-    full_name = forms.CharField(max_length=UserProfile.MAX_NAME_LENGTH)
-    # The required-ness of the password field gets overridden if it isn't
-    # actually required for a realm
-    password = forms.CharField(widget=forms.PasswordInput, max_length=MAX_PASSWORD_LENGTH)
+def email_not_system_bot(email: str) -> None:
+    if is_cross_realm_bot_email(email):
+        msg = email_reserved_for_system_bots_error(email)
+        code = msg
+        raise ValidationError(
+            msg,
+            code=code,
+            params=dict(deactivated=False),
+        )
+
+
+def email_is_not_disposable(email: str) -> None:
+    try:
+        validate_is_not_disposable(email)
+    except DisposableEmailError:
+        raise ValidationError(_("Please use your real email address."))
+
+
+class RealmDetailsForm(forms.Form):
     realm_subdomain = forms.CharField(max_length=Realm.MAX_REALM_SUBDOMAIN_LENGTH, required=False)
-    realm_type = forms.IntegerField(required=False)
-    is_demo_organization = forms.BooleanField(required=False)
-    enable_marketing_emails = forms.BooleanField(required=False)
+    realm_type = forms.TypedChoiceField(
+        coerce=int, choices=[(t["id"], t["name"]) for t in Realm.ORG_TYPES.values()]
+    )
+    realm_default_language = forms.ChoiceField(choices=[])
+    realm_name = forms.CharField(max_length=Realm.MAX_REALM_NAME_LENGTH)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        # Since the superclass doesn't except random extra kwargs, we
+        # Since the superclass doesn't accept random extra kwargs, we
         # remove it from the kwargs dict before initializing.
         self.realm_creation = kwargs["realm_creation"]
         del kwargs["realm_creation"]
 
         super().__init__(*args, **kwargs)
-        if settings.TERMS_OF_SERVICE_VERSION is not None:
-            self.fields["terms"] = forms.BooleanField(required=True)
-        self.fields["realm_name"] = forms.CharField(
-            max_length=Realm.MAX_REALM_NAME_LENGTH, required=self.realm_creation
+        self.fields["realm_default_language"] = forms.ChoiceField(
+            choices=[(lang["code"], lang["name"]) for lang in get_language_list()],
+            required=self.realm_creation,
         )
-
-    def clean_full_name(self) -> str:
-        try:
-            return check_full_name(self.cleaned_data["full_name"])
-        except JsonableError as e:
-            raise ValidationError(e.msg)
-
-    def clean_password(self) -> str:
-        password = self.cleaned_data["password"]
-        if self.fields["password"].required and not check_password_strength(password):
-            # The frontend code tries to stop the user from submitting the form with a weak password,
-            # but if the user bypasses that protection, this error code path will run.
-            raise ValidationError(str(PASSWORD_TOO_WEAK_ERROR))
-
-        return password
+        self.fields["realm_type"].required = self.realm_creation
+        self.fields["realm_name"].required = self.realm_creation
 
     def clean_realm_subdomain(self) -> str:
         if not self.realm_creation:
@@ -157,16 +159,115 @@ class RegistrationForm(forms.Form):
         return subdomain
 
 
+# These are the matching field names for the options in
+# RealmAuditLog.HOW_REALM_CREATOR_FOUND_ZULIP_OPTIONS that
+# ask for more context when creating a new organization.
+HOW_FOUND_ZULIP_EXTRA_CONTEXT = {
+    "other": "how_realm_creator_found_zulip_other_text",
+    "ad": "how_realm_creator_found_zulip_where_ad",
+    "existing_user": "how_realm_creator_found_zulip_which_organization",
+    "review_site": "how_realm_creator_found_zulip_review_site",
+    "ai_chatbot": "how_realm_creator_found_zulip_which_ai_chatbot",
+}
+
+
+class HowFoundZulipFormMixin(forms.Form):
+    how_realm_creator_found_zulip = forms.ChoiceField(
+        choices=RealmAuditLog.HOW_REALM_CREATOR_FOUND_ZULIP_OPTIONS.items()
+    )
+    how_realm_creator_found_zulip_other_text = forms.CharField(max_length=100, required=False)
+    how_realm_creator_found_zulip_where_ad = forms.CharField(max_length=100, required=False)
+    how_realm_creator_found_zulip_which_organization = forms.CharField(
+        max_length=100, required=False
+    )
+    how_realm_creator_found_zulip_review_site = forms.CharField(max_length=100, required=False)
+    how_realm_creator_found_zulip_which_ai_chatbot = forms.CharField(max_length=100, required=False)
+
+
+class RegistrationForm(HowFoundZulipFormMixin, RealmDetailsForm):
+    MAX_PASSWORD_LENGTH = 100
+    full_name = forms.CharField(max_length=UserProfile.MAX_NAME_LENGTH)
+    # The required-ness of the password field gets overridden if it isn't
+    # actually required for a realm
+    password = forms.CharField(widget=forms.PasswordInput, max_length=MAX_PASSWORD_LENGTH)
+    enable_marketing_emails = forms.BooleanField(required=False)
+    email_address_visibility = forms.TypedChoiceField(
+        required=False,
+        coerce=int,
+        empty_value=None,
+        choices=list(UserProfile.EMAIL_ADDRESS_VISIBILITY_ID_TO_NAME_MAP.items()),
+    )
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Since the superclass doesn't except random extra kwargs, we
+        # remove it from the kwargs dict before initializing.
+        self.realm = kwargs.pop("realm", None)
+
+        super().__init__(*args, **kwargs)
+        if settings.TERMS_OF_SERVICE_VERSION is not None:
+            self.fields["terms"] = forms.BooleanField(required=True)
+        self.fields["how_realm_creator_found_zulip"].required = self.realm_creation
+
+    def clean_full_name(self) -> str:
+        try:
+            return check_full_name(
+                full_name_raw=self.cleaned_data["full_name"], user_profile=None, realm=self.realm
+            )
+        except JsonableError as e:
+            raise ValidationError(e.msg)
+
+    def clean_password(self) -> str:
+        password = self.cleaned_data["password"]
+        if self.fields["password"].required and not check_password_strength(password):
+            # The frontend code tries to stop the user from submitting the form with a weak password,
+            # but if the user bypasses that protection, this error code path will run.
+            raise ValidationError(str(PASSWORD_TOO_WEAK_ERROR))
+
+        return password
+
+
+class DemoRegistrationForm(HowFoundZulipFormMixin, forms.Form):
+    terms = forms.BooleanField(required=False)
+    realm_name = forms.CharField(max_length=Realm.MAX_REALM_NAME_LENGTH)
+    realm_type = forms.TypedChoiceField(
+        coerce=int, choices=[(t["id"], t["name"]) for t in Realm.ORG_TYPES.values()]
+    )
+    realm_default_language = forms.ChoiceField(choices=[])
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.realm_creation = True
+        super().__init__(*args, **kwargs)
+        if settings.TERMS_OF_SERVICE_VERSION is not None:
+            self.fields["terms"] = forms.BooleanField(required=True)
+
+        self.fields["realm_default_language"] = forms.ChoiceField(
+            choices=[(lang["code"], lang["name"]) for lang in get_language_list()],
+        )
+
+
 class ToSForm(forms.Form):
-    terms = forms.BooleanField(required=True)
+    terms = forms.BooleanField(required=False)
+    enable_marketing_emails = forms.BooleanField(required=False)
+    email_address_visibility = forms.TypedChoiceField(
+        required=False,
+        coerce=int,
+        empty_value=None,
+        choices=list(UserProfile.EMAIL_ADDRESS_VISIBILITY_ID_TO_NAME_MAP.items()),
+    )
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        if settings.TERMS_OF_SERVICE_VERSION is not None:
+            self.fields["terms"] = forms.BooleanField(required=True)
 
 
 class HomepageForm(forms.Form):
-    email = forms.EmailField()
+    email = forms.EmailField(max_length=EMAIL_MAX_LENGTH)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.realm = kwargs.pop("realm", None)
         self.from_multiuse_invite = kwargs.pop("from_multiuse_invite", False)
+        self.require_password_backend = kwargs.pop("require_password_backend", False)
         self.invited_as = kwargs.pop("invited_as", None)
         super().__init__(*args, **kwargs)
 
@@ -186,14 +287,17 @@ class HomepageForm(forms.Form):
                 )
             )
 
-        if not from_multiuse_invite and realm.invite_required:
-            raise ValidationError(
-                _(
-                    "Please request an invite for {email} "
-                    "from the organization "
-                    "administrator."
-                ).format(email=email)
-            )
+        if not from_multiuse_invite:
+            if realm.invite_required:
+                raise ValidationError(
+                    _(
+                        "Please request an invite for {email} from the organization administrator."
+                    ).format(email=email)
+                )
+            if self.require_password_backend and not password_auth_enabled(realm):
+                raise ValidationError(
+                    _("Can't join the organization: password authentication is not enabled.")
+                )
 
         try:
             email_allowed_for_realm(email, realm)
@@ -202,7 +306,7 @@ class HomepageForm(forms.Form):
                 _(
                     "Your email address, {email}, is not in one of the domains "
                     "that are allowed to register for accounts in this organization."
-                ).format(string_id=realm.string_id, email=email)
+                ).format(email=email)
             )
         except DisposableEmailError:
             raise ValidationError(_("Please use your real email address."))
@@ -211,10 +315,12 @@ class HomepageForm(forms.Form):
                 _("Email addresses containing + are not allowed in this organization.")
             )
 
-        if realm.is_zephyr_mirror_realm:
-            email_is_not_mit_mailing_list(email)
-
         if settings.BILLING_ENABLED:
+            from corporate.lib.registration import (
+                check_spare_licenses_available_for_registering_new_user,
+            )
+            from corporate.lib.stripe import LicenseLimitError
+
             role = self.invited_as if self.invited_as is not None else UserProfile.ROLE_MEMBER
             try:
                 check_spare_licenses_available_for_registering_new_user(realm, email, role=role)
@@ -229,33 +335,139 @@ class HomepageForm(forms.Form):
         return email
 
 
-def email_not_system_bot(email: str) -> None:
-    if is_cross_realm_bot_email(email):
-        msg = email_reserved_for_system_bots_error(email)
-        code = msg
-        raise ValidationError(
-            msg,
-            code=code,
-            params=dict(deactivated=False),
+class ImportRealmOwnerSelectionForm(forms.Form):
+    user_id = forms.IntegerField(required=False)
+
+
+class RealmCreationForm(RealmDetailsForm):
+    # This form determines whether users can create a new realm.
+    email = forms.EmailField(
+        validators=[email_not_system_bot, email_is_not_disposable], max_length=EMAIL_MAX_LENGTH
+    )
+    import_from = forms.ChoiceField(
+        choices=PreregistrationRealm.IMPORT_FROM_CHOICES,
+        required=False,
+    )
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs["realm_creation"] = True
+        super().__init__(*args, **kwargs)
+
+    def clean_import_from(self) -> str:
+        # Convert "" to "none".
+        return self.cleaned_data["import_from"] or "none"
+
+
+class AltchaWidget(forms.TextInput):
+    @override
+    def render(
+        self,
+        name: str,
+        value: Any,
+        attrs: dict[str, Any] | None = None,
+        renderer: BaseRenderer | None = None,
+    ) -> SafeString:
+        return format_html(
+            (
+                "<altcha-widget"
+                '  name="captcha"'
+                '  challengeurl="/json/antispam_challenge"'
+                "  hidelogo"
+                "  hidefooter"
+                "  refetchonexpire"
+                '  style="{}"'
+                '  strings="{}"'
+                ">"
+            ),
+            "--altcha-max-width: 300px;",
+            orjson.dumps(
+                {
+                    "verified": _("Verified that you're a human user!"),
+                    "verifying": _("Verifying that you're not a bot…"),
+                }
+            ).decode(),
         )
 
 
-def email_is_not_disposable(email: str) -> None:
+def validate_captcha_payload(request: HttpRequest, captcha_payload: str) -> None:
+    if not settings.USING_CAPTCHA or not settings.ALTCHA_HMAC_KEY:  # nocoverage
+        raise forms.ValidationError(_("Challenges are not enabled."))
+
     try:
-        domain = Address(addr_spec=email).domain
-    except (HeaderParseError, ValueError):
-        raise ValidationError(_("Please use your real email address."))
+        ok, err = verify_solution(captcha_payload, settings.ALTCHA_HMAC_KEY, check_expires=True)
+        if not ok:
+            logging.warning("Invalid altcha solution: %s", err)
+            raise forms.ValidationError(_("Validation failed, please try again."))
+    except forms.ValidationError:
+        raise
+    except Exception as e:
+        logging.exception(e)
+        raise forms.ValidationError(_("Validation failed, please try again."))
 
-    if is_disposable_domain(domain):
-        raise ValidationError(_("Please use your real email address."))
+    captcha_data = orjson.loads(base64.b64decode(captcha_payload))
+    challenge = captcha_data["challenge"]
+    session_challenges = [e[0] for e in request.session.get("altcha_challenges", [])]
+    if challenge not in session_challenges:
+        logging.warning("Expired or replayed altcha solution")
+        raise forms.ValidationError(_("Validation failed, please try again."))
+
+    # Remove the successful solve from the session, to prevent replay
+    request.session["altcha_challenges"] = [
+        e for e in request.session.get("altcha_challenges", []) if e[0] != challenge
+    ]
 
 
-class RealmCreationForm(forms.Form):
-    # This form determines whether users can create a new realm.
-    email = forms.EmailField(validators=[email_not_system_bot, email_is_not_disposable])
+class CaptchaRealmCreationForm(RealmCreationForm):
+    captcha = forms.CharField(required=True, widget=AltchaWidget)
+
+    def __init__(
+        self,
+        *,
+        request: HttpRequest,
+        data: dict[str, Any] | None = None,
+        initial: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(data=data, initial=initial)
+        self.request = request
+
+    @override
+    def clean(self) -> None:
+        super().clean()
+        if not self.data.get("captcha"):
+            self.add_error("captcha", _("Validation failed, please try again."))
+
+    def clean_captcha(self) -> str:
+        payload = self.data.get("captcha", "")
+        validate_captcha_payload(self.request, payload)
+        return payload
 
 
-class LoggingSetPasswordForm(SetPasswordForm):
+class CaptchaDemoRegistrationForm(DemoRegistrationForm):
+    captcha = forms.CharField(required=True, widget=AltchaWidget)
+
+    def __init__(
+        self,
+        *,
+        request: HttpRequest,
+        data: dict[str, Any] | None = None,
+        initial: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(data=data, initial=initial)
+        self.request = request
+
+    @override
+    def clean(self) -> None:
+        super().clean()
+        if not self.data.get("captcha"):
+            self.add_error("captcha", _("Validation failed, please try again."))
+
+    def clean_captcha(self) -> str:
+        payload = self.data.get("captcha", "")
+        validate_captcha_payload(self.request, payload)
+        return payload
+
+
+class LoggingSetPasswordForm(SetPasswordForm[UserProfile]):
     new_password1 = forms.CharField(
         label=_("New password"),
         widget=forms.PasswordInput(attrs={"autocomplete": "new-password"}),
@@ -269,6 +481,17 @@ class LoggingSetPasswordForm(SetPasswordForm):
         widget=forms.PasswordInput(attrs={"autocomplete": "new-password"}),
         max_length=RegistrationForm.MAX_PASSWORD_LENGTH,
     )
+    enable_marketing_emails = forms.BooleanField(required=False)
+
+    def __init__(self, user: UserProfile, *args: Any, **kwargs: Any) -> None:
+        super().__init__(user, *args, **kwargs)
+        self.show_enable_marketing_emails = False
+        if (
+            settings.CORPORATE_ENABLED
+            and user.realm.demo_organization_scheduled_deletion_date is not None
+            and not user.enable_marketing_emails
+        ):
+            self.show_enable_marketing_emails = user.realm.get_first_human_user() == user
 
     def clean_new_password1(self) -> str:
         new_password = self.cleaned_data["new_password1"]
@@ -279,33 +502,34 @@ class LoggingSetPasswordForm(SetPasswordForm):
 
         return new_password
 
+    @override
     def save(self, commit: bool = True) -> UserProfile:
-        assert isinstance(self.user, UserProfile)
         do_change_password(self.user, self.cleaned_data["new_password1"], commit=commit)
+        enable_marketing_emails = self.cleaned_data["enable_marketing_emails"]
+        if enable_marketing_emails and not self.user.enable_marketing_emails:
+            do_change_user_setting(
+                self.user,
+                "enable_marketing_emails",
+                enable_marketing_emails,
+                acting_user=self.user,
+            )
+
         return self.user
 
 
-def generate_password_reset_url(
-    user_profile: UserProfile, token_generator: PasswordResetTokenGenerator
-) -> str:
-    token = token_generator.make_token(user_profile)
-    uid = urlsafe_base64_encode(str(user_profile.id).encode())
-    endpoint = reverse("password_reset_confirm", kwargs=dict(uidb64=uid, token=token))
-    return f"{user_profile.realm.uri}{endpoint}"
-
-
 class ZulipPasswordResetForm(PasswordResetForm):
+    @override
     def save(
         self,
-        domain_override: Optional[str] = None,
+        domain_override: str | None = None,
         subject_template_name: str = "registration/password_reset_subject.txt",
         email_template_name: str = "registration/password_reset_email.html",
         use_https: bool = False,
         token_generator: PasswordResetTokenGenerator = default_token_generator,
-        from_email: Optional[str] = None,
-        request: Optional[HttpRequest] = None,
-        html_email_template_name: Optional[str] = None,
-        extra_email_context: Optional[Dict[str, Any]] = None,
+        from_email: str | None = None,
+        request: HttpRequest | None = None,
+        html_email_template_name: str | None = None,
+        extra_email_context: dict[str, Any] | None = None,
     ) -> None:
         """
         If the email address has an account in the target realm,
@@ -340,7 +564,7 @@ class ZulipPasswordResetForm(PasswordResetForm):
             logging.info("Realm is deactivated")
             return
 
-        if settings.RATE_LIMITING:
+        if should_rate_limit(request):
             try:
                 rate_limit_password_reset_form_by_email(email)
                 rate_limit_request_by_ip(request, domain="sends_email_by_ip")
@@ -358,48 +582,9 @@ class ZulipPasswordResetForm(PasswordResetForm):
         except UserProfile.DoesNotExist:
             user = None
 
-        context = {
-            "email": email,
-            "realm_uri": realm.uri,
-            "realm_name": realm.name,
-        }
-
-        if user is not None and not user.is_active:
-            context["user_deactivated"] = True
-            user = None
-
-        if user is not None:
-            context["active_account_in_realm"] = True
-            context["reset_url"] = generate_password_reset_url(user, token_generator)
-            queue_soft_reactivation(user.id)
-            send_email(
-                "zerver/emails/password_reset",
-                to_user_ids=[user.id],
-                from_name=FromAddress.security_email_from_name(user_profile=user),
-                from_address=FromAddress.tokenized_no_reply_address(),
-                context=context,
-                realm=realm,
-                request=request,
-            )
-        else:
-            context["active_account_in_realm"] = False
-            active_accounts_in_other_realms = UserProfile.objects.filter(
-                delivery_email__iexact=email, is_active=True
-            )
-            if active_accounts_in_other_realms:
-                context["active_accounts_in_other_realms"] = active_accounts_in_other_realms
-            language = get_language()
-
-            send_email(
-                "zerver/emails/password_reset",
-                to_emails=[email],
-                from_name=FromAddress.security_email_from_name(language=language),
-                from_address=FromAddress.tokenized_no_reply_address(),
-                language=language,
-                context=context,
-                realm=realm,
-                request=request,
-            )
+        do_send_password_reset_email(
+            email, realm, user, token_generator=token_generator, request=request
+        )
 
 
 class RateLimitedPasswordResetByEmail(RateLimitedObject):
@@ -407,10 +592,12 @@ class RateLimitedPasswordResetByEmail(RateLimitedObject):
         self.email = email
         super().__init__()
 
+    @override
     def key(self) -> str:
         return f"{type(self).__name__}:{self.email}"
 
-    def rules(self) -> List[Tuple[int, int]]:
+    @override
+    def rules(self) -> list[tuple[int, int]]:
         return settings.RATE_LIMITING_RULES["password_reset_form_by_email"]
 
 
@@ -422,13 +609,14 @@ def rate_limit_password_reset_form_by_email(email: str) -> None:
 
 class CreateUserForm(forms.Form):
     full_name = forms.CharField(max_length=100)
-    email = forms.EmailField()
+    email = forms.EmailField(max_length=EMAIL_MAX_LENGTH)
 
 
 class OurAuthenticationForm(AuthenticationForm):
     logger = logging.getLogger("zulip.auth.OurAuthenticationForm")
 
-    def clean(self) -> Dict[str, Any]:
+    @override
+    def clean(self) -> dict[str, Any]:
         username = self.cleaned_data.get("username")
         password = self.cleaned_data.get("password")
 
@@ -437,7 +625,7 @@ class OurAuthenticationForm(AuthenticationForm):
             subdomain = get_subdomain(self.request)
             realm = get_realm(subdomain)
 
-            return_data: Dict[str, Any] = {}
+            return_data: dict[str, Any] = {}
             try:
                 self.user_cache = authenticate(
                     request=self.request,
@@ -451,10 +639,10 @@ class OurAuthenticationForm(AuthenticationForm):
                 secs_to_freedom = int(e.secs_to_freedom)
                 error_message = _(
                     "You're making too many attempts to sign in."
-                    " Try again in {} seconds or contact your organization administrator"
+                    " Try again in {seconds} seconds or contact your organization administrator"
                     " for help."
                 )
-                raise ValidationError(error_message.format(secs_to_freedom))
+                raise ValidationError(error_message.format(seconds=secs_to_freedom))
 
             if return_data.get("inactive_realm"):
                 raise AssertionError("Programming error: inactive realm in authentication form")
@@ -486,15 +674,14 @@ class OurAuthenticationForm(AuthenticationForm):
 
             if self.user_cache is None:
                 raise forms.ValidationError(
-                    self.error_messages["invalid_login"],
-                    code="invalid_login",
-                    params={"username": self.username_field.verbose_name},
+                    INVALID_ACCOUNT_CREDENTIALS_ERROR,
                 )
 
             self.confirm_login_allowed(self.user_cache)
 
         return self.cleaned_data
 
+    @override
     def add_prefix(self, field_name: str) -> str:
         """Disable prefix, since Zulip doesn't use this Django forms feature
         (and django-two-factor does use it), and we'd like both to be
@@ -511,19 +698,21 @@ class AuthenticationTokenForm(TwoFactorAuthenticationTokenForm):
     """
 
     otp_token = forms.IntegerField(
-        label=_("Token"), min_value=1, max_value=int("9" * totp_digits()), widget=forms.TextInput
+        label=_("Token"), min_value=0, max_value=int("9" * totp_digits()), widget=forms.TextInput
     )
 
 
 class MultiEmailField(forms.Field):
-    def to_python(self, emails: Optional[str]) -> List[str]:
+    @override
+    def to_python(self, emails: str | None) -> list[str]:
         """Normalize data to a list of strings."""
         if not emails:
             return []
 
         return [email.strip() for email in emails.split(",")]
 
-    def validate(self, emails: List[str]) -> None:
+    @override
+    def validate(self, emails: list[str]) -> None:
         """Check if value consists only of valid emails."""
         super().validate(emails)
         for email in emails:
@@ -531,9 +720,11 @@ class MultiEmailField(forms.Field):
 
 
 class FindMyTeamForm(forms.Form):
-    emails = MultiEmailField(help_text=_("Add up to 10 comma-separated email addresses."))
+    emails = MultiEmailField(
+        help_text=_("Tip: You can enter multiple email addresses with commas between them.")
+    )
 
-    def clean_emails(self) -> List[str]:
+    def clean_emails(self) -> list[str]:
         emails = self.cleaned_data["emails"]
         if len(emails) > 10:
             raise forms.ValidationError(_("Please enter at most 10 emails."))

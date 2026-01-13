@@ -1,12 +1,10 @@
-from typing import Dict, List
-
 from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
 from zerver.lib.exceptions import UnsupportedWebhookEventTypeError
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_bool, check_string, to_wild_value
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_bool, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message, get_setup_webhook_message
 from zerver.models import UserProfile
 
@@ -40,7 +38,7 @@ LIDARR_TRACKS_LIMIT = 20
 ALL_EVENT_TYPES = ["Test", "Grab", "Rename", "Retag", "Download"]
 
 
-def get_tracks_content(tracks_data: List[Dict[str, str]]) -> str:
+def get_tracks_content(tracks_data: list[dict[str, str]]) -> str:
     tracks_content = ""
     for track in tracks_data[:LIDARR_TRACKS_LIMIT]:
         tracks_content += LIDARR_TRACKS_ROW_TEMPLATE.format(track_title=track.get("title"))
@@ -54,30 +52,31 @@ def get_tracks_content(tracks_data: List[Dict[str, str]]) -> str:
 
 
 @webhook_view("Lidarr", all_event_types=ALL_EVENT_TYPES)
-@has_request_variables
+@typed_endpoint
 def api_lidarr_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
+    *,
+    payload: JsonBodyPayload[WildValue],
 ) -> HttpResponse:
     body = get_body_for_http_request(payload)
-    subject = get_subject_for_http_request(payload)
+    topic_name = get_topic_for_http_request(payload)
 
     check_send_webhook_message(
-        request, user_profile, subject, body, payload["eventType"].tame(check_string)
+        request, user_profile, topic_name, body, payload["eventType"].tame(check_string)
     )
     return json_success(request)
 
 
-def get_subject_for_http_request(payload: WildValue) -> str:
+def get_topic_for_http_request(payload: WildValue) -> str:
     if payload["eventType"].tame(check_string) == "Test":
-        topic = LIDARR_TOPIC_TEMPLATE_TEST
+        topic_name = LIDARR_TOPIC_TEMPLATE_TEST
     else:
-        topic = LIDARR_TOPIC_TEMPLATE.format(
+        topic_name = LIDARR_TOPIC_TEMPLATE.format(
             artist_name=payload["artist"]["name"].tame(check_string)
         )
 
-    return topic
+    return topic_name
 
 
 def get_body_for_album_grabbed_event(payload: WildValue) -> str:
@@ -100,10 +99,7 @@ def get_body_for_tracks_retagged_event(payload: WildValue) -> str:
 
 
 def get_body_for_tracks_imported_upgrade_event(payload: WildValue) -> str:
-    tracks_data = []
-    for track in payload["tracks"]:
-        tracks_data.append({"title": track["title"].tame(check_string)})
-
+    tracks_data = [{"title": track["title"].tame(check_string)} for track in payload["tracks"]]
     data = {
         "artist_name": payload["artist"]["name"].tame(check_string),
         "tracks_final_data": get_tracks_content(tracks_data),
@@ -113,10 +109,7 @@ def get_body_for_tracks_imported_upgrade_event(payload: WildValue) -> str:
 
 
 def get_body_for_tracks_imported_event(payload: WildValue) -> str:
-    tracks_data = []
-    for track in payload["tracks"]:
-        tracks_data.append({"title": track["title"].tame(check_string)})
-
+    tracks_data = [{"title": track["title"].tame(check_string)} for track in payload["tracks"]]
     data = {
         "artist_name": payload["artist"]["name"].tame(check_string),
         "tracks_final_data": get_tracks_content(tracks_data),

@@ -1,19 +1,15 @@
-import importlib
 import os
-from typing import List
+from unittest import mock
 
-import django.urls.resolvers
 from django.test import Client
 
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.url_redirects import (
     API_DOCUMENTATION_REDIRECTS,
-    HELP_DOCUMENTATION_REDIRECTS,
     LANDING_PAGE_REDIRECTS,
     POLICY_DOCUMENTATION_REDIRECTS,
 )
-from zerver.models import Realm, Stream
-from zproject import urls
+from zerver.models import Stream
 
 
 class PublicURLTest(ZulipTestCase):
@@ -22,7 +18,7 @@ class PublicURLTest(ZulipTestCase):
     URLs redirect to a page.
     """
 
-    def fetch(self, method: str, urls: List[str], expected_status: int) -> None:
+    def fetch(self, method: str, urls: list[str], expected_status: int) -> None:
         for url in urls:
             # e.g. self.client_post(url) if method is "post"
             response = getattr(self, method)(url)
@@ -31,6 +27,42 @@ class PublicURLTest(ZulipTestCase):
                 expected_status,
                 msg=f"Expected {expected_status}, received {response.status_code} for {method} to {url}",
             )
+
+    def test_api_doc_pages(self) -> None:
+        # Test all files in api_docs documentation directory (except for 'index.md',
+        # 'missing.md', "api-doc-template.md", `api_docs/include/` and `api_docs/unmerged.d/` files).
+
+        api_doc_urls = []
+        for doc in os.listdir("./api_docs/"):
+            if doc.startswith(".") or "~" in doc or "#" in doc:
+                continue  # nocoverage -- just here for convenience
+            if doc in {"index.md", "include", "missing.md", "api-doc-template.md", "unmerged.d"}:
+                continue
+            url = "/api/" + os.path.splitext(doc)[0]  # Strip the extension.
+            api_doc_urls.append(url)
+
+        expected_tag = """<meta property="og:description" content="This is an API docs page" />"""
+
+        for url in api_doc_urls:
+            with mock.patch(
+                "zerver.lib.html_to_text.html_to_text", return_value="This is an API docs page"
+            ) as m:
+                response = self.client_get(url)
+                m.assert_called_once()
+                self.assertIn(expected_tag, response.content.decode())
+                self.assertEqual(response.status_code, 200)
+
+    def test_design_testing_pages(self) -> None:
+        urls = {
+            "/devtools/buttons/": "Button styles browser",
+            "/devtools/banners/": "Banner styles browser",
+            "/devtools/inputs/": "Input styles browser",
+        }
+
+        for url, expected_content in urls.items():
+            result = self.client_get(url)
+            self.assertEqual(result.status_code, 200)
+            self.assert_in_success_response([expected_content], result)
 
     def test_public_urls(self) -> None:
         """
@@ -48,7 +80,7 @@ class PublicURLTest(ZulipTestCase):
                 "/ru/accounts/home/",
                 "/en/accounts/login/",
                 "/ru/accounts/login/",
-                "/help/",
+                "/api/",
                 # Since web-public streams are enabled in this `zulip`
                 # instance, the public access experience is loaded directly.
                 "/",
@@ -65,20 +97,12 @@ class PublicURLTest(ZulipTestCase):
                 "/api/v1/streams",
             ],
             404: [
-                "/help/api-doc-template",
-                "/help/nonexistent",
-                "/help/include/admin",
-                "/help/" + "z" * 1000,
+                "/api/api-doc-template",
+                "/api/nonexistent",
+                "/api/include/admin",
+                "/api/" + "z" * 1000,
             ],
         }
-
-        # Add all files in help documentation directory (except for 'index.md',
-        # 'missing.md' and `help/include/` files) to `get_urls['200']` list.
-        for doc in os.listdir("./help"):
-            if doc.startswith(".") or "~" in doc or "#" in doc:
-                continue  # nocoverage -- just here for convenience
-            if doc not in {"index.md", "include", "missing.md"}:
-                get_urls[200].append("/help/" + os.path.splitext(doc)[0])  # Strip the extension.
 
         post_urls = {
             200: ["/accounts/login/"],
@@ -86,7 +110,6 @@ class PublicURLTest(ZulipTestCase):
             401: [
                 "/json/messages",
                 "/json/invites",
-                "/json/subscriptions/exists",
                 "/api/v1/users/me/subscriptions/properties",
                 "/json/fetch_api_key",
                 "/json/users/me/subscriptions",
@@ -115,42 +138,29 @@ class PublicURLTest(ZulipTestCase):
         Here we simply sanity-check that all the URLs load
         correctly.
         """
-        auth_types = [auth.lower() for auth in Realm.AUTHENTICATION_FLAGS]
-        for auth in [
-            "azuread",
-            "email",
-            "remoteuser",
-            # The endpoint is generated dynamically based on the configuration of the OIDC backend,
-            # so it can't be tested here.
-            "openid connect",
-        ]:  # We do not have configerror pages for AzureAD and Email.
-            auth_types.remove(auth)
-
-        auth_types += [
+        auth_error_pages = [
+            "apple",
+            "dev_not_supported",
+            "github",
+            "gitlab",
+            "google",
+            "ldap",
+            "remote_user_backend_disabled",
+            "remote_user_header_missing",
+            "saml",
             "smtp",
-            "remoteuser/remote_user_backend_disabled",
-            "remoteuser/remote_user_header_missing",
         ]
-        urls = [f"/config-error/{auth_type}" for auth_type in auth_types]
+        urls = [f"/config-error/{err_page_name}" for err_page_name in auth_error_pages]
         with self.settings(DEVELOPMENT=True):
             for url in urls:
-                response = self.client_get(url)
-                self.assert_in_success_response(["Configuration error"], response)
-
-
-class URLResolutionTest(ZulipTestCase):
-    def check_function_exists(self, module_name: str, view: str) -> None:
-        module = importlib.import_module(module_name)
-        self.assertTrue(hasattr(module, view), f"View {module_name}.{view} does not exist")
-
-    # Tests function-based views declared in urls.urlpatterns for
-    # whether the function exists.  We at present do not test the
-    # class-based views.
-    def test_non_api_url_resolution(self) -> None:
-        for pattern in urls.urlpatterns:
-            if isinstance(pattern, django.urls.resolvers.URLPattern):
-                (module_name, base_view) = pattern.lookup_str.rsplit(".", 1)
-                self.check_function_exists(module_name, base_view)
+                with self.assertLogs("django.request", level="ERROR") as m:
+                    response = self.client_get(url)
+                    self.assertEqual(response.status_code, 500)
+                    self.assert_in_response("Configuration error", response)
+                    self.assertEqual(
+                        m.output,
+                        [f"ERROR:django.request:Internal Server Error: {url}"],
+                    )
 
 
 class ErrorPageTest(ZulipTestCase):
@@ -170,13 +180,18 @@ class ErrorPageTest(ZulipTestCase):
 class RedirectURLTest(ZulipTestCase):
     def test_api_redirects(self) -> None:
         for redirect in API_DOCUMENTATION_REDIRECTS:
-            result = self.client_get(redirect.old_url, follow=True)
-            self.assert_in_success_response(["Zulip homepage", "API documentation home"], result)
+            if redirect.old_url not in [
+                "/api/incoming-webhooks-overview",
+                "/api/incoming-webhooks-walkthrough",
+            ]:
+                result = self.client_get(redirect.old_url, follow=True)
+                self.assert_in_success_response(
+                    ["Zulip homepage", "API documentation home"], result
+                )
 
-    def test_help_redirects(self) -> None:
-        for redirect in HELP_DOCUMENTATION_REDIRECTS:
-            result = self.client_get(redirect.old_url, follow=True)
-            self.assert_in_success_response(["Zulip homepage", "Help center home"], result)
+            result = self.client_get(redirect.old_url)
+            self.assertEqual(result.status_code, 301)
+            self.assertIn(redirect.new_url, result["Location"])
 
     def test_policy_redirects(self) -> None:
         for redirect in POLICY_DOCUMENTATION_REDIRECTS:
@@ -185,8 +200,9 @@ class RedirectURLTest(ZulipTestCase):
 
     def test_landing_page_redirects(self) -> None:
         for redirect in LANDING_PAGE_REDIRECTS:
-            result = self.client_get(redirect.old_url, follow=True)
-            self.assert_in_success_response(["Download"], result)
+            if redirect.old_url != "/try-zulip/":
+                result = self.client_get(redirect.old_url, follow=True)
+                self.assert_in_success_response(["Download"], result)
 
             result = self.client_get(redirect.old_url)
             self.assertEqual(result.status_code, 301)

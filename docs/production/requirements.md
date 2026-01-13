@@ -4,16 +4,18 @@ To run a Zulip server, you will need:
 
 - A dedicated machine or VM
 - A supported OS:
-  - Ubuntu 20.04
   - Ubuntu 22.04
-  - Debian 11
+  - Ubuntu 24.04
+  - Debian 12
+  - Debian 13
 - A supported CPU architecture:
   - x86-64
   - aarch64
-- At least 2 GB RAM, and 10 GB disk space
+- At least 2 GB RAM
+  - If you have < 5 GB RAM, we require some swap space; we recommend configuring
+    2 GB of swap
   - If you expect 100+ users: 4 GB RAM, and 2 CPUs
-  - If you intend to [upgrade from Git][upgrade-from-git]: 3 GB RAM, or
-    2G and at least 1G of swap configured.
+- 10GB free space (i.e. approximately a 25GB total disk, given OS requirements)
 - A hostname in DNS
 - Credentials for sending email
 
@@ -36,7 +38,7 @@ on issues you'll encounter](install-existing-server.md).
 
 #### Operating system
 
-Ubuntu 20.04, Ubuntu 22.04, and Debian 11
+Ubuntu 22.04, Ubuntu 24.04, Debian 12, and Debian 13
 are supported for running Zulip in production. You can also
 run Zulip on other platforms that support Docker using
 [docker-zulip][docker-zulip-homepage].
@@ -63,16 +65,15 @@ sudo apt update
 
 - CPU and memory: For installations with 100+ users you'll need a
   minimum of **2 CPUs** and **4 GB RAM**. For installations with fewer
-  users, 1 CPU and 2 GB RAM is sufficient. We strongly recommend against
-  installing with less than 2 GB of RAM, as you will likely experience
-  out of memory issues installing dependencies. We recommend against
-  using highly CPU-limited servers like the AWS `t2` style instances
-  for organizations with hundreds of users (active or no).
+  users, 1 CPU and 2 GB RAM with 2 GB of swap is sufficient. We
+  recommend against using highly CPU-limited servers like the AWS `t2`
+  style instances for organizations with hundreds of users (active or
+  no).
 
-- Disk space: You'll need at least 10 GB of free disk space for a
-  server with dozens of users. We recommend using an SSD and avoiding
-  cloud storage backends that limit the IOPS per second, since the
-  disk is primarily used for the Zulip database.
+- Disk space: You'll need at least 10 GB of dedicated free disk space
+  for a server with dozens of users. We recommend using an SSD and
+  avoiding cloud storage backends that limit the IOPS per second,
+  since the disk is primarily used for the Zulip database.
 
 See our [documentation on scalability](#scalability) below for advice
 on hardware requirements for larger organizations.
@@ -96,10 +97,10 @@ on hardware requirements for larger organizations.
   that Zulip can properly manage image and website previews and mobile
   push notifications. Outgoing Internet access is not required if you
   [disable those
-  features](https://zulip.com/help/allow-image-link-previews).
+  features](https://zulip.com/help/image-video-and-website-previews).
 - Outgoing SMTP access (usually port 587) to your [SMTP
   server](email.md) so that Zulip can send emails.
-- A domain name (e.g. `zulip.example.com`) that your users will use to
+- A domain name (e.g., `zulip.example.com`) that your users will use to
   access the Zulip server. In order to generate valid SSL
   certificates [with Certbot][doc-certbot], and to enable other
   services such as Google authentication, public DNS name is simpler,
@@ -118,8 +119,7 @@ access to incoming port 22 for SSH access for remote access.
 
 [ssrf]: https://owasp.org/www-community/attacks/Server_Side_Request_Forgery
 [smokescreen-proxy]: deployment.md#customizing-the-outgoing-http-proxy
-[reverse-proxy]: deployment.md#putting-the-zulip-application-behind-a-reverse-proxy
-[email-mirror-code]: https://github.com/zulip/zulip/blob/main/zerver/management/commands/email_mirror.py
+[reverse-proxy]: reverse-proxies.md
 
 ## Credentials needed
 
@@ -144,7 +144,7 @@ certificate documentation](ssl-certificates.md).
 #### Outgoing email
 
 - Outgoing email (SMTP) credentials that Zulip can use to send
-  outgoing emails to users (e.g. email address confirmation emails
+  outgoing emails to users (e.g., email address confirmation emails
   during the signup process, message notification emails, password
   reset, etc.). If you don't have an existing outgoing SMTP solution,
   read about
@@ -153,15 +153,17 @@ certificate documentation](ssl-certificates.md).
 Once you have met these requirements, see [full instructions for installing
 Zulip in production](install.md).
 
-[trusty-eol]: https://wiki.ubuntu.com/Releases
-
 ## Scalability
 
 This section details some basic guidelines for running a Zulip server
 for larger organizations (especially >1000 users or 500+ daily active
-users). Zulip's resource needs depend mainly on 3 parameters:
+users). These guidelines are conservative, since they are intended to
+be sufficient for a wide range of possible usage patterns that may not
+be applicable to your installation.
 
-- daily active users (e.g. number of employees if everyone's an
+Zulip's resource needs depend mainly on 3 parameters:
+
+- daily active users (e.g., number of employees if everyone's an
   employee)
 - total user accounts (can be much larger)
 - message volume.
@@ -180,7 +182,7 @@ installing Zulip with a dedicated database server.
   active users, we recommend using a [remote PostgreSQL
   database](postgresql.md), but it's not required.
 
-- **RAM:** We recommended more RAM for larger installations:
+- **RAM:** We recommend more RAM for larger installations:
 
   - With 25+ daily active users, 4 GB of RAM.
   - With 100+ daily active users, 8 GB of RAM.
@@ -202,20 +204,21 @@ installing Zulip with a dedicated database server.
 - **Disk for application server:** We recommend using [the S3 file
   uploads backend][s3-uploads] to store uploaded files at scale. With
   the S3 backend configuration, we recommend 50 GB of disk for the OS,
-  Zulip software, logs and scratch/free space. Disk needs when
-  storing uploads locally
+  Zulip software, logs and scratch/free space. Because uploaded files
+  are cached locally, you may need more disk space if you make heavy
+  use of uploaded files.
 
 - **Disk for database:** SSD disk is highly recommended. For
   installations where most messages have <100 recipients, 10 GB per 1M
   messages of history is sufficient plus 1 GB per 1000 users is
-  sufficient. If most messages are to public streams with 10K+ users
+  sufficient. If most messages are to public channels with 10K+ users
   subscribed (like on chat.zulip.org), add 20 GB per (1000 user
-  accounts) per (1M messages to public streams).
+  accounts) per (1M messages to public channels).
 
 - **Example:** When
   [the Zulip development community](https://zulip.com/development-community/) server
   had 12K user accounts (~300 daily actives) and 800K messages of
-  history (400K to public streams), it was a default configuration
+  history (400K to public channels), it was a default configuration
   single-server installation with 16 GB of RAM, 4 cores (essentially
   always idle), and its database was using about 100 GB of disk.
 
@@ -226,26 +229,26 @@ installing Zulip with a dedicated database server.
   syncing `LOCAL_UPLOADS_DIR` or using the [S3 file uploads
   backend][s3-uploads].
 
-- **Sharding:** Zulip releases do not fully support dividing Tornado
-  traffic for a single Zulip realm/organization between multiple
-  application servers, which is why we recommend a hot spare over
-  load-balancing. We don't have an easily deployed configuration for
-  load-balancing Tornado within a single organization, and as a result
-  can't currently offer this model outside of enterprise support
-  contracts.
+- **Sharding:** For servers with several thousand daily active users,
+  Zulip supports [sharding its real-time-push Tornado
+  service][tornado-sharding], both by realm/organization (for hosting many
+  organizations) and by user ID (for hosting single very large
+  organizations).
 
-  - Zulip 2.0 and later supports running multiple Tornado servers
-    sharded by realm/organization, which is how we scale Zulip Cloud.
-    [Contact us][contact-support] for help implementing the sharding policy.
+  Care must be taken when dividing traffic for a single Zulip realm
+  between multiple Zulip application servers, which is why we
+  recommend a hot spare over load-balancing for most installations
+  desiring extra redundancy.
 
-Scalability is an area of active development, so if you're unsure
-whether Zulip is a fit for your organization or need further advice
-[contact Zulip support][contact-support].
+If you have scalability questions or are unsure whether Zulip is a fit
+for your use case, contact [Zulip sales or support][contact-support]
+for assistance.
 
 For readers interested in technical details around what features
 impact Zulip's scalability, this [performance and scalability design
 document](../subsystems/performance.md) may also be of interest.
 
 [s3-uploads]: upload-backends.md#s3-backend-configuration
-[streaming-replication]: deployment.md#postgresql-warm-standby
+[streaming-replication]: postgresql.md#postgresql-warm-standby
 [contact-support]: https://zulip.com/help/contact-support
+[tornado-sharding]: system-configuration.md#tornado_sharding

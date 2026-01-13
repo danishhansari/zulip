@@ -1,6 +1,5 @@
 # Webhooks for teamcity integration
 import logging
-from typing import Optional
 
 from django.db.models import Q
 from django.http import HttpRequest, HttpResponse
@@ -10,10 +9,11 @@ from zerver.actions.message_send import (
     send_rate_limited_pm_notification_to_bot_owner,
 )
 from zerver.decorator import webhook_view
-from zerver.lib.request import REQ, RequestNotes, has_request_variables
+from zerver.lib.request import RequestNotes
 from zerver.lib.response import json_success
 from zerver.lib.send_email import FromAddress
-from zerver.lib.validator import WildValue, check_string, to_wild_value
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import Realm, UserProfile
 
@@ -27,7 +27,7 @@ need further help!
 """
 
 
-def guess_zulip_user_from_teamcity(teamcity_username: str, realm: Realm) -> Optional[UserProfile]:
+def guess_zulip_user_from_teamcity(teamcity_username: str, realm: Realm) -> UserProfile | None:
     try:
         # Try to find a matching user in Zulip
         # We search a user's full name, short name,
@@ -42,7 +42,7 @@ def guess_zulip_user_from_teamcity(teamcity_username: str, realm: Realm) -> Opti
         return None
 
 
-def get_teamcity_property_value(property_list: WildValue, name: str) -> Optional[str]:
+def get_teamcity_property_value(property_list: WildValue, name: str) -> str | None:
     for property in property_list:
         if property["name"].tame(check_string) == name:
             return property["value"].tame(check_string)
@@ -50,11 +50,12 @@ def get_teamcity_property_value(property_list: WildValue, name: str) -> Optional
 
 
 @webhook_view("TeamCity")
-@has_request_variables
+@typed_endpoint
 def api_teamcity_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
+    *,
+    payload: JsonBodyPayload[WildValue],
 ) -> HttpResponse:
     if "build" not in payload:
         # Ignore third-party specific (e.g. Slack) payload formats
@@ -105,11 +106,11 @@ def api_teamcity_webhook(
     )
 
     if "branchDisplayName" in message:
-        topic = "{} ({})".format(build_name, message["branchDisplayName"].tame(check_string))
+        topic_name = "{} ({})".format(build_name, message["branchDisplayName"].tame(check_string))
     else:
-        topic = build_name
+        topic_name = build_name
 
-    # Check if this is a personal build, and if so try to private message the user who triggered it.
+    # Check if this is a personal build, and if so try to direct message the user who triggered it.
     if (
         get_teamcity_property_value(message["teamcityProperties"], "env.BUILD_IS_PERSONAL")
         == "true"
@@ -146,5 +147,5 @@ def api_teamcity_webhook(
 
         return json_success(request)
 
-    check_send_webhook_message(request, user_profile, topic, body)
+    check_send_webhook_message(request, user_profile, topic_name, body)
     return json_success(request)

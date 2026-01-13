@@ -6,7 +6,6 @@ import re
 import subprocess
 import sys
 import tempfile
-from typing import List
 
 import yaml
 
@@ -63,30 +62,28 @@ puppet_env = os.environ.copy()
 puppet_env["FACTER_zulip_conf_path"] = args.config
 puppet_env["FACTER_zulip_scripts_path"] = scripts_path
 
-# This is to suppress Puppet warnings with ruby 2.7.
-if (distro_info["ID"], distro_info["VERSION_ID"]) in [("ubuntu", "20.04")]:
-    puppet_env["RUBYOPT"] = "-W0"
 
-
-def noop_would_change(puppet_cmd: List[str]) -> bool:
+def noop_would_change(puppet_cmd: list[str]) -> bool:
     # --noop does not work with --detailed-exitcodes; see
     # https://tickets.puppetlabs.com/browse/PUP-686
-    try:
-        lastrun_file = tempfile.NamedTemporaryFile()
-        subprocess.check_call(
-            # puppet_cmd may already contain --noop, but it is safe to
-            # supply twice
-            [*puppet_cmd, "--noop", "--lastrunfile", lastrun_file.name],
-            env=puppet_env,
-        )
+    with tempfile.NamedTemporaryFile() as lastrun_file:
+        try:
+            subprocess.check_call(
+                # puppet_cmd may already contain --noop, but it is safe to
+                # supply twice
+                [*puppet_cmd, "--noop", "--lastrunfile", lastrun_file.name],
+                env=puppet_env,
+            )
+        except subprocess.CalledProcessError:
+            sys.exit(2)
 
+        # Reopen the file since Puppet rewrote it with a new inode
         with open(lastrun_file.name) as lastrun:
             lastrun_data = yaml.safe_load(lastrun)
-            return lastrun_data.get("resources", {}).get("out_of_sync", 0) != 0
-    except subprocess.CalledProcessError:
-        sys.exit(2)
-    finally:
-        lastrun_file.close()
+            resources = lastrun_data.get("resources", {})
+            if resources.get("failed", 0) != 0:
+                sys.exit(2)
+            return resources.get("out_of_sync", 0) != 0
 
 
 if not args.noop and not args.force:
@@ -98,7 +95,7 @@ if not args.noop and not args.force:
         sys.stdout.write("Apply changes? [y/N] ")
         sys.stdout.flush()
         do_apply = sys.stdin.readline().strip().lower()
-        if do_apply == "" or do_apply == "n":
+        if do_apply in ("", "n"):
             sys.exit(0)
 
 if args.noop and args.force:
@@ -112,5 +109,5 @@ ret = subprocess.call([*puppet_cmd, "--detailed-exitcodes"], env=puppet_env)
 # ret = 2 => changes, no errors
 # ret = 4 => no changes, yes errors
 # ret = 6 => changes, yes errors
-if ret != 0 and ret != 2:
+if ret not in (0, 2):
     sys.exit(2)

@@ -9,26 +9,26 @@ Contents:
 
 ## Installing directly on Ubuntu, Debian, CentOS, or Fedora
 
+:::{warning}
+There is no supported uninstallation process with the direct-install
+method. If you want that, use [the Vagrant environment](setup-recommended.md),
+where you can just do `vagrant destroy` to clean up the development environment.
+:::
+
 One can install the Zulip development environment directly on a Linux
 host by following these instructions. Currently supported platforms
 are:
 
-- Ubuntu 20.04, 22.04
-- Debian 11
+- Ubuntu 22.04, 24.04
+- Debian 12, 13
 - CentOS 7 (beta)
-- Fedora 33 and 34 (beta)
+- Fedora 38 (beta)
 - RHEL 7 (beta)
 
 **Note**: You should not use the `root` user to run the installation.
 If you are using a [remote server](remote.md), see
 the
 [section on creating appropriate user accounts](remote.md#setting-up-user-accounts).
-
-:::{warning}
-There is no supported uninstallation process with this
-method. If you want that, use the Vagrant environment, where you can
-just do `vagrant destroy` to clean up the development environment.
-:::
 
 Start by [cloning your fork of the Zulip repository][zulip-rtd-git-cloning]
 and [connecting the Zulip upstream repository][zulip-rtd-git-connect]:
@@ -39,12 +39,23 @@ cd zulip
 git remote add -f upstream https://github.com/zulip/zulip.git
 ```
 
+CentOS, Fedora, and RHEL users should ensure that python3 is installed on their
+systems (Debian and Ubuntu distributions already include it):
+
 ```bash
-# On CentOS/RHEL/Fedora, you must first install python3
-# From a clone of zulip.git
+# On CentOS/Fedora/RHEL, you must first install python3.
+# For example, this command installs python3 with yum:
+yum install python
+```
+
+With python3 installed, change into the directory where you have cloned
+Zulip and run the following commands:
+
+```bash
+# From inside a clone of zulip.git:
 ./tools/provision
-source /srv/zulip-py3-venv/bin/activate
-./tools/run-dev.py  # starts the development server
+source .venv/bin/activate
+./tools/run-dev  # starts the development server
 ```
 
 Once you've done the above setup, you can pick up the [documentation
@@ -55,7 +66,7 @@ ignoring the parts about `vagrant` (since you're not using it).
 ## Installing using Vagrant with VirtualBox on Windows 10
 
 :::{note}
-We recommend using [WSL 2 for Windows development](setup-recommended.md#windows-10)
+We recommend using [WSL 2 for Windows development](setup-recommended.md)
 because it is easier to set up and provides a substantially better experience.
 :::
 
@@ -201,8 +212,8 @@ expected.
 1. Set the `EXTERNAL_HOST` environment variable.
 
    ```console
-   (zulip-py3-venv) vagrant@ubuntu-18:/srv/zulip$ export EXTERNAL_HOST="$(hostname -I | xargs):9991"
-   (zulip-py3-venv) vagrant@ubuntu-18:/srv/zulip$ echo $EXTERNAL_HOST
+   (zulip-server) vagrant@ubuntu-18:/srv/zulip$ export EXTERNAL_HOST="$(hostname -I | xargs):9991"
+   (zulip-server) vagrant@ubuntu-18:/srv/zulip$ echo $EXTERNAL_HOST
    ```
 
    The output will be like:
@@ -223,7 +234,7 @@ expected.
 1. You should now be able to start the Zulip development server.
 
    ```console
-   (zulip-py3-venv) vagrant@ubuntu-18:/srv/zulip$ ./tools/run-dev.py
+   (zulip-server) vagrant@ubuntu-18:/srv/zulip$ ./tools/run-dev
    ```
 
    The output will look like:
@@ -255,13 +266,13 @@ expected.
    programs after the provisioning is completed. If it still isn't
    enough, try restarting your system and running the command again.
 
-2. Be patient the first time you run `./tools/run-dev.py`.
+2. Be patient the first time you run `./tools/run-dev`.
 
 As with other installation methods, please visit [#provision
 help][provision-help] in the [Zulip development community
 server](https://zulip.com/development-community/) if you need help.
 
-[provision-help]: https://chat.zulip.org/#narrow/stream/21-provision-help
+[provision-help]: https://chat.zulip.org/#narrow/channel/21-provision-help
 
 ## Newer versions of supported platforms
 
@@ -276,7 +287,7 @@ Ubuntu that you're using, we'd love to add support for it. It's
 likely only a few lines of changes to `tools/lib/provision.py` and
 `scripts/lib/setup-apt-repo` if you'd like to do it yourself and
 submit a pull request, or you can ask for help in
-[#development help](https://chat.zulip.org/#narrow/stream/49-development-help)
+[#development help](https://chat.zulip.org/#narrow/channel/49-development-help)
 in [the Zulip development community](https://zulip.com/development-community/),
 and a core team member can help guide you through adding support for the platform.
 

@@ -4,8 +4,8 @@
 
 Zulip uses the Django framework for its Python backend. We
 use the testing framework from
-[django.test](https://docs.djangoproject.com/en/3.2/topics/testing/)
-to test our code. We have over a thousand automated tests that verify that
+[django.test](https://docs.djangoproject.com/en/5.0/topics/testing/)
+to test our code. We have thousands of automated tests that verify that
 our backend works as expected.
 
 All changes to the Zulip backend code should be supported by tests. We
@@ -102,10 +102,11 @@ Shakesepeare characters, and they are part of the "zulip.com" realm.
 Generally, you will also do some explicit data setup of your own. Here
 are a couple useful methods in ZulipTestCase:
 
-- common_subscribe_to_streams
-- send_message
 - make_stream
-- subscribe_to_stream
+- subscribe
+- unsubscribe
+- send_stream_message
+- send_personal_message
 
 More typically, you will use methods directly from the backend code.
 (This ensures more end-to-end testing, and avoids false positives from
@@ -121,7 +122,7 @@ Here are some example action methods that tests may use for data setup:
 
 ### Testing code that accesses the filesystem
 
-Some tests need to access the filesystem (e.g. `test_upload.py` tests
+Some tests need to access the filesystem (e.g., `test_upload.py` tests
 for `LocalUploadBackend` and the data import tests). Doing
 this correctly requires care to avoid problems like:
 
@@ -142,7 +143,7 @@ To avoid these problems, you can do the following:
   avoid conflicts with other tests run later by the same test process.
 
 Our common testing infrastructure handles some of this for you,
-e.g. it replaces `settings.LOCAL_UPLOADS_DIR` for each test process
+e.g., it replaces `settings.LOCAL_UPLOADS_DIR` for each test process
 with a unique path under `/var/<uuid>/test-backend`. And
 `UploadSerializeMixin` manages some of the cleanup work for
 `test_upload.py`.
@@ -252,7 +253,7 @@ foo.qux = 42
 ```
 
 is _not_ going to throw any errors. Our mock silently accepts all these calls and records them.
-`Mock` also implements methods for us to access and assert its records, e.g.
+`Mock` also implements methods for us to access and assert its records, e.g.,
 
 ```python
 foo.bar.assert_called_with('quux')

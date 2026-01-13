@@ -5,7 +5,7 @@
 class zulip::profile::base {
   include zulip::timesync
   include zulip::common
-  case $::os['family'] {
+  case $facts['os']['family'] {
     'Debian': {
       include zulip::apt_repository
     }
@@ -16,7 +16,7 @@ class zulip::profile::base {
       fail('osfamily not supported')
     }
   }
-  case $::os['family'] {
+  case $facts['os']['family'] {
     'Debian': {
       $base_packages = [
         # Basics
@@ -81,31 +81,44 @@ class zulip::profile::base {
     links  => follow,
   }
   file { ['/etc/zulip/zulip.conf', '/etc/zulip/settings.py']:
-    ensure  => file,
+    ensure  => present,
     require => File['/etc/zulip'],
     mode    => '0644',
     owner   => 'zulip',
     group   => 'zulip',
   }
   file { '/etc/zulip/zulip-secrets.conf':
-    ensure  => file,
+    ensure  => present,
     require => File['/etc/zulip'],
     mode    => '0640',
     owner   => 'zulip',
     group   => 'zulip',
   }
 
-  file { '/etc/security/limits.conf':
+  file { '/etc/security/limits.d/zulip.conf':
     ensure => file,
     mode   => '0640',
     owner  => 'root',
     group  => 'root',
-    source => 'puppet:///modules/zulip/limits.conf',
+    source => 'puppet:///modules/zulip/limits.d/zulip.conf',
+  }
+  file { '/etc/systemd/system.conf.d/':
+    ensure => directory,
+    mode   => '0755',
+    owner  => 'root',
+    group  => 'root',
+  }
+  file { '/etc/systemd/system.conf.d/limits.conf':
+    ensure => file,
+    mode   => '0644',
+    owner  => 'root',
+    group  => 'root',
+    source => 'puppet:///modules/zulip/systemd/system.conf.d/limits.conf',
   }
 
   service { 'puppet':
-    ensure  => 'stopped',
-    enable  => 'false',
+    ensure  => stopped,
+    enable  => false,
     require => Package['puppet'],
   }
 
@@ -123,13 +136,5 @@ class zulip::profile::base {
     mode   => '0750',
   }
 
-  file { "${zulip::common::nagios_plugins_dir}/zulip_base":
-    require => Package[$zulip::common::nagios_plugins],
-    recurse => true,
-    purge   => true,
-    owner   => 'root',
-    group   => 'root',
-    mode    => '0755',
-    source  => 'puppet:///modules/zulip/nagios_plugins/zulip_base',
-  }
+  zulip::nagios_plugins { 'zulip_base': }
 }

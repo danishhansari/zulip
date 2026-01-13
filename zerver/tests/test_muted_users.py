@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from unittest import mock
 
-import orjson
+import time_machine
 
 from zerver.actions.users import do_deactivate_user
 from zerver.lib.cache import cache_get, get_muting_users_cache_key
@@ -9,6 +9,7 @@ from zerver.lib.muted_users import get_mute_object, get_muting_users, get_user_m
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.timestamp import datetime_to_timestamp
 from zerver.models import RealmAuditLog, UserMessage, UserProfile
+from zerver.models.realm_audit_logs import AuditLogEventType
 
 
 class MutedUsersTests(ZulipTestCase):
@@ -21,7 +22,7 @@ class MutedUsersTests(ZulipTestCase):
         self.assertEqual(muted_users, [])
         mute_time = datetime(2021, 1, 1, tzinfo=timezone.utc)
 
-        with mock.patch("zerver.views.muted_users.timezone_now", return_value=mute_time):
+        with time_machine.travel(mute_time, tick=False):
             url = f"/api/v1/users/me/muted_users/{cordelia.id}"
             result = self.api_post(hamlet, url)
             self.assert_json_success(result)
@@ -59,9 +60,11 @@ class MutedUsersTests(ZulipTestCase):
 
         url = f"/api/v1/users/me/muted_users/{muted_id}"
         result = self.api_post(hamlet, url)
-        # Currently we do not allow muting bots. This is the error message
-        # from `access_user_by_id`.
-        self.assert_json_error(result, "No such user")
+        self.assert_json_success(result)
+
+        url = f"/api/v1/users/me/muted_users/{muted_id}"
+        result = self.api_delete(hamlet, url)
+        self.assert_json_success(result)
 
     def test_add_muted_user_mute_twice(self) -> None:
         hamlet = self.example_user("hamlet")
@@ -76,14 +79,6 @@ class MutedUsersTests(ZulipTestCase):
         result = self.api_post(hamlet, url)
         self.assert_json_error(result, "User already muted")
 
-        # Verify the error handling for the database level
-        # IntegrityError we'll get with a race between two processes
-        # trying to mute the user.  To do this, we patch the
-        # get_mute_object function to always return None.
-        with mock.patch("zerver.views.muted_users.get_mute_object", return_value=None):
-            result = self.api_post(hamlet, url)
-            self.assert_json_error(result, "User already muted")
-
     def _test_add_muted_user_valid_data(self, deactivate_user: bool = False) -> None:
         hamlet = self.example_user("hamlet")
         self.login_user(hamlet)
@@ -93,7 +88,7 @@ class MutedUsersTests(ZulipTestCase):
         if deactivate_user:
             do_deactivate_user(cordelia, acting_user=None)
 
-        with mock.patch("zerver.views.muted_users.timezone_now", return_value=mute_time):
+        with time_machine.travel(mute_time, tick=False):
             url = f"/api/v1/users/me/muted_users/{cordelia.id}"
             result = self.api_post(hamlet, url)
             self.assert_json_success(result)
@@ -117,9 +112,9 @@ class MutedUsersTests(ZulipTestCase):
         self.assertEqual(
             audit_log_entry,
             (
-                RealmAuditLog.USER_MUTED,
+                AuditLogEventType.USER_MUTED,
                 mute_time,
-                orjson.dumps({"muted_user_id": cordelia.id}).decode(),
+                {"muted_user_id": cordelia.id},
             ),
         )
 
@@ -147,12 +142,12 @@ class MutedUsersTests(ZulipTestCase):
         if deactivate_user:
             do_deactivate_user(cordelia, acting_user=None)
 
-        with mock.patch("zerver.views.muted_users.timezone_now", return_value=mute_time):
+        with time_machine.travel(mute_time, tick=False):
             url = f"/api/v1/users/me/muted_users/{cordelia.id}"
             result = self.api_post(hamlet, url)
             self.assert_json_success(result)
 
-        with mock.patch("zerver.actions.muted_users.timezone_now", return_value=mute_time):
+        with time_machine.travel(mute_time, tick=False):
             # To test that `RealmAuditLog` entry has correct `event_time`.
             url = f"/api/v1/users/me/muted_users/{cordelia.id}"
             result = self.api_delete(hamlet, url)
@@ -177,9 +172,9 @@ class MutedUsersTests(ZulipTestCase):
         self.assertEqual(
             audit_log_entry,
             (
-                RealmAuditLog.USER_UNMUTED,
+                AuditLogEventType.USER_UNMUTED,
                 mute_time,
-                orjson.dumps({"unmuted_user_id": cordelia.id}).decode(),
+                {"unmuted_user_id": cordelia.id},
             ),
         )
 
@@ -213,11 +208,11 @@ class MutedUsersTests(ZulipTestCase):
         self.assertEqual(set(), cache_get(get_muting_users_cache_key(cordelia.id))[0])
 
     def assert_usermessage_read_flag(self, user: UserProfile, message: int, flag: bool) -> None:
-        usermesaage = UserMessage.objects.get(
+        usermessage = UserMessage.objects.get(
             user_profile=user,
             message=message,
         )
-        self.assertTrue(usermesaage.flags.read == flag)
+        self.assertTrue(usermessage.flags.read == flag)
 
     def test_new_messages_from_muted_user_marked_as_read(self) -> None:
         hamlet = self.example_user("hamlet")
@@ -237,18 +232,20 @@ class MutedUsersTests(ZulipTestCase):
 
         # Have Cordelia send messages to Hamlet and Othello.
         stream_message = self.send_stream_message(cordelia, "general", "Spam in stream")
-        huddle_message = self.send_huddle_message(cordelia, [hamlet, othello], "Spam in huddle")
-        pm_to_hamlet = self.send_personal_message(cordelia, hamlet, "Spam in PM")
-        pm_to_othello = self.send_personal_message(cordelia, othello, "Spam in PM")
+        group_direct_message = self.send_group_direct_message(
+            cordelia, [hamlet, othello], "Spam in direct message group"
+        )
+        pm_to_hamlet = self.send_personal_message(cordelia, hamlet, "Spam in direct message")
+        pm_to_othello = self.send_personal_message(cordelia, othello, "Spam in direct message")
 
         # These should be marked as read for Hamlet, since he has muted Cordelia.
         self.assert_usermessage_read_flag(hamlet, stream_message, True)
-        self.assert_usermessage_read_flag(hamlet, huddle_message, True)
+        self.assert_usermessage_read_flag(hamlet, group_direct_message, True)
         self.assert_usermessage_read_flag(hamlet, pm_to_hamlet, True)
 
         # These messages should be unreads for Othello, since he hasn't muted Cordelia.
         self.assert_usermessage_read_flag(othello, stream_message, False)
-        self.assert_usermessage_read_flag(othello, huddle_message, False)
+        self.assert_usermessage_read_flag(othello, group_direct_message, False)
         self.assert_usermessage_read_flag(othello, pm_to_othello, False)
 
     def test_existing_messages_from_muted_user_marked_as_read(self) -> None:
@@ -264,17 +261,19 @@ class MutedUsersTests(ZulipTestCase):
 
         # Have Cordelia send messages to Hamlet and Othello.
         stream_message = self.send_stream_message(cordelia, "general", "Spam in stream")
-        huddle_message = self.send_huddle_message(cordelia, [hamlet, othello], "Spam in huddle")
-        pm_to_hamlet = self.send_personal_message(cordelia, hamlet, "Spam in PM")
-        pm_to_othello = self.send_personal_message(cordelia, othello, "Spam in PM")
+        group_direct_message = self.send_group_direct_message(
+            cordelia, [hamlet, othello], "Spam in direct message group"
+        )
+        pm_to_hamlet = self.send_personal_message(cordelia, hamlet, "Spam in direct message")
+        pm_to_othello = self.send_personal_message(cordelia, othello, "Spam in direct message")
 
         # These messages are unreads for both Hamlet and Othello right now.
         self.assert_usermessage_read_flag(hamlet, stream_message, False)
-        self.assert_usermessage_read_flag(hamlet, huddle_message, False)
+        self.assert_usermessage_read_flag(hamlet, group_direct_message, False)
         self.assert_usermessage_read_flag(hamlet, pm_to_hamlet, False)
 
         self.assert_usermessage_read_flag(othello, stream_message, False)
-        self.assert_usermessage_read_flag(othello, huddle_message, False)
+        self.assert_usermessage_read_flag(othello, group_direct_message, False)
         self.assert_usermessage_read_flag(othello, pm_to_othello, False)
 
         # Hamlet mutes Cordelia.
@@ -284,12 +283,12 @@ class MutedUsersTests(ZulipTestCase):
 
         # The messages sent earlier should be marked as read for Hamlet.
         self.assert_usermessage_read_flag(hamlet, stream_message, True)
-        self.assert_usermessage_read_flag(hamlet, huddle_message, True)
+        self.assert_usermessage_read_flag(hamlet, group_direct_message, True)
         self.assert_usermessage_read_flag(hamlet, pm_to_hamlet, True)
 
         # These messages are still unreads for Othello, since he did not mute Cordelia.
         self.assert_usermessage_read_flag(othello, stream_message, False)
-        self.assert_usermessage_read_flag(othello, huddle_message, False)
+        self.assert_usermessage_read_flag(othello, group_direct_message, False)
         self.assert_usermessage_read_flag(othello, pm_to_othello, False)
 
     def test_muted_message_send_notifications_not_enqueued(self) -> None:
@@ -339,15 +338,16 @@ class MutedUsersTests(ZulipTestCase):
 
         self.login("cordelia")
         with mock.patch("zerver.tornado.event_queue.maybe_enqueue_notifications") as m:
-            result = self.client_patch(
-                "/json/messages/" + str(message_id),
-                dict(
-                    content="@**King Hamlet**",
-                ),
-            )
+            with self.captureOnCommitCallbacks(execute=True):
+                result = self.client_patch(
+                    "/json/messages/" + str(message_id),
+                    dict(
+                        content="@**King Hamlet**",
+                    ),
+                )
             self.assert_json_success(result)
             m.assert_called_once()
-            # `maybe_enqueue_notificaions` was called for Hamlet after message edit mentioned him.
+            # `maybe_enqueue_notifications` was called for Hamlet after message edit mentioned him.
             self.assertEqual(m.call_args_list[0][1]["user_notifications_data"].user_id, hamlet.id)
 
         # Hamlet mutes Cordelia.
@@ -369,6 +369,37 @@ class MutedUsersTests(ZulipTestCase):
                 ),
             )
             self.assert_json_success(result)
-            # `maybe_enqueue_notificaions` wasn't called for Hamlet after message edit which mentioned him,
+            # `maybe_enqueue_notifications` wasn't called for Hamlet after message edit which mentioned him,
             # because the sender (Cordelia) was muted.
             m.assert_not_called()
+
+    def test_muting_and_unmuting_restricted_users(self) -> None:
+        # NOTE: It is a largely unintended side effect of how we use
+        # the access_user_by_id API that limited guests can't mute
+        # inaccessible users. These tests verify the expected
+        # behavior.
+
+        self.set_up_db_for_testing_user_access()
+        polonius = self.example_user("polonius")
+        cordelia = self.example_user("cordelia")
+        iago = self.example_user("iago")
+
+        url = f"/api/v1/users/me/muted_users/{cordelia.id}"
+        result = self.api_post(polonius, url)
+        self.assert_json_error(result, "Insufficient permission")
+
+        url = f"/api/v1/users/me/muted_users/{iago.id}"
+        result = self.api_post(polonius, url)
+        self.assert_json_success(result)
+        muted_users = get_user_mutes(polonius)
+        self.assert_length(muted_users, 1)
+
+        url = f"/api/v1/users/me/muted_users/{cordelia.id}"
+        result = self.api_delete(polonius, url)
+        self.assert_json_error(result, "Insufficient permission")
+
+        url = f"/api/v1/users/me/muted_users/{iago.id}"
+        result = self.api_delete(polonius, url)
+        self.assert_json_success(result)
+        muted_users = get_user_mutes(polonius)
+        self.assert_length(muted_users, 0)

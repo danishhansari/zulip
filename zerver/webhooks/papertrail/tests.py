@@ -1,23 +1,21 @@
 from urllib.parse import urlencode
 
+from typing_extensions import override
+
 from zerver.lib.test_classes import WebhookTestCase
 
 
 class PapertrailHookTests(WebhookTestCase):
-    STREAM_NAME = "papertrail"
-    URL_TEMPLATE = "/api/v1/external/papertrail?&api_key={api_key}&stream={stream}"
-    WEBHOOK_DIR_NAME = "papertrail"
-
     def test_short_message(self) -> None:
-        expected_topic = "logs"
+        expected_topic_name = "logs"
         expected_message = """
 [Search for "Important stuff"](https://papertrailapp.com/searches/42) found **2** matches:
 
-May 18 20:30:02 - abc - cron OR server1:
+<time:2011-05-18T20:30:02-07:00> - abc - cron OR server1:
 ``` quote
 message body
 ```
-May 18 20:30:02 - server1 - cron OR server1:
+<time:2011-05-18T20:30:02-07:00> - server1 - cron OR server1:
 ``` quote
 A short event
 ```
@@ -25,7 +23,7 @@ A short event
 
         self.check_webhook(
             "short_post",
-            expected_topic,
+            expected_topic_name,
             expected_message,
             content_type="application/x-www-form-urlencoded",
         )
@@ -35,19 +33,19 @@ A short event
         expected_message = """
 [Search for "Important stuff"](https://papertrailapp.com/searches/42) found **5** matches:
 
-May 18 20:30:02 - abc - cron OR server1:
+<time:2011-05-18T20:30:02-07:00> - abc - cron OR server1:
 ``` quote
 message body 1
 ```
-May 18 20:30:02 - abc - cron OR server1:
+<time:2011-05-18T20:30:02-07:00> - abc - cron OR server1:
 ``` quote
 message body 2
 ```
-May 18 20:30:02 - abc - cron OR server1:
+<time:2011-05-18T20:30:02-07:00> - abc - cron OR server1:
 ``` quote
 message body 3
 ```
-May 18 20:30:02 - abc - cron OR server1:
+<time:2011-05-18T20:30:02-07:00> - abc - cron OR server1:
 ``` quote
 message body 4
 ```
@@ -69,6 +67,7 @@ message body 4
 
         self.assertIn("Events key is missing from payload", e.exception.args[0])
 
+    @override
     def get_body(self, fixture_name: str) -> str:
         # Papertrail webhook sends a POST request with payload parameter
         # containing the JSON body. Documented here:

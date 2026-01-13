@@ -1,6 +1,6 @@
 import re
 from collections import OrderedDict
-from typing import Any, Optional, Union
+from typing import Any
 from unittest import mock
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -9,19 +9,20 @@ from django.test import override_settings
 from django.utils.html import escape
 from pyoembed.providers import get_provider
 from requests.exceptions import ConnectionError
+from typing_extensions import override
 
 from zerver.actions.message_delete import do_delete_messages
 from zerver.lib.cache import cache_delete, cache_get, preview_url_cache_key
 from zerver.lib.camo import get_camo_url
-from zerver.lib.queue import queue_json_publish
+from zerver.lib.queue import queue_json_publish_rollback_unsafe
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.test_helpers import mock_queue_publish
 from zerver.lib.url_preview.oembed import get_oembed_data, strip_cdata
 from zerver.lib.url_preview.parsers import GenericParser, OpenGraphParser
 from zerver.lib.url_preview.preview import get_link_embed_data
 from zerver.lib.url_preview.types import UrlEmbedData, UrlOEmbedData
-from zerver.models import Message, Realm, UserProfile
-from zerver.worker.queue_processors import FetchLinksEmbedData
+from zerver.models import Message, Realm, UserMessage, UserProfile
+from zerver.worker.embed_links import FetchLinksEmbedData
 
 
 def reconstruct_url(url: str, maxwidth: int = 640, maxheight: int = 480) -> str:
@@ -195,9 +196,7 @@ class OpenGraphParserTestCase(ZulipTestCase):
           <head>
             <meta property="og:title" content="中文" />
           </head>
-        </html>""".encode(
-            "big5"
-        )
+        </html>""".encode("big5")
         parser = OpenGraphParser(html, "text/html; charset=Big5")
         result = parser.extract_data()
         self.assertEqual(result.title, "中文")
@@ -208,9 +207,7 @@ class OpenGraphParserTestCase(ZulipTestCase):
             <meta content-type="text/html; charset=Big5" />
             <meta property="og:title" content="中文" />
           </head>
-        </html>""".encode(
-            "big5"
-        )
+        </html>""".encode("big5")
         parser = OpenGraphParser(html, "text/html")
         result = parser.extract_data()
         self.assertEqual(result.title, "中文")
@@ -321,6 +318,7 @@ class PreviewTestCase(ZulipTestCase):
           </html>
         """
 
+    @override
     def setUp(self) -> None:
         super().setUp()
         Realm.objects.all().update(inline_url_embed_preview=True)
@@ -332,7 +330,7 @@ class PreviewTestCase(ZulipTestCase):
         status: int = 200,
         relative_url: bool = False,
         content_type: str = "text/html",
-        body: Optional[Union[str, ConnectionError]] = None,
+        body: str | ConnectionError | None = None,
     ) -> None:
         if body is None:
             body = cls.open_graph_html
@@ -350,7 +348,7 @@ class PreviewTestCase(ZulipTestCase):
         url = "http://test.org/"
         self.create_mock_response(url)
 
-        with mock_queue_publish("zerver.actions.message_edit.queue_json_publish") as patched:
+        with mock_queue_publish("zerver.actions.message_edit.queue_event_on_commit") as patched:
             result = self.client_patch(
                 "/json/messages/" + str(msg_id),
                 {
@@ -379,16 +377,20 @@ class PreviewTestCase(ZulipTestCase):
     @responses.activate
     @override_settings(INLINE_URL_EMBED_PREVIEW=True)
     def _send_message_with_test_org_url(
-        self, sender: UserProfile, queue_should_run: bool = True, relative_url: bool = False
+        self,
+        sender: UserProfile,
+        queue_should_run: bool = True,
+        relative_url: bool = False,
+        other_content: str = "",
     ) -> Message:
         url = "http://test.org/"
         # Ensure the cache for this is empty
         cache_delete(preview_url_cache_key(url))
-        with mock_queue_publish("zerver.actions.message_send.queue_json_publish") as patched:
+        with mock_queue_publish("zerver.actions.message_send.queue_event_on_commit") as patched:
             msg_id = self.send_personal_message(
                 sender,
                 self.example_user("cordelia"),
-                content=url,
+                content=url + other_content,
             )
             if queue_should_run:
                 patched.assert_called_once()
@@ -427,7 +429,7 @@ class PreviewTestCase(ZulipTestCase):
         self.login_user(user)
         original_url = "http://test.org/"
         edited_url = "http://edited.org/"
-        with mock_queue_publish("zerver.actions.message_send.queue_json_publish") as patched:
+        with mock_queue_publish("zerver.actions.message_send.queue_event_on_commit") as patched:
             msg_id = self.send_stream_message(
                 user, "Denmark", topic_name="foo", content=original_url
             )
@@ -436,15 +438,14 @@ class PreviewTestCase(ZulipTestCase):
             self.assertEqual(queue, "embed_links")
             event = patched.call_args[0][1]
 
-        def wrapped_queue_json_publish(*args: Any, **kwargs: Any) -> None:
+        def wrapped_queue_event_on_commit(*args: Any, **kwargs: Any) -> None:
             self.create_mock_response(original_url)
             self.create_mock_response(edited_url)
 
-            with self.settings(TEST_SUITE=False):
-                with self.assertLogs(level="INFO") as info_logs:
-                    # Run the queue processor. This will simulate the event for original_url being
-                    # processed after the message has been edited.
-                    FetchLinksEmbedData().consume(event)
+            with self.settings(TEST_SUITE=False), self.assertLogs(level="INFO") as info_logs:
+                # Run the queue processor. This will simulate the event for original_url being
+                # processed after the message has been edited.
+                FetchLinksEmbedData().consume(event)
             self.assertTrue(
                 "INFO:root:Time spent on get_link_embed_data for http://test.org/: "
                 in info_logs.output[0]
@@ -459,24 +460,23 @@ class PreviewTestCase(ZulipTestCase):
 
             self.assertTrue(responses.assert_call_count(edited_url, 0))
 
-            with self.settings(TEST_SUITE=False):
-                with self.assertLogs(level="INFO") as info_logs:
-                    # Now proceed with the original queue_json_publish and call the
-                    # up-to-date event for edited_url.
-                    queue_json_publish(*args, **kwargs)
-                    msg = Message.objects.select_related("sender").get(id=msg_id)
-                    assert msg.rendered_content is not None
-                    self.assertIn(
-                        f'<a href="{edited_url}" title="The Rock">The Rock</a>',
-                        msg.rendered_content,
-                    )
+            with self.settings(TEST_SUITE=False), self.assertLogs(level="INFO") as info_logs:
+                # Now proceed with the original queue_json_publish_rollback_unsafe
+                # and call the up-to-date event for edited_url.
+                queue_json_publish_rollback_unsafe(*args, **kwargs)
+                msg = Message.objects.select_related("sender").get(id=msg_id)
+                assert msg.rendered_content is not None
+                self.assertIn(
+                    f'<a href="{edited_url}" title="The Rock">The Rock</a>',
+                    msg.rendered_content,
+                )
             self.assertTrue(
                 "INFO:root:Time spent on get_link_embed_data for http://edited.org/: "
                 in info_logs.output[0]
             )
 
         with mock_queue_publish(
-            "zerver.actions.message_edit.queue_json_publish", wraps=wrapped_queue_json_publish
+            "zerver.actions.message_edit.queue_event_on_commit", wraps=wrapped_queue_event_on_commit
         ):
             result = self.client_patch(
                 "/json/messages/" + str(msg_id),
@@ -492,7 +492,7 @@ class PreviewTestCase(ZulipTestCase):
         user = self.example_user("hamlet")
         self.login_user(user)
         url = "http://test.org/"
-        with mock_queue_publish("zerver.actions.message_send.queue_json_publish") as patched:
+        with mock_queue_publish("zerver.actions.message_send.queue_event_on_commit") as patched:
             msg_id = self.send_stream_message(user, "Denmark", topic_name="foo", content=url)
             patched.assert_called_once()
             queue = patched.call_args[0][0]
@@ -500,19 +500,60 @@ class PreviewTestCase(ZulipTestCase):
             event = patched.call_args[0][1]
 
         msg = Message.objects.select_related("sender").get(id=msg_id)
-        do_delete_messages(msg.sender.realm, [msg])
+        do_delete_messages(msg.realm, [msg], acting_user=None)
 
         # We do still fetch the URL, as we don't want to incur the
         # cost of locking the row while we do the HTTP fetches.
         self.create_mock_response(url)
-        with self.settings(TEST_SUITE=False):
-            with self.assertLogs(level="INFO") as info_logs:
-                # Run the queue processor. This will simulate the event for original_url being
-                # processed after the message has been deleted.
-                FetchLinksEmbedData().consume(event)
+        with self.settings(TEST_SUITE=False), self.assertLogs(level="INFO") as info_logs:
+            # Run the queue processor. This will simulate the event for original_url being
+            # processed after the message has been deleted.
+            FetchLinksEmbedData().consume(event)
         self.assertTrue(
             "INFO:root:Time spent on get_link_embed_data for http://test.org/: "
             in info_logs.output[0]
+        )
+
+    def test_mentions_preserved(self) -> None:
+        # Updating the message with the preview content should be sure
+        # to preserve the mention data.
+        msg = self._send_message_with_test_org_url(
+            sender=self.example_user("hamlet"),
+            other_content=" @**Cordelia, Lear's daughter** mention",
+        )
+        self.assertEqual(
+            int(
+                UserMessage.objects.get(message=msg, user_profile=self.example_user("hamlet")).flags
+            ),
+            int(UserMessage.flags.read | UserMessage.flags.is_private),
+        )
+        self.assertEqual(
+            int(
+                UserMessage.objects.get(
+                    message=msg, user_profile=self.example_user("cordelia")
+                ).flags
+            ),
+            int(UserMessage.flags.mentioned | UserMessage.flags.is_private),
+        )
+
+        msg = self._send_message_with_test_org_url(
+            sender=self.example_user("hamlet"), other_content=" @*hamletcharacters* mention"
+        )
+        self.assertEqual(
+            int(
+                UserMessage.objects.get(message=msg, user_profile=self.example_user("hamlet")).flags
+            ),
+            int(
+                UserMessage.flags.mentioned | UserMessage.flags.read | UserMessage.flags.is_private
+            ),
+        )
+        self.assertEqual(
+            int(
+                UserMessage.objects.get(
+                    message=msg, user_profile=self.example_user("cordelia")
+                ).flags
+            ),
+            int(UserMessage.flags.mentioned | UserMessage.flags.is_private),
         )
 
     def test_get_link_embed_data(self) -> None:
@@ -536,7 +577,7 @@ class PreviewTestCase(ZulipTestCase):
 
     @override_settings(CAMO_URI="")
     def test_inline_url_embed_preview(self) -> None:
-        with_preview = '<p><a href="http://test.org/">http://test.org/</a></p>\n<div class="message_embed"><a class="message_embed_image" href="http://test.org/" style="background-image: url(http\\:\\/\\/ia\\.media-imdb\\.com\\/images\\/rock\\.jpg)"></a><div class="data-container"><div class="message_embed_title"><a href="http://test.org/" title="The Rock">The Rock</a></div><div class="message_embed_description">Description text</div></div></div>'
+        with_preview = '<p><a href="http://test.org/">http://test.org/</a></p>\n<div class="message_embed"><a class="message_embed_image" href="http://test.org/" style="background-image: url(&quot;http://ia.media-imdb.com/images/rock.jpg&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="http://test.org/" title="The Rock">The Rock</a></div><div class="message_embed_description">Description text</div></div></div>'
         without_preview = '<p><a href="http://test.org/">http://test.org/</a></p>'
         msg = self._send_message_with_test_org_url(sender=self.example_user("hamlet"))
         self.assertEqual(msg.rendered_content, with_preview)
@@ -551,13 +592,11 @@ class PreviewTestCase(ZulipTestCase):
         self.assertEqual(msg.rendered_content, without_preview)
 
     def test_inline_url_embed_preview_with_camo(self) -> None:
-        camo_url = re.sub(
-            r"([^\w-])", r"\\\1", get_camo_url("http://ia.media-imdb.com/images/rock.jpg")
-        )
+        camo_url = get_camo_url("http://ia.media-imdb.com/images/rock.jpg")
         with_preview = (
-            '<p><a href="http://test.org/">http://test.org/</a></p>\n<div class="message_embed"><a class="message_embed_image" href="http://test.org/" style="background-image: url('
+            '<p><a href="http://test.org/">http://test.org/</a></p>\n<div class="message_embed"><a class="message_embed_image" href="http://test.org/" style="background-image: url(&quot;'
             + camo_url
-            + ')"></a><div class="data-container"><div class="message_embed_title"><a href="http://test.org/" title="The Rock">The Rock</a></div><div class="message_embed_description">Description text</div></div></div>'
+            + '&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="http://test.org/" title="The Rock">The Rock</a></div><div class="message_embed_description">Description text</div></div></div>'
         )
         msg = self._send_message_with_test_org_url(sender=self.example_user("hamlet"))
         self.assertEqual(msg.rendered_content, with_preview)
@@ -569,7 +608,7 @@ class PreviewTestCase(ZulipTestCase):
         user = self.example_user("hamlet")
         self.login_user(user)
         url = "http://test.org/"
-        with mock_queue_publish("zerver.actions.message_send.queue_json_publish") as patched:
+        with mock_queue_publish("zerver.actions.message_send.queue_event_on_commit") as patched:
             msg_id = self.send_stream_message(user, "Denmark", topic_name="foo", content=url)
             patched.assert_called_once()
             queue = patched.call_args[0][0]
@@ -577,7 +616,7 @@ class PreviewTestCase(ZulipTestCase):
             event = patched.call_args[0][1]
 
         # Swap the URL out for one with characters that need CSS escaping
-        html = re.sub(r"rock\.jpg", "rock).jpg", self.open_graph_html)
+        html = re.sub(r"rock\.jpg", r"rock.jpg\\", self.open_graph_html)
         self.create_mock_response(url, body=html)
         with self.settings(TEST_SUITE=False):
             with self.assertLogs(level="INFO") as info_logs:
@@ -592,7 +631,7 @@ class PreviewTestCase(ZulipTestCase):
             '<p><a href="http://test.org/">http://test.org/</a></p>\n'
             '<div class="message_embed"><a class="message_embed_image" href="http://test.org/"'
             ' style="background-image:'
-            ' url(http\\:\\/\\/ia\\.media-imdb\\.com\\/images\\/rock\\)\\.jpg)"></a><div'
+            ' url(&quot;http://ia.media-imdb.com/images/rock.jpg\\\\&quot;)"></a><div'
             ' class="data-container"><div class="message_embed_title"><a href="http://test.org/"'
             ' title="The Rock">The Rock</a></div><div class="message_embed_description">Description'
             " text</div></div></div>"
@@ -606,7 +645,7 @@ class PreviewTestCase(ZulipTestCase):
     @override_settings(INLINE_URL_EMBED_PREVIEW=True)
     def test_inline_relative_url_embed_preview(self) -> None:
         # Relative URLs should not be sent for URL preview.
-        with mock_queue_publish("zerver.actions.message_send.queue_json_publish") as patched:
+        with mock_queue_publish("zerver.actions.message_send.queue_event_on_commit") as patched:
             self.send_personal_message(
                 self.example_user("prospero"),
                 self.example_user("cordelia"),
@@ -616,7 +655,7 @@ class PreviewTestCase(ZulipTestCase):
 
     @override_settings(CAMO_URI="")
     def test_inline_url_embed_preview_with_relative_image_url(self) -> None:
-        with_preview_relative = '<p><a href="http://test.org/">http://test.org/</a></p>\n<div class="message_embed"><a class="message_embed_image" href="http://test.org/" style="background-image: url(http\\:\\/\\/test\\.org\\/images\\/rock\\.jpg)"></a><div class="data-container"><div class="message_embed_title"><a href="http://test.org/" title="The Rock">The Rock</a></div><div class="message_embed_description">Description text</div></div></div>'
+        with_preview_relative = '<p><a href="http://test.org/">http://test.org/</a></p>\n<div class="message_embed"><a class="message_embed_image" href="http://test.org/" style="background-image: url(&quot;http://test.org/images/rock.jpg&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="http://test.org/" title="The Rock">The Rock</a></div><div class="message_embed_description">Description text</div></div></div>'
         # Try case where the Open Graph image is a relative URL.
         msg = self._send_message_with_test_org_url(
             sender=self.example_user("prospero"), relative_url=True
@@ -665,7 +704,7 @@ class PreviewTestCase(ZulipTestCase):
         user = self.example_user("hamlet")
         self.login_user(user)
         url = "http://test.org/audio.mp3"
-        with mock_queue_publish("zerver.actions.message_send.queue_json_publish") as patched:
+        with mock_queue_publish("zerver.actions.message_send.queue_event_on_commit") as patched:
             msg_id = self.send_stream_message(user, "Denmark", topic_name="foo", content=url)
             patched.assert_called_once()
             queue = patched.call_args[0][0]
@@ -697,7 +736,7 @@ class PreviewTestCase(ZulipTestCase):
         user = self.example_user("hamlet")
         self.login_user(user)
         url = "http://test.org/foo.html"
-        with mock_queue_publish("zerver.actions.message_send.queue_json_publish") as patched:
+        with mock_queue_publish("zerver.actions.message_send.queue_event_on_commit") as patched:
             msg_id = self.send_stream_message(user, "Denmark", topic_name="foo", content=url)
             patched.assert_called_once()
             queue = patched.call_args[0][0]
@@ -733,7 +772,7 @@ class PreviewTestCase(ZulipTestCase):
         user = self.example_user("hamlet")
         self.login_user(user)
         url = "http://test.org/foo.html"
-        with mock_queue_publish("zerver.actions.message_send.queue_json_publish") as patched:
+        with mock_queue_publish("zerver.actions.message_send.queue_event_on_commit") as patched:
             msg_id = self.send_stream_message(user, "Denmark", topic_name="foo", content=url)
             patched.assert_called_once()
             queue = patched.call_args[0][0]
@@ -742,9 +781,11 @@ class PreviewTestCase(ZulipTestCase):
 
         # HTML with a bad og:image metadata
         html = "\n".join(
-            line
-            if "og:image" not in line
-            else '<meta property="og:image" content="http://[bad url/" />'
+            (
+                line
+                if "og:image" not in line
+                else '<meta property="og:image" content="http://[bad url/" />'
+            )
             for line in self.open_graph_html.splitlines()
         )
         self.create_mock_response(url, body=html)
@@ -772,7 +813,7 @@ class PreviewTestCase(ZulipTestCase):
         user = self.example_user("hamlet")
         self.login_user(user)
         url = "http://test.org/foo.html"
-        with mock_queue_publish("zerver.actions.message_send.queue_json_publish") as patched:
+        with mock_queue_publish("zerver.actions.message_send.queue_event_on_commit") as patched:
             msg_id = self.send_stream_message(user, "Denmark", topic_name="foo", content=url)
             patched.assert_called_once()
             queue = patched.call_args[0][0]
@@ -810,7 +851,7 @@ class PreviewTestCase(ZulipTestCase):
         user = self.example_user("hamlet")
         self.login_user(user)
         url = "http://test.org/"
-        with mock_queue_publish("zerver.actions.message_send.queue_json_publish") as patched:
+        with mock_queue_publish("zerver.actions.message_send.queue_event_on_commit") as patched:
             msg_id = self.send_stream_message(user, "Denmark", topic_name="foo", content=url)
             patched.assert_called_once()
             queue = patched.call_args[0][0]
@@ -832,13 +873,13 @@ class PreviewTestCase(ZulipTestCase):
         assert msg.rendered_content is not None
         self.assertIn(cached_data.title, msg.rendered_content)
         assert cached_data.image is not None
-        self.assertIn(re.sub(r"([^\w-])", r"\\\1", cached_data.image), msg.rendered_content)
+        self.assertIn(cached_data.image, msg.rendered_content)
 
     @responses.activate
     @override_settings(INLINE_URL_EMBED_PREVIEW=True)
     def test_valid_content_type_error_get_data(self) -> None:
         url = "http://test.org/"
-        with mock_queue_publish("zerver.actions.message_send.queue_json_publish"):
+        with mock_queue_publish("zerver.actions.message_send.queue_event_on_commit"):
             msg_id = self.send_personal_message(
                 self.example_user("hamlet"),
                 self.example_user("cordelia"),
@@ -854,24 +895,26 @@ class PreviewTestCase(ZulipTestCase):
 
         self.create_mock_response(url, body=ConnectionError())
 
-        with mock.patch(
-            "zerver.lib.url_preview.preview.get_oembed_data",
-            side_effect=lambda *args, **kwargs: None,
-        ):
-            with mock.patch(
+        with (
+            mock.patch(
+                "zerver.lib.url_preview.preview.get_oembed_data",
+                side_effect=lambda *args, **kwargs: None,
+            ),
+            mock.patch(
                 "zerver.lib.url_preview.preview.valid_content_type", side_effect=lambda k: True
-            ):
-                with self.settings(TEST_SUITE=False):
-                    with self.assertLogs(level="INFO") as info_logs:
-                        FetchLinksEmbedData().consume(event)
-                    self.assertTrue(
-                        "INFO:root:Time spent on get_link_embed_data for http://test.org/: "
-                        in info_logs.output[0]
-                    )
+            ),
+            self.settings(TEST_SUITE=False),
+        ):
+            with self.assertLogs(level="INFO") as info_logs:
+                FetchLinksEmbedData().consume(event)
+            self.assertTrue(
+                "INFO:root:Time spent on get_link_embed_data for http://test.org/: "
+                in info_logs.output[0]
+            )
 
-                    # This did not get cached -- hence the lack of [0] on the cache_get
-                    cached_data = cache_get(preview_url_cache_key(url))
-                    self.assertIsNone(cached_data)
+            # This did not get cached -- hence the lack of [0] on the cache_get
+            cached_data = cache_get(preview_url_cache_key(url))
+            self.assertIsNone(cached_data)
 
         msg.refresh_from_db()
         self.assertEqual(
@@ -883,7 +926,7 @@ class PreviewTestCase(ZulipTestCase):
     def test_invalid_url(self) -> None:
         url = "http://test.org/"
         error_url = "http://test.org/x"
-        with mock_queue_publish("zerver.actions.message_send.queue_json_publish"):
+        with mock_queue_publish("zerver.actions.message_send.queue_event_on_commit"):
             msg_id = self.send_personal_message(
                 self.example_user("hamlet"),
                 self.example_user("cordelia"),
@@ -920,7 +963,7 @@ class PreviewTestCase(ZulipTestCase):
     @override_settings(INLINE_URL_EMBED_PREVIEW=True)
     def test_safe_oembed_html_url(self) -> None:
         url = "http://test.org/"
-        with mock_queue_publish("zerver.actions.message_send.queue_json_publish"):
+        with mock_queue_publish("zerver.actions.message_send.queue_event_on_commit"):
             msg_id = self.send_personal_message(
                 self.example_user("hamlet"),
                 self.example_user("cordelia"),
@@ -941,13 +984,15 @@ class PreviewTestCase(ZulipTestCase):
         )
         self.create_mock_response(url)
         with self.settings(TEST_SUITE=False):
-            with self.assertLogs(level="INFO") as info_logs:
-                with mock.patch(
+            with (
+                self.assertLogs(level="INFO") as info_logs,
+                mock.patch(
                     "zerver.lib.url_preview.preview.get_oembed_data",
                     lambda *args, **kwargs: mocked_data,
-                ):
-                    FetchLinksEmbedData().consume(event)
-                    cached_data = cache_get(preview_url_cache_key(url))[0]
+                ),
+            ):
+                FetchLinksEmbedData().consume(event)
+                cached_data = cache_get(preview_url_cache_key(url))[0]
             self.assertTrue(
                 "INFO:root:Time spent on get_link_embed_data for http://test.org/: "
                 in info_logs.output[0]
@@ -962,7 +1007,7 @@ class PreviewTestCase(ZulipTestCase):
     @override_settings(INLINE_URL_EMBED_PREVIEW=True)
     def test_youtube_url_title_replaces_url(self) -> None:
         url = "https://www.youtube.com/watch?v=eSJTXC7Ixgg"
-        with mock_queue_publish("zerver.actions.message_send.queue_json_publish"):
+        with mock_queue_publish("zerver.actions.message_send.queue_event_on_commit"):
             msg_id = self.send_personal_message(
                 self.example_user("hamlet"),
                 self.example_user("cordelia"),
@@ -981,26 +1026,28 @@ class PreviewTestCase(ZulipTestCase):
         )
         self.create_mock_response(url)
         with self.settings(TEST_SUITE=False):
-            with self.assertLogs(level="INFO") as info_logs:
-                with mock.patch(
-                    "zerver.worker.queue_processors.url_preview.get_link_embed_data",
+            with (
+                self.assertLogs(level="INFO") as info_logs,
+                mock.patch(
+                    "zerver.worker.embed_links.url_preview.get_link_embed_data",
                     lambda *args, **kwargs: mocked_data,
-                ):
-                    FetchLinksEmbedData().consume(event)
+                ),
+            ):
+                FetchLinksEmbedData().consume(event)
             self.assertTrue(
                 "INFO:root:Time spent on get_link_embed_data for https://www.youtube.com/watch?v=eSJTXC7Ixgg:"
                 in info_logs.output[0]
             )
 
         msg.refresh_from_db()
-        expected_content = f"""<p><a href="https://www.youtube.com/watch?v=eSJTXC7Ixgg">YouTube - Clearer Code at Scale - Static Types at Zulip and Dropbox</a></p>\n<div class="youtube-video message_inline_image"><a data-id="eSJTXC7Ixgg" href="https://www.youtube.com/watch?v=eSJTXC7Ixgg"><img src="{get_camo_url("https://i.ytimg.com/vi/eSJTXC7Ixgg/default.jpg")}"></a></div>"""
+        expected_content = f"""<p><a href="https://www.youtube.com/watch?v=eSJTXC7Ixgg">YouTube - Clearer Code at Scale - Static Types at Zulip and Dropbox</a></p>\n<div class="youtube-video message_inline_image"><a data-id="eSJTXC7Ixgg" href="https://www.youtube.com/watch?v=eSJTXC7Ixgg"><img src="{get_camo_url("https://i.ytimg.com/vi/eSJTXC7Ixgg/mqdefault.jpg")}"></a></div>"""
         self.assertEqual(expected_content, msg.rendered_content)
 
     @responses.activate
     @override_settings(INLINE_URL_EMBED_PREVIEW=True)
     def test_custom_title_replaces_youtube_url_title(self) -> None:
         url = "[YouTube link](https://www.youtube.com/watch?v=eSJTXC7Ixgg)"
-        with mock_queue_publish("zerver.actions.message_send.queue_json_publish"):
+        with mock_queue_publish("zerver.actions.message_send.queue_event_on_commit"):
             msg_id = self.send_personal_message(
                 self.example_user("hamlet"),
                 self.example_user("cordelia"),
@@ -1019,17 +1066,19 @@ class PreviewTestCase(ZulipTestCase):
         )
         self.create_mock_response(url)
         with self.settings(TEST_SUITE=False):
-            with self.assertLogs(level="INFO") as info_logs:
-                with mock.patch(
-                    "zerver.worker.queue_processors.url_preview.get_link_embed_data",
+            with (
+                self.assertLogs(level="INFO") as info_logs,
+                mock.patch(
+                    "zerver.worker.embed_links.url_preview.get_link_embed_data",
                     lambda *args, **kwargs: mocked_data,
-                ):
-                    FetchLinksEmbedData().consume(event)
+                ),
+            ):
+                FetchLinksEmbedData().consume(event)
             self.assertTrue(
                 "INFO:root:Time spent on get_link_embed_data for [YouTube link](https://www.youtube.com/watch?v=eSJTXC7Ixgg):"
                 in info_logs.output[0]
             )
 
         msg.refresh_from_db()
-        expected_content = f"""<p><a href="https://www.youtube.com/watch?v=eSJTXC7Ixgg">YouTube link</a></p>\n<div class="youtube-video message_inline_image"><a data-id="eSJTXC7Ixgg" href="https://www.youtube.com/watch?v=eSJTXC7Ixgg"><img src="{get_camo_url("https://i.ytimg.com/vi/eSJTXC7Ixgg/default.jpg")}"></a></div>"""
+        expected_content = f"""<p><a href="https://www.youtube.com/watch?v=eSJTXC7Ixgg">YouTube link</a></p>\n<div class="youtube-video message_inline_image"><a data-id="eSJTXC7Ixgg" href="https://www.youtube.com/watch?v=eSJTXC7Ixgg"><img src="{get_camo_url("https://i.ytimg.com/vi/eSJTXC7Ixgg/mqdefault.jpg")}"></a></div>"""
         self.assertEqual(expected_content, msg.rendered_content)

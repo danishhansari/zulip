@@ -1,16 +1,19 @@
 import unicodedata
 
 from django.db import connection, migrations, models
-from django.db.backends.postgresql.schema import BaseDatabaseSchemaEditor
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 from django.db.migrations.state import StateApps
 
 # There are 66 Unicode non-characters; see
 # https://www.unicode.org/faq/private_use.html#nonchar4
 unicode_non_chars = {
     chr(x)
-    for x in list(range(0xFDD0, 0xFDF0))  # FDD0 through FDEF, inclusive
-    + list(range(0xFFFE, 0x110000, 0x10000))  # 0xFFFE, 0x1FFFE, ... 0x10FFFE inclusive
-    + list(range(0xFFFF, 0x110000, 0x10000))  # 0xFFFF, 0x1FFFF, ... 0x10FFFF inclusive
+    for r in [
+        range(0xFDD0, 0xFDF0),  # FDD0 through FDEF, inclusive
+        range(0xFFFE, 0x110000, 0x10000),  # 0xFFFE, 0x1FFFE, ... 0x10FFFE inclusive
+        range(0xFFFF, 0x110000, 0x10000),  # 0xFFFF, 0x1FFFF, ... 0x10FFFF inclusive
+    ]
+    for x in r
 }
 
 
@@ -29,7 +32,7 @@ def fix_topics(apps: StateApps, schema_editor: BaseDatabaseSchemaEditor) -> None
         # Nothing to do if there are no messages.
         return
 
-    print("")
+    print()
     while lower_bound < max_id:
         print(f"Processed {lower_bound} / {max_id}")
         with connection.cursor() as cursor:
@@ -72,5 +75,5 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RunPython(fix_topics, reverse_code=migrations.RunPython.noop),
+        migrations.RunPython(fix_topics, reverse_code=migrations.RunPython.noop, elidable=True),
     ]

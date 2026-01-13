@@ -1,3 +1,4 @@
+from django.db import transaction
 from django.http import HttpRequest, HttpResponse
 
 from zerver.actions.uploads import notify_attachment_update
@@ -16,8 +17,9 @@ def list_by_user(request: HttpRequest, user_profile: UserProfile) -> HttpRespons
     )
 
 
-def remove(request: HttpRequest, user_profile: UserProfile, attachment_id: str) -> HttpResponse:
-    attachment = access_attachment_by_id(user_profile, int(attachment_id), needs_owner=True)
+@transaction.atomic(durable=True)
+def remove(request: HttpRequest, user_profile: UserProfile, attachment_id: int) -> HttpResponse:
+    attachment = access_attachment_by_id(user_profile, attachment_id, needs_owner=True)
     remove_attachment(user_profile, attachment)
-    notify_attachment_update(user_profile, "remove", {"id": int(attachment_id)})
+    notify_attachment_update(user_profile, "remove", {"id": attachment_id})
     return json_success(request)

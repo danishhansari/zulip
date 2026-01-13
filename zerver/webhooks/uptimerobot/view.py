@@ -4,11 +4,11 @@ from django.utils.translation import gettext as _
 
 from zerver.actions.message_send import send_rate_limited_pm_notification_to_bot_owner
 from zerver.decorator import webhook_view
-from zerver.lib.exceptions import JsonableError
-from zerver.lib.request import REQ, has_request_variables
+from zerver.lib.exceptions import JsonableError, UnsupportedWebhookEventTypeError
 from zerver.lib.response import json_success
 from zerver.lib.send_email import FromAddress
-from zerver.lib.validator import WildValue, check_string, to_wild_value
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import UserProfile
 
@@ -32,11 +32,12 @@ ALL_EVENT_TYPES = ["up", "down"]
 
 
 @webhook_view("UptimeRobot", all_event_types=ALL_EVENT_TYPES)
-@has_request_variables
+@typed_endpoint
 def api_uptimerobot_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
+    *,
+    payload: JsonBodyPayload[WildValue],
 ) -> HttpResponse:
     event_type = payload["alert_type_friendly_name"].tame(check_string)
     if event_type == "Up":
@@ -46,7 +47,7 @@ def api_uptimerobot_webhook(
 
     try:
         body = get_body_for_http_request(payload, event_type)
-        subject = get_subject_for_http_request(payload)
+        topic_name = get_topic_for_http_request(payload)
     except ValidationError:
         message = MISCONFIGURED_PAYLOAD_ERROR_MESSAGE.format(
             bot_name=user_profile.full_name,
@@ -56,11 +57,11 @@ def api_uptimerobot_webhook(
 
         raise JsonableError(_("Invalid payload"))
 
-    check_send_webhook_message(request, user_profile, subject, body, event)
+    check_send_webhook_message(request, user_profile, topic_name, body, event)
     return json_success(request)
 
 
-def get_subject_for_http_request(payload: WildValue) -> str:
+def get_topic_for_http_request(payload: WildValue) -> str:
     return UPTIMEROBOT_TOPIC_TEMPLATE.format(
         monitor_friendly_name=payload["monitor_friendly_name"].tame(check_string)
     )
@@ -87,5 +88,7 @@ def get_body_for_http_request(payload: WildValue, event_type: str) -> str:
             monitor_url=monitor_url,
             alert_details=alert_details,
         )
+    else:
+        raise UnsupportedWebhookEventTypeError(event_type)
 
     return body

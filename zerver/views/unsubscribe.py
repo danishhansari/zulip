@@ -1,4 +1,4 @@
-from typing import Callable
+from collections.abc import Callable
 
 from django.http import HttpRequest, HttpResponse
 from django.shortcuts import render
@@ -42,7 +42,7 @@ def do_missedmessage_unsubscribe(user_profile: UserProfile) -> None:
 
 
 def do_welcome_unsubscribe(user_profile: UserProfile) -> None:
-    clear_scheduled_emails(user_profile.id, ScheduledEmail.WELCOME)
+    clear_scheduled_emails([user_profile.id], ScheduledEmail.WELCOME)
 
 
 def do_digest_unsubscribe(user_profile: UserProfile) -> None:

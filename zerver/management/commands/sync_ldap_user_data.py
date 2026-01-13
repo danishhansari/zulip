@@ -1,10 +1,12 @@
 import logging
 from argparse import ArgumentParser
-from typing import Any, Collection
+from typing import Any
 
 from django.conf import settings
 from django.core.management.base import CommandError
 from django.db import transaction
+from django.db.models import QuerySet
+from typing_extensions import override
 
 from zerver.lib.logging_util import log_to_file
 from zerver.lib.management import ZulipBaseCommand
@@ -17,9 +19,9 @@ log_to_file(logger, settings.LDAP_SYNC_LOG_PATH)
 
 
 # Run this on a cron job to pick up on name changes.
-@transaction.atomic
+@transaction.atomic(durable=True)
 def sync_ldap_user_data(
-    user_profiles: Collection[UserProfile], deactivation_protection: bool = True
+    user_profiles: QuerySet[UserProfile], deactivation_protection: bool = True
 ) -> None:
     logger.info("Starting update.")
     try:
@@ -62,6 +64,7 @@ def sync_ldap_user_data(
 
 
 class Command(ZulipBaseCommand):
+    @override
     def add_arguments(self, parser: ArgumentParser) -> None:
         parser.add_argument(
             "-f",
@@ -73,18 +76,18 @@ class Command(ZulipBaseCommand):
         self.add_realm_args(parser)
         self.add_user_list_args(parser)
 
+    @override
     def handle(self, *args: Any, **options: Any) -> None:
         if options.get("realm_id") is not None:
             realm = self.get_realm(options)
             user_profiles = self.get_users(options, realm, is_bot=False, include_deactivated=True)
         else:
-            user_profile_query = UserProfile.objects.select_related().filter(is_bot=False)
+            user_profiles = UserProfile.objects.select_related("realm").filter(is_bot=False)
 
-            if not user_profile_query.exists():
+            if not user_profiles.exists():
                 # This case provides a special error message if one
                 # tries setting up LDAP sync before creating a realm.
                 raise CommandError("Zulip server contains no users. Have you created a realm?")
-            user_profiles = list(user_profile_query)
 
         if len(user_profiles) == 0:
             # We emphasize that this error is purely about the

@@ -1,6 +1,6 @@
-```{eval-rst}
-:orphan:
-```
+---
+orphan: true
+---
 
 # How to request a remote Zulip development instance
 
@@ -43,8 +43,8 @@ zulip/zulip, you are ready to request your Zulip developer instance.
 If you haven't already, create an account on https://chat.zulip.org/.
 
 Next, join the [development
-help](https://chat.zulip.org/#narrow/stream/49-development-help) stream. Create a
-new **stream message** with your GitHub username as the **topic** and request
+help](https://chat.zulip.org/#narrow/channel/49-development-help) channel. Create a
+new **channel message** with your GitHub username as the **topic** and request
 your remote dev instance. **Please make sure you have completed steps 1 and 2
 before doing so**. A core developer should reply letting you know they're
 working on creating it as soon as they are available to help.
@@ -60,8 +60,8 @@ Once your remote dev instance is ready:
   `ssh zulipdev@<username>.zulipdev.org` on the command line
   (Terminal for macOS and Linux, Bash for Git on Windows).
 - There is no password; your account is configured to use your SSH keys.
-- Once you log in, you should see `(zulip-py3-venv) ~$`.
-- To start the dev server, `cd zulip` and then run `./tools/run-dev.py`.
+- Once you log in, you should see `(zulip-server) ~$`.
+- To start the dev server, `cd zulip` and then run `./tools/run-dev`.
 - While the dev server is running, you can see the Zulip server in your browser
   at http://zulip.username.zulipdev.org:9991.
 - The development server actually runs on all subdomains of

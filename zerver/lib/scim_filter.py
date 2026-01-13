@@ -1,7 +1,5 @@
-from typing import List, Optional, Tuple
-
 from django.http import HttpRequest
-from django_scim.filters import UserFilterQuery
+from django_scim.filters import GroupFilterQuery, UserFilterQuery
 
 from zerver.lib.request import RequestNotes
 
@@ -28,7 +26,7 @@ class ZulipUserFilterQuery(UserFilterQuery):
     # attr_map describes which table.column the given SCIM2 User
     # attributes refer to.
     attr_map = {
-        # attr, sub attr, uri
+        # attr, sub attr, url
         ("userName", None, None): "zerver_userprofile.delivery_email",
         # We can only reasonably support filtering by name.formatted
         # as UserProfile.full_name is its equivalent. We don't store
@@ -38,19 +36,13 @@ class ZulipUserFilterQuery(UserFilterQuery):
         ("active", None, None): "zerver_userprofile.is_active",
     }
 
-    # joins tells django-scim2 to always add the specified JOINS
-    # to the formed SQL queries. We need to JOIN the Realm table
-    # because we need to limit the results to the realm (subdomain)
-    # of the request.
-    joins = ("INNER JOIN zerver_realm ON zerver_realm.id = realm_id",)
-
     @classmethod
-    def get_extras(cls, q: str, request: Optional[HttpRequest] = None) -> Tuple[str, List[object]]:
+    def get_extras(cls, q: str, request: HttpRequest | None = None) -> tuple[str, list[object]]:
         """
         Return extra SQL and params to be attached to end of current Query's
         SQL and params. The return format matches the format that should be used
         for providing raw SQL with params to Django's .raw():
-        https://docs.djangoproject.com/en/3.2/topics/db/sql/#passing-parameters-into-raw
+        https://docs.djangoproject.com/en/5.0/topics/db/sql/#passing-parameters-into-raw
 
         Here we ensure that results are limited to the subdomain of the request
         and also exclude bots, as we currently don't want them to be managed by SCIM2.
@@ -60,6 +52,26 @@ class ZulipUserFilterQuery(UserFilterQuery):
         assert realm is not None
 
         return (
-            "AND zerver_realm.id = %s AND zerver_userprofile.is_bot = False ORDER BY zerver_userprofile.id",
+            "AND zerver_userprofile.realm_id = %s AND zerver_userprofile.is_bot = False ORDER BY zerver_userprofile.id",
+            [realm.id],
+        )
+
+
+class ZulipGroupFilterQuery(GroupFilterQuery):
+    attr_map = {
+        ("displayName", None, None): "zerver_namedusergroup.name",
+    }
+
+    @classmethod
+    def get_extras(cls, q: str, request: HttpRequest | None = None) -> tuple[str, list[object]]:
+        """
+        Here we ensure that results are limited to the subdomain of the request.
+        """
+        assert request is not None
+        realm = RequestNotes.get_notes(request).realm
+        assert realm is not None
+
+        return (
+            "AND zerver_namedusergroup.realm_id = %s AND zerver_namedusergroup.deactivated = False ORDER BY zerver_namedusergroup.usergroup_ptr_id",
             [realm.id],
         )

@@ -3,7 +3,6 @@ import configparser
 import os
 import sys
 from collections import defaultdict
-from typing import Dict, List, Optional
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(BASE_DIR)
@@ -13,11 +12,12 @@ setup_path()
 
 from django.core.management import ManagementUtility, get_commands
 from django.core.management.color import color_style
+from typing_extensions import override
 
 from scripts.lib.zulip_tools import assert_not_running_as_root
 
 
-def get_filtered_commands() -> Dict[str, str]:
+def get_filtered_commands() -> dict[str, str]:
     """Because Zulip uses management commands in production, `manage.py
     help` is a form of documentation for users. Here we exclude from
     that documentation built-in commands that are not constructive for
@@ -73,6 +73,7 @@ class FilteredManagementUtility(ManagementUtility):
     All other change are just code style differences to pass the Zulip linter.
     """
 
+    @override
     def main_help_text(self, commands_only: bool = False) -> str:
         """Return the script's main help text, as a string."""
         if commands_only:
@@ -95,8 +96,7 @@ class FilteredManagementUtility(ManagementUtility):
             for app in sorted(commands_dict):
                 usage.append("")
                 usage.append(style.NOTICE(f"[{app}]"))
-                for name in sorted(commands_dict[app]):
-                    usage.append(f"    {name}")
+                usage.extend(f"    {name}" for name in sorted(commands_dict[app]))
             # Output an extra note if settings are not properly configured
             if self.settings_exception is not None:
                 usage.append(
@@ -109,14 +109,19 @@ class FilteredManagementUtility(ManagementUtility):
         return "\n".join(usage)
 
 
-def execute_from_command_line(argv: Optional[List[str]] = None) -> None:
+def execute_from_command_line(argv: list[str] | None = None) -> None:
     """Run a FilteredManagementUtility."""
     utility = FilteredManagementUtility(argv)
     utility.execute()
 
 
 if __name__ == "__main__":
-    assert_not_running_as_root()
+    if len(sys.argv) > 1 and sys.argv[1] == "email_server":
+        # This needs to be able to run as root to read certificates
+        # for STARTTLS, and bind to port 25.
+        pass
+    else:
+        assert_not_running_as_root()
 
     config_file = configparser.RawConfigParser()
     config_file.read("/etc/zulip/zulip.conf")
@@ -143,7 +148,6 @@ if __name__ == "__main__":
 
     log_management_command(sys.argv, settings.MANAGEMENT_LOG_PATH)
 
-    os.environ.setdefault("PYTHONSTARTUP", os.path.join(BASE_DIR, "scripts/lib/pythonrc.py"))
     if "--no-traceback" not in sys.argv and len(sys.argv) > 1:
         sys.argv.append("--traceback")
     try:

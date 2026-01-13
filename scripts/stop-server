@@ -7,6 +7,10 @@ import sys
 import time
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+from scripts.lib.setup_path import setup_path
+
+setup_path()
+
 from scripts.lib.supervisor import list_supervisor_processes
 from scripts.lib.zulip_tools import (
     ENDC,
@@ -14,12 +18,16 @@ from scripts.lib.zulip_tools import (
     WARNING,
     has_application_server,
     has_process_fts_updates,
+    su_to_zulip,
 )
 
 deploy_path = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 os.chdir(deploy_path)
 
-if pwd.getpwuid(os.getuid()).pw_name != "zulip":
+username = pwd.getpwuid(os.getuid()).pw_name
+if username == "root":
+    su_to_zulip()
+elif username != "zulip":
     logging.error("Must be run as user 'zulip'.")
     sys.exit(1)
 
@@ -41,6 +49,9 @@ if has_application_server():
     services.append("zulip-django")
     services.append("zulip-tornado:*")
     services.append("zulip-workers:*")
+    services.append("zulip-tus")
+    services.append("zulip-katex")
+    services.append("zulip-email-server")
     if has_application_server(once=True):
         # These used to be included in "zulip-workers:*"; we may be
         # stopping an older version of Zulip, which has not applied

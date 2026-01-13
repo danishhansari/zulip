@@ -1,13 +1,16 @@
 import itertools
 from collections import defaultdict
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from operator import itemgetter
-from typing import AbstractSet, Any, Collection, Dict, List, Optional, Set
+from typing import Any, Literal
 
-from django.db.models import Q, QuerySet
-from django_stubs_ext import ValuesQuerySet
+from django.db import connection, transaction
+from django.db.models import F, Q, QuerySet
+from psycopg2 import sql
+from psycopg2.extras import execute_values
 
-from zerver.models import AlertWord, Realm, Recipient, Stream, Subscription, UserProfile
+from zerver.models import AlertWord, Recipient, Stream, Subscription, UserProfile, UserTopic
 
 
 @dataclass
@@ -19,8 +22,8 @@ class SubInfo:
 
 @dataclass
 class SubscriberPeerInfo:
-    subscribed_ids: Dict[int, Set[int]]
-    private_peer_dict: Dict[int, Set[int]]
+    subscribed_ids: dict[int, set[int]]
+    private_peer_dict: dict[int, set[int]]
 
 
 def get_active_subscriptions_for_stream_id(
@@ -40,7 +43,7 @@ def get_active_subscriptions_for_stream_id(
     return query
 
 
-def get_active_subscriptions_for_stream_ids(stream_ids: Set[int]) -> QuerySet[Subscription]:
+def get_active_subscriptions_for_stream_ids(stream_ids: set[int]) -> QuerySet[Subscription]:
     return Subscription.objects.filter(
         recipient__type=Recipient.STREAM,
         recipient__type_id__in=stream_ids,
@@ -51,7 +54,7 @@ def get_active_subscriptions_for_stream_ids(stream_ids: Set[int]) -> QuerySet[Su
 
 def get_subscribed_stream_ids_for_user(
     user_profile: UserProfile,
-) -> ValuesQuerySet[Subscription, int]:
+) -> QuerySet[Subscription, int]:
     return Subscription.objects.filter(
         user_profile_id=user_profile,
         recipient__type=Recipient.STREAM,
@@ -61,7 +64,7 @@ def get_subscribed_stream_ids_for_user(
 
 def get_subscribed_stream_recipient_ids_for_user(
     user_profile: UserProfile,
-) -> ValuesQuerySet[Subscription, int]:
+) -> QuerySet[Subscription, int]:
     return Subscription.objects.filter(
         user_profile_id=user_profile,
         recipient__type=Recipient.STREAM,
@@ -76,7 +79,13 @@ def get_stream_subscriptions_for_user(user_profile: UserProfile) -> QuerySet[Sub
     )
 
 
-def get_used_colors_for_user_ids(user_ids: List[int]) -> Dict[int, Set[str]]:
+def get_user_subscribed_streams(user_profile: UserProfile) -> QuerySet[Stream]:
+    return Stream.objects.filter(
+        recipient_id__in=get_subscribed_stream_recipient_ids_for_user(user_profile)
+    )
+
+
+def get_used_colors_for_user_ids(user_ids: list[int]) -> dict[int, set[str]]:
     """Fetch which stream colors have already been used for each user in
     user_ids. Uses an optimized query designed to support picking
     colors when bulk-adding users to streams, which requires
@@ -92,9 +101,9 @@ def get_used_colors_for_user_ids(user_ids: List[int]) -> Dict[int, Set[str]]:
         .distinct()
     )
 
-    result: Dict[int, Set[str]] = defaultdict(set)
+    result: dict[int, set[str]] = defaultdict(set)
 
-    for row in list(query):
+    for row in query:
         assert row["color"] is not None
         result[row["user_profile_id"]].add(row["color"])
 
@@ -102,9 +111,9 @@ def get_used_colors_for_user_ids(user_ids: List[int]) -> Dict[int, Set[str]]:
 
 
 def get_bulk_stream_subscriber_info(
-    users: List[UserProfile],
-    streams: List[Stream],
-) -> Dict[int, List[SubInfo]]:
+    users: list[UserProfile],
+    streams: list[Stream],
+) -> dict[int, list[SubInfo]]:
     stream_ids = {stream.id for stream in streams}
 
     subs = Subscription.objects.filter(
@@ -117,7 +126,7 @@ def get_bulk_stream_subscriber_info(
     stream_map = {stream.recipient_id: stream for stream in streams}
     user_map = {user.id: user for user in users}
 
-    result: Dict[int, List[SubInfo]] = {user.id: [] for user in users}
+    result: dict[int, list[SubInfo]] = {user.id: [] for user in users}
 
     for sub in subs:
         user_id = sub.user_profile_id
@@ -141,21 +150,19 @@ def num_subscribers_for_stream_id(stream_id: int) -> int:
     ).count()
 
 
-def get_user_ids_for_streams(stream_ids: Set[int]) -> Dict[int, Set[int]]:
-    all_subs = (
-        get_active_subscriptions_for_stream_ids(stream_ids)
-        .values(
-            "recipient__type_id",
-            "user_profile_id",
-        )
-        .order_by(
-            "recipient__type_id",
-        )
+def get_user_ids_for_stream_query(
+    query: QuerySet[Subscription, Subscription],
+) -> dict[int, set[int]]:
+    all_subs = query.values(
+        "recipient__type_id",
+        "user_profile_id",
+    ).order_by(
+        "recipient__type_id",
     )
 
     get_stream_id = itemgetter("recipient__type_id")
 
-    result: Dict[int, Set[int]] = defaultdict(set)
+    result: dict[int, set[int]] = defaultdict(set)
     for stream_id, rows in itertools.groupby(all_subs, get_stream_id):
         user_ids = {row["user_profile_id"] for row in rows}
         result[stream_id] = user_ids
@@ -163,89 +170,36 @@ def get_user_ids_for_streams(stream_ids: Set[int]) -> Dict[int, Set[int]]:
     return result
 
 
-def bulk_get_subscriber_peer_info(
-    realm: Realm,
-    streams: Collection[Stream],
-) -> SubscriberPeerInfo:
-    """
-    Glossary:
+def get_user_ids_for_streams(stream_ids: set[int]) -> dict[int, set[int]]:
+    return get_user_ids_for_stream_query(get_active_subscriptions_for_stream_ids(stream_ids))
 
-        subscribed_ids:
-            This shows the users who are actually subscribed to the
-            stream, which we generally send to the person subscribing
-            to the stream.
 
-        private_peer_dict:
-            These are the folks that need to know about a new subscriber.
-            It's usually a superset of the subscribers.
-
-            Note that we only compute this for PRIVATE streams.  We
-            let other code handle peers for public streams, since the
-            peers for all public streams are actually the same group
-            of users, and downstream code can use that property of
-            public streams to avoid extra work.
-    """
-
-    subscribed_ids = {}
-    private_peer_dict = {}
-
-    private_stream_ids = {stream.id for stream in streams if stream.invite_only}
-    public_stream_ids = {stream.id for stream in streams if not stream.invite_only}
-
-    stream_user_ids = get_user_ids_for_streams(private_stream_ids | public_stream_ids)
-
-    if private_stream_ids:
-        realm_admin_ids = {user.id for user in realm.get_admin_users_and_bots()}
-
-        for stream_id in private_stream_ids:
-            # This is the same business rule as we use in
-            # bulk_get_private_peers. Realm admins can see all private stream
-            # subscribers.
-            subscribed_user_ids = stream_user_ids.get(stream_id, set())
-            subscribed_ids[stream_id] = subscribed_user_ids
-            private_peer_dict[stream_id] = subscribed_user_ids | realm_admin_ids
-
-    for stream_id in public_stream_ids:
-        subscribed_user_ids = stream_user_ids.get(stream_id, set())
-        subscribed_ids[stream_id] = subscribed_user_ids
-
-    return SubscriberPeerInfo(
-        subscribed_ids=subscribed_ids,
-        private_peer_dict=private_peer_dict,
+def get_guest_user_ids_for_streams(stream_ids: set[int]) -> dict[int, set[int]]:
+    return get_user_ids_for_stream_query(
+        get_active_subscriptions_for_stream_ids(stream_ids).filter(
+            user_profile__role=UserProfile.ROLE_GUEST
+        )
     )
 
 
-def bulk_get_private_peers(
-    realm: Realm,
-    private_streams: List[Stream],
-) -> Dict[int, Set[int]]:
-    if not private_streams:
-        return {}
+def get_users_for_streams(stream_ids: set[int]) -> dict[int, set[UserProfile]]:
+    all_subs = (
+        get_active_subscriptions_for_stream_ids(stream_ids)
+        .select_related("user_profile", "recipient")
+        .order_by("recipient__type_id")
+    )
 
-    for stream in private_streams:
-        # Our caller should only pass us private streams.
-        assert stream.invite_only
+    result: dict[int, set[UserProfile]] = defaultdict(set)
+    for stream_id, rows in itertools.groupby(all_subs, key=lambda obj: obj.recipient.type_id):
+        users = {row.user_profile for row in rows}
+        result[stream_id] = users
 
-    peer_ids: Dict[int, Set[int]] = {}
-
-    realm_admin_ids = {user.id for user in realm.get_admin_users_and_bots()}
-
-    stream_ids = {stream.id for stream in private_streams}
-    stream_user_ids = get_user_ids_for_streams(stream_ids)
-
-    for stream in private_streams:
-        # This is the same business rule as we use in
-        # bulk_get_subscriber_peer_info.  Realm admins can see all private
-        # stream subscribers.
-        subscribed_user_ids = stream_user_ids.get(stream.id, set())
-        peer_ids[stream.id] = subscribed_user_ids | realm_admin_ids
-
-    return peer_ids
+    return result
 
 
 def handle_stream_notifications_compatibility(
-    user_profile: Optional[UserProfile],
-    stream_dict: Dict[str, Any],
+    user_profile: UserProfile | None,
+    stream_dict: dict[str, Any],
     notification_settings_null: bool,
 ) -> None:
     # Old versions of the mobile apps don't support `None` as a
@@ -276,7 +230,7 @@ def handle_stream_notifications_compatibility(
         )
 
 
-def subscriber_ids_with_stream_history_access(stream: Stream) -> Set[int]:
+def subscriber_ids_with_stream_history_access(stream: Stream) -> set[int]:
     """Returns the set of active user IDs who can access any message
     history on this stream (regardless of whether they have a
     UserMessage) based on the stream's configuration.
@@ -305,7 +259,9 @@ def get_subscriptions_for_send_message(
     *,
     realm_id: int,
     stream_id: int,
-    possible_wildcard_mention: bool,
+    topic_name: str,
+    possible_stream_wildcard_mention: bool,
+    topic_participant_user_ids: AbstractSet[int],
     possibly_mentioned_user_ids: AbstractSet[int],
 ) -> QuerySet[Subscription]:
     """This function optimizes an important use case for large
@@ -341,7 +297,7 @@ def get_subscriptions_for_send_message(
         include_deactivated_users=False,
     )
 
-    if possible_wildcard_mention:
+    if possible_stream_wildcard_mention:
         return query
 
     query = query.filter(
@@ -351,10 +307,108 @@ def get_subscriptions_for_send_message(
         | Q(email_notifications=True)
         | (Q(email_notifications=None) & Q(user_profile__enable_stream_email_notifications=True))
         | Q(user_profile_id__in=possibly_mentioned_user_ids)
+        | Q(user_profile_id__in=topic_participant_user_ids)
         | Q(
             user_profile_id__in=AlertWord.objects.filter(realm_id=realm_id).values_list(
                 "user_profile_id"
             )
         )
+        | Q(
+            user_profile_id__in=UserTopic.objects.filter(
+                stream_id=stream_id,
+                topic_name__iexact=topic_name,
+                visibility_policy=UserTopic.VisibilityPolicy.FOLLOWED,
+            ).values_list("user_profile_id")
+        )
     )
     return query
+
+
+def update_all_subscriber_counts_for_user(
+    user_profile: UserProfile, direction: Literal[1, -1]
+) -> None:
+    """
+    Increment/Decrement number of stream subscribers by 1, when reactivating/deactivating user.
+
+    direction -> 1=increment, -1=decrement
+    """
+    get_user_subscribed_streams(user_profile).update(
+        subscriber_count=F("subscriber_count") + direction
+    )
+
+
+def bulk_update_subscriber_counts(
+    direction: Literal[1, -1],
+    streams: dict[int, set[int]],
+) -> None:
+    """Increment/Decrement number of stream subscribers for multiple users.
+
+    direction -> 1=increment, -1=decrement
+    """
+    if len(streams) == 0:
+        return
+
+    # list of tuples (stream_id, delta_subscribers) used as the
+    # columns of the temporary table delta_table.
+    stream_delta_values = [
+        (stream_id, len(subscribers) * direction) for stream_id, subscribers in streams.items()
+    ]
+
+    # The goal here is to update subscriber_count in a bulk efficient way,
+    # letting the database handle the deltas to avoid some race conditions.
+    #
+    # But unlike update_all_subscriber_counts_for_user which uses F()
+    # for a single delta value, we can't use F() to apply different
+    # deltas per row in a single update using ORM, so we use a raw
+    # SQL query.
+    query = sql.SQL(
+        """UPDATE {stream_table}
+            SET subscriber_count = {stream_table}.subscriber_count + delta_table.delta
+            FROM (VALUES %s) AS delta_table(id, delta)
+            WHERE {stream_table}.id = delta_table.id;
+        """
+    ).format(stream_table=sql.Identifier(Stream._meta.db_table))
+
+    cursor = connection.cursor()
+    execute_values(cursor.cursor, query, stream_delta_values)
+
+
+@transaction.atomic(savepoint=False)
+def create_stream_subscription(
+    user_profile: UserProfile,
+    recipient: Recipient,
+    stream: Stream,
+    color: str = Subscription.DEFAULT_STREAM_COLOR,
+) -> None:
+    """
+    Creates a single stream Subscription object, incrementing
+    stream.subscriber_count by 1 if user is active, in the same
+    transaction.
+    """
+
+    # We only create a stream subscription in this function
+    assert recipient.type == Recipient.STREAM
+
+    Subscription.objects.create(
+        recipient=recipient,
+        user_profile=user_profile,
+        is_user_active=user_profile.is_active,
+        color=color,
+    )
+
+    if user_profile.is_active:
+        Stream.objects.filter(id=stream.id).update(subscriber_count=F("subscriber_count") + 1)
+
+
+@transaction.atomic(savepoint=False)
+def bulk_create_stream_subscriptions(  # nocoverage
+    subs: list[Subscription], streams: dict[int, set[int]]
+) -> None:
+    """
+    Bulk create subscripions for streams, incrementing
+    stream.subscriber_count in the same transaction.
+
+    Currently only used in populate_db.
+    """
+    Subscription.objects.bulk_create(subs)
+    bulk_update_subscriber_counts(direction=1, streams=streams)

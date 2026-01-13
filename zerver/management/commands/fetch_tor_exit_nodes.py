@@ -1,12 +1,13 @@
 import os
 from argparse import ArgumentParser
-from typing import Any, Set
+from typing import Any
 
 import orjson
 from django.conf import settings
+from typing_extensions import override
 from urllib3.util import Retry
 
-from zerver.lib.management import ZulipBaseCommand
+from zerver.lib.management import ZulipBaseCommand, abort_cron_during_deploy
 from zerver.lib.outgoing_http import OutgoingSession
 
 
@@ -33,6 +34,7 @@ to a file for access from Django for rate-limiting purposes.
 Does nothing unless RATE_LIMIT_TOR_TOGETHER is enabled.
 """
 
+    @override
     def add_arguments(self, parser: ArgumentParser) -> None:
         parser.add_argument(
             "--max-retries",
@@ -41,16 +43,14 @@ Does nothing unless RATE_LIMIT_TOR_TOGETHER is enabled.
             help="Number of times to retry fetching data from TOR",
         )
 
+    @override
+    @abort_cron_during_deploy
     def handle(self, *args: Any, **options: Any) -> None:
         if not settings.RATE_LIMIT_TOR_TOGETHER:
             return
 
-        certificates = os.environ.get("CUSTOM_CA_CERTIFICATES")
         session = TorDataSession(max_retries=options["max_retries"])
-        response = session.get(
-            "https://check.torproject.org/exit-addresses",
-            verify=certificates,
-        )
+        response = session.get("https://check.torproject.org/exit-addresses")
         response.raise_for_status()
 
         # Format:
@@ -58,7 +58,7 @@ Does nothing unless RATE_LIMIT_TOR_TOGETHER is enabled.
         #     Published 2021-11-02 11:01:07
         #     LastStatus 2021-11-02 23:00:00
         #     ExitAddress 176.10.99.200 2021-11-02 23:17:02
-        exit_nodes: Set[str] = set()
+        exit_nodes: set[str] = set()
         for line in response.text.splitlines():
             if line.startswith("ExitAddress "):
                 exit_nodes.add(line.split()[1])

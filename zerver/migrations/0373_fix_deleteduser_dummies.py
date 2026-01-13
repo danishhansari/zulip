@@ -5,7 +5,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.db import migrations
-from django.db.backends.postgresql.schema import BaseDatabaseSchemaEditor
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 from django.db.migrations.state import StateApps
 
 
@@ -45,7 +45,7 @@ def fix_dummy_users(apps: StateApps, schema_editor: BaseDatabaseSchemaEditor) ->
     """
     do_delete_users had two bugs:
     1. Creating the replacement dummy users with active=True
-    2. Creating the replacement dummy users with email domain set to realm.uri,
+    2. Creating the replacement dummy users with email domain set to realm.url,
     which may not be a valid email domain.
     Prior commits fixed the bugs, and this migration fixes the pre-existing objects.
     """
@@ -83,5 +83,6 @@ class Migration(migrations.Migration):
         migrations.RunPython(
             fix_dummy_users,
             reverse_code=migrations.RunPython.noop,
+            elidable=True,
         )
     ]

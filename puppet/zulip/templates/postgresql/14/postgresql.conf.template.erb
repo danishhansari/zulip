@@ -822,43 +822,62 @@ vacuum_freeze_table_age   = 1800000000
 
 # Performance settings
 max_connections = 1000
-maintenance_work_mem = <%= scope["zulip::profile::postgresql::maintenance_work_mem"] %>MB
-effective_cache_size = <%= scope["zulip::profile::postgresql::effective_cache_size"] %>MB
-work_mem = <%= scope["zulip::profile::postgresql::work_mem"] %>MB
-shared_buffers = <%= scope["zulip::profile::postgresql::shared_buffers"] %>MB
-wal_buffers = 4MB
-checkpoint_completion_target = 0.7
-<% if @random_page_cost != '' -%>
+maintenance_work_mem = <%= @maintenance_work_mem %>
+effective_cache_size = <%= @effective_cache_size %>
+work_mem = <%= @work_mem %>
+shared_buffers = <%= @shared_buffers %>
+<% unless @wal_buffers.nil? -%>
+wal_buffers = <%= @wal_buffers %>
+<% end -%>
+<% unless @min_wal_size.nil? -%>
+min_wal_size = <%= @min_wal_size %>
+<% end -%>
+<% unless @max_wal_size.nil? -%>
+max_wal_size = <%= @max_wal_size %>
+<% end -%>
+<% unless @random_page_cost.nil? -%>
 random_page_cost = <%= @random_page_cost %>
 <% end -%>
-<% if @effective_io_concurrency != '' -%>
+<% unless @effective_io_concurrency.nil? -%>
 effective_io_concurrency = <%= @effective_io_concurrency %>
 <% end -%>
+<% unless @max_worker_processes.nil? -%>
+max_worker_processes = <%= @max_worker_processes %>
+<% end -%>
+<% unless @max_parallel_workers_per_gather.nil? -%>
+max_parallel_workers_per_gather = <%= @max_parallel_workers_per_gather %>
+<% end -%>
+<% unless @max_parallel_workers.nil? -%>
+max_parallel_workers = <%= @max_parallel_workers %>
+<% end -%>
+<% unless @max_parallel_maintenance_workers.nil? -%>
+max_parallel_maintenance_workers = <%= @max_parallel_maintenance_workers %>
+<% end -%>
 
-<% if @listen_addresses != '' -%>
+<% unless @listen_addresses.nil? -%>
 listen_addresses = <%= @listen_addresses %>
 <% end -%>
 
 <% if @s3_backups_bucket != '' -%>
-# Streaming backups and replication
-max_wal_senders = 5
+# WAL backups to S3 (may also be used for replication)
 archive_mode = on
 archive_command = '/usr/bin/timeout 10m /usr/local/bin/env-wal-g wal-push %p'
 restore_command = '/usr/local/bin/env-wal-g wal-fetch "%f" "%p"'
-<% if @replication_primary != '' && @replication_user != '' -%>
+<% end -%>
+<% unless @replication_primary.nil? || @replication_user.nil? -%>
+# Streaming replication
 primary_conninfo = 'host=<%= @replication_primary %> user=<%= @replication_user -%>
 <% if @replication_password != '' %> password=<%= @replication_password %><% end -%>
-<% if @ssl_mode != '' %> sslmode=<%= @ssl_mode %><% end -%>
+<% unless @ssl_mode.nil? %> sslmode=<%= @ssl_mode %><% end -%>
 '
 <% end -%>
-<% end -%>
 
-<% if @ssl_cert_file != '' -%>
-ssl_cert_file = '<%= @ssl_cert_file %>'		# (change requires restart)
+<% unless @ssl_cert_file.nil? -%>
+ssl_cert_file = '<%= @ssl_cert_file %>'
 <% end -%>
-<% if @ssl_key_file != '' -%>
-ssl_key_file = '<%= @ssl_key_file %>'		# (change requires restart)
+<% unless @ssl_key_file.nil? -%>
+ssl_key_file = '<%= @ssl_key_file %>'
 <% end -%>
-<% if @ssl_ca_file != '' -%>
-ssl_ca_file = '<%= @ssl_ca_file %>'		# (change requires restart)
+<% unless @ssl_ca_file.nil? -%>
+ssl_ca_file = '<%= @ssl_ca_file %>'
 <% end -%>

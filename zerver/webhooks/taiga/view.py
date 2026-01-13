@@ -6,37 +6,36 @@ Tips for notification output:
 value should always be in bold; otherwise the subject of US/task
 should be in bold.
 """
-from typing import Dict, List, Optional, Tuple, Union
+
+from typing import TypeAlias
 
 from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_bool, check_none_or, check_string, to_wild_value
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_bool, check_none_or, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import UserProfile
 
-EventType = Dict[str, Union[str, Dict[str, Optional[Union[str, bool]]]]]
-ReturnType = Tuple[WildValue, WildValue]
+EventType: TypeAlias = dict[str, str | dict[str, str | bool | None]]
+ReturnType: TypeAlias = tuple[WildValue, WildValue]
 
 
 @webhook_view("Taiga")
-@has_request_variables
+@typed_endpoint
 def api_taiga_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    message: WildValue = REQ(argument_type="body", converter=to_wild_value),
+    *,
+    message: JsonBodyPayload[WildValue],
 ) -> HttpResponse:
     parsed_events = parse_message(message)
-    content_lines = []
-    for event in parsed_events:
-        content_lines.append(generate_content(event) + "\n")
-    content = "".join(sorted(content_lines))
-    topic = "General"
+    content = "".join(sorted(generate_content(event) + "\n" for event in parsed_events))
+    topic_name = "General"
     if message["data"].get("milestone") and "name" in message["data"]["milestone"]:
-        topic = message["data"]["milestone"]["name"].tame(check_string)
-    check_send_webhook_message(request, user_profile, topic, content)
+        topic_name = message["data"]["milestone"]["name"].tame(check_string)
+    check_send_webhook_message(request, user_profile, topic_name, content)
 
     return json_success(request)
 
@@ -204,10 +203,10 @@ def parse_create_or_delete(
     }
 
 
-def parse_change_event(change_type: str, message: WildValue) -> Optional[EventType]:
+def parse_change_event(change_type: str, message: WildValue) -> EventType | None:
     """Parses change event."""
     evt: EventType = {}
-    values: Dict[str, Optional[Union[str, bool]]] = {
+    values: dict[str, str | bool | None] = {
         "user": get_owner_name(message),
         "user_link": get_owner_link(message),
         "subject": get_subject(message),
@@ -301,9 +300,9 @@ def parse_webhook_test(
 
 def parse_message(
     message: WildValue,
-) -> List[EventType]:
+) -> list[EventType]:
     """Parses the payload by delegating to specialized functions."""
-    events: List[EventType] = []
+    events: list[EventType] = []
     if message["action"].tame(check_string) in ["create", "delete"]:
         events.append(parse_create_or_delete(message))
     elif message["action"].tame(check_string) == "change":

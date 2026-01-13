@@ -1,11 +1,12 @@
 import os
 import re
-from typing import List, Match
+from re import Match
 from xml.etree.ElementTree import Element
 
 from markdown import Extension, Markdown
 from markdown.blockparser import BlockParser
 from markdown.blockprocessors import BlockProcessor
+from typing_extensions import override
 
 from zerver.lib.exceptions import InvalidMarkdownIncludeStatementError
 from zerver.lib.markdown.priorities import BLOCK_PROCESSOR_PRIORITIES
@@ -16,6 +17,7 @@ class IncludeExtension(Extension):
         super().__init__()
         self.base_path = base_path
 
+    @override
     def extendMarkdown(self, md: Markdown) -> None:
         md.parser.blockprocessors.register(
             IncludeBlockProcessor(md.parser, self.base_path),
@@ -25,12 +27,13 @@ class IncludeExtension(Extension):
 
 
 class IncludeBlockProcessor(BlockProcessor):
-    RE = re.compile(r"^ {,3}\{!([^!]+)!\} *$", re.M)
+    RE = re.compile(r"^ {,3}\{!([^!]+)!\} *$", re.MULTILINE)
 
     def __init__(self, parser: BlockParser, base_path: str) -> None:
         super().__init__(parser)
         self.base_path = base_path
 
+    @override
     def test(self, parent: Element, block: str) -> bool:
         return bool(self.RE.search(block))
 
@@ -46,7 +49,8 @@ class IncludeBlockProcessor(BlockProcessor):
 
         return "\n".join(lines)
 
-    def run(self, parent: Element, blocks: List[str]) -> None:
+    @override
+    def run(self, parent: Element, blocks: list[str]) -> None:
         self.parser.state.set("include")
         self.parser.parseChunk(parent, self.RE.sub(self.expand_include, blocks.pop(0)))
         self.parser.state.reset()

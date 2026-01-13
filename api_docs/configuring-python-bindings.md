@@ -3,17 +3,74 @@
 Zulip provides a set of tools that allows interacting with its API more
 easily, called the [Python bindings](https://pypi.python.org/pypi/zulip/).
 One of the most notable use cases for these bindings are bots developed
-using Zulip's [bot framework](/api/writing-bots).
+using Zulip's [bot framework](/help/writing-bots).
 
-In order to use them, you need to configure them with your API key and other
-settings. There are two ways to achieve that:
+In order to use them, you need to configure them with your identity
+(account, API key, and Zulip server URL). There are a few ways to
+achieve that:
 
- - With a file called `.zuliprc`, located in your home directory.
- - With
-   [environment variables](https://en.wikipedia.org/wiki/Environment_variable)
-   set up in your host machine.
+- Using a `zuliprc` file, referenced via the `--config-file` option or
+  the `config_file` option to the `zulip.Client` constructor
+  (recommended for bots).
+- Using a `zuliprc` file in your home directory at `~/.zuliprc`
+  (recommended for your own API key).
+- Using the [environment
+  variables](https://en.wikipedia.org/wiki/Environment_variable)
+  documented below.
+- Using the `--api-key`, `--email`, and `--site` variables as command
+  line parameters.
+- Using the `api_key`, `email`, and `site` parameters to the
+  `zulip.Client` constructor.
 
-A `.zuliprc` file is a plain text document that looks like this:
+## Download a `zuliprc` file
+
+{start_tabs}
+
+{tab|for-a-bot}
+
+{settings_tab|your-bots}
+
+1. In the **Actions** column, click the **manage bot**
+   (<i class="zulip-icon zulip-icon-user-cog"></i>) icon,
+   and scroll down to **Zuliprc configuration**.
+
+1. Click the **download**
+   (<i class="zulip-icon zulip-icon-download"></i>) icon
+   to download the bot's `zuliprc` file, or the **copy**
+   (<i class="zulip-icon zulip-icon-copy"></i>) icon to
+   copy the file's content to your clipboard.
+
+!!! warn ""
+
+    Anyone with a bot's API key can impersonate the bot, so be careful with it!
+
+{tab|for-yourself}
+
+{settings_tab|account-and-privacy}
+
+1. Under **API key**, click **Manage your API key**.
+
+1. Enter your password, and click **Get API key**. If you don't know your
+   password, click **reset it** and follow the
+   instructions from there.
+
+1. Click **Download zuliprc** to download your `zuliprc` file.
+
+1. (optional) If you'd like your credentials to be used by default
+   when using the Zulip API on your computer, move the `zuliprc` file
+   to `~/.zuliprc` in your home directory.
+
+!!! warn ""
+
+    Anyone with your API key can impersonate you, so be doubly careful with it.
+
+{end_tabs}
+
+## Configuration keys and environment variables
+
+`zuliprc` is a configuration file written in the
+[INI file format](https://en.wikipedia.org/wiki/INI_file),
+which contains key-value pairs as shown in the following example:
 
 ```
 [api]
@@ -29,7 +86,7 @@ can be found in the following table:
 <table class="table">
     <thead>
         <tr>
-            <th><code>.zuliprc</code> key</th>
+            <th><code>zuliprc</code> key</th>
             <th>Environment variable</th>
             <th>Required</th>
             <th>Description</th>
@@ -102,3 +159,10 @@ can be found in the following table:
         </td>
     </tr>
 </table>
+
+## Related articles
+
+* [Installation instructions](/api/installation-instructions)
+* [API keys](/api/api-keys)
+* [Running bots](/help/running-bots)
+* [Deploying bots](/help/deploying-bots)

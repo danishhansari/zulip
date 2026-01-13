@@ -2,12 +2,12 @@
 
 from django.conf import settings
 from django.db import migrations, transaction
-from django.db.backends.postgresql.schema import BaseDatabaseSchemaEditor
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 from django.db.migrations.state import StateApps
 from django.utils.timezone import now as timezone_now
 
 # This migration is a copy of
-# zerver/migrations/0402_alter_usertopic_visibility_policy.py" run
+# zerver/migrations/0382_create_role_based_system_groups.py" run
 # for the internal realm only.
 
 
@@ -64,16 +64,15 @@ def create_role_based_system_groups_for_internal_realms(
             # failure, and had already created groups.
             return
 
-        role_system_groups_dict = {}
-        for role in SYSTEM_USER_GROUP_ROLE_MAP:
-            user_group_params = SYSTEM_USER_GROUP_ROLE_MAP[role]
-            user_group = UserGroup(
+        role_system_groups_dict = {
+            role: UserGroup(
                 name=user_group_params["name"],
                 description=user_group_params["description"],
                 realm=realm,
                 is_system_group=True,
             )
-            role_system_groups_dict[role] = user_group
+            for role, user_group_params in SYSTEM_USER_GROUP_ROLE_MAP.items()
+        }
 
         full_members_system_group = UserGroup(
             name="@role:fullmembers",

@@ -5,9 +5,9 @@ from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
 from zerver.lib.exceptions import UnsupportedWebhookEventTypeError
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_string, to_wild_value
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import UserProfile
 
@@ -38,18 +38,19 @@ ALL_EVENT_TYPES = [
 
 
 @webhook_view("Basecamp", all_event_types=ALL_EVENT_TYPES)
-@has_request_variables
+@typed_endpoint
 def api_basecamp_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
+    *,
+    payload: JsonBodyPayload[WildValue],
 ) -> HttpResponse:
     event = get_event_type(payload)
 
     if event not in SUPPORT_EVENTS:
         raise UnsupportedWebhookEventTypeError(event)
 
-    subject = get_project_name(payload)
+    topic_name = get_project_name(payload)
     if event.startswith("document_"):
         body = get_document_body(event, payload)
         event = "document"
@@ -74,7 +75,7 @@ def api_basecamp_webhook(
     else:
         raise UnsupportedWebhookEventTypeError(event)
 
-    check_send_webhook_message(request, user_profile, subject, body, event)
+    check_send_webhook_message(request, user_profile, topic_name, body, event)
     return json_success(request)
 
 
@@ -90,11 +91,11 @@ def get_event_creator(payload: WildValue) -> str:
     return payload["creator"]["name"].tame(check_string)
 
 
-def get_subject_url(payload: WildValue) -> str:
+def get_topic_url(payload: WildValue) -> str:
     return payload["recording"]["app_url"].tame(check_string)
 
 
-def get_subject_title(payload: WildValue) -> str:
+def get_topic_title(payload: WildValue) -> str:
     return payload["recording"]["title"].tame(check_string)
 
 
@@ -128,7 +129,7 @@ def get_questions_answer_body(event: str, payload: WildValue) -> str:
     return template.format(
         user_name=get_event_creator(payload),
         verb=verb,
-        answer_url=get_subject_url(payload),
+        answer_url=get_topic_url(payload),
         question_title=title,
         question_url=question["app_url"].tame(check_string),
     )
@@ -142,7 +143,7 @@ def get_comment_body(event: str, payload: WildValue) -> str:
     return template.format(
         user_name=get_event_creator(payload),
         verb=verb,
-        answer_url=get_subject_url(payload),
+        answer_url=get_topic_url(payload),
         task_title=task["title"].tame(check_string),
         task_url=task["app_url"].tame(check_string),
     )
@@ -166,12 +167,12 @@ def get_todo_body(event: str, payload: WildValue) -> str:
 
 def get_generic_body(event: str, payload: WildValue, prefix: str, template: str) -> str:
     verb = get_verb(event, prefix)
-    title = get_subject_title(payload)
+    title = get_topic_title(payload)
     template = add_punctuation_if_necessary(template, title)
 
     return template.format(
         user_name=get_event_creator(payload),
         verb=verb,
-        title=get_subject_title(payload),
-        url=get_subject_url(payload),
+        title=get_topic_title(payload),
+        url=get_topic_url(payload),
     )

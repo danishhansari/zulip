@@ -1,92 +1,73 @@
-import copy
-import datetime
-import zlib
+import re
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import (
-    Any,
-    Collection,
-    Dict,
-    List,
-    Mapping,
-    Optional,
-    Sequence,
-    Set,
-    Tuple,
-    TypedDict,
-    Union,
-)
+from datetime import datetime, timedelta
+from typing import Any, TypedDict
 
-import ahocorasick
-import orjson
 from django.conf import settings
 from django.db import connection
-from django.db.models import Max, Sum
+from django.db.models import Exists, F, Max, OuterRef, QuerySet, Subquery, Sum
 from django.utils.timezone import now as timezone_now
 from django.utils.translation import gettext as _
-from django_stubs_ext import ValuesQuerySet
+from django_cte import CTE, with_cte
 from psycopg2.sql import SQL
 
 from analytics.lib.counts import COUNT_STATS
 from analytics.models import RealmCount
-from zerver.lib.avatar import get_avatar_field
-from zerver.lib.cache import (
-    cache_set_many,
-    cache_with_key,
-    generic_bulk_cached_fetch,
-    to_dict_cache_key,
-    to_dict_cache_key_id,
-)
-from zerver.lib.display_recipient import bulk_fetch_display_recipients
+from zerver.lib.cache import generic_bulk_cached_fetch, to_dict_cache_key_id
+from zerver.lib.display_recipient import get_display_recipient, get_display_recipient_by_id
 from zerver.lib.exceptions import JsonableError, MissingAuthenticationError
-from zerver.lib.markdown import MessageRenderingResult, markdown_convert, topic_links
-from zerver.lib.markdown import version as markdown_version
-from zerver.lib.mention import MentionData
+from zerver.lib.markdown import MessageRenderingResult
+from zerver.lib.mention import MentionData, sender_can_mention_group
+from zerver.lib.message_cache import MessageDict, extract_message_dict, stringify_message_dict
+from zerver.lib.partial import partial
 from zerver.lib.request import RequestVariableConversionError
 from zerver.lib.stream_subscription import (
+    get_active_subscriptions_for_stream_id,
     get_stream_subscriptions_for_user,
     get_subscribed_stream_recipient_ids_for_user,
     num_subscribers_for_stream_id,
 )
-from zerver.lib.streams import get_web_public_streams_queryset
-from zerver.lib.timestamp import datetime_to_timestamp
-from zerver.lib.topic import DB_TOPIC_NAME, MESSAGE__TOPIC, TOPIC_LINKS, TOPIC_NAME
-from zerver.lib.types import DisplayRecipientT, EditHistoryEvent, UserDisplayRecipient
-from zerver.lib.url_preview.types import UrlEmbedData
-from zerver.lib.user_topics import build_topic_mute_checker, topic_is_muted
+from zerver.lib.streams import (
+    can_access_stream_history,
+    get_web_public_streams_queryset,
+    is_user_in_groups_granting_content_access,
+)
+from zerver.lib.topic import (
+    MESSAGE__TOPIC,
+    RESOLVED_TOPIC_PREFIX,
+    TOPIC_NAME,
+    maybe_rename_general_chat_to_empty_topic,
+    messages_for_topic,
+)
+from zerver.lib.types import FormattedEditHistoryEvent, UserDisplayRecipient
+from zerver.lib.user_groups import UserGroupMembershipDetails, get_recursive_membership_groups
+from zerver.lib.user_topics import build_get_topic_visibility_policy, get_topic_visibility_policy
+from zerver.lib.users import get_inaccessible_user_ids
 from zerver.models import (
-    MAX_TOPIC_NAME_LENGTH,
     Message,
-    Reaction,
+    NamedUserGroup,
     Realm,
     Recipient,
     Stream,
-    SubMessage,
     Subscription,
     UserMessage,
     UserProfile,
-    get_display_recipient_by_id,
-    get_usermessage_by_message_id,
-    query_for_ids,
+    UserTopic,
 )
+from zerver.models.constants import MAX_TOPIC_NAME_LENGTH
+from zerver.models.messages import get_usermessage_by_message_id
+from zerver.models.realms import MessageEditHistoryVisibilityPolicyEnum
+from zerver.models.recipients import DirectMessageGroup
 
 
 class MessageDetailsDict(TypedDict, total=False):
     type: str
     mentioned: bool
-    user_ids: List[int]
+    user_ids: list[int]
     stream_id: int
     topic: str
     unmuted_stream_msg: bool
-
-
-class RawReactionRow(TypedDict):
-    emoji_code: str
-    emoji_name: str
-    message_id: int
-    reaction_type: str
-    user_profile__email: str
-    user_profile__full_name: str
-    user_profile_id: int
 
 
 class RawUnreadStreamDict(TypedDict):
@@ -94,47 +75,47 @@ class RawUnreadStreamDict(TypedDict):
     topic: str
 
 
-class RawUnreadPrivateMessageDict(TypedDict):
+class RawUnreadDirectMessageDict(TypedDict):
     other_user_id: int
 
 
-class RawUnreadHuddleDict(TypedDict):
+class RawUnreadDirectMessageGroupDict(TypedDict):
     user_ids_string: str
 
 
 class RawUnreadMessagesResult(TypedDict):
-    pm_dict: Dict[int, RawUnreadPrivateMessageDict]
-    stream_dict: Dict[int, RawUnreadStreamDict]
-    huddle_dict: Dict[int, RawUnreadHuddleDict]
-    mentions: Set[int]
-    muted_stream_ids: List[int]
-    unmuted_stream_msgs: Set[int]
+    pm_dict: dict[int, RawUnreadDirectMessageDict]
+    stream_dict: dict[int, RawUnreadStreamDict]
+    huddle_dict: dict[int, RawUnreadDirectMessageGroupDict]
+    mentions: set[int]
+    muted_stream_ids: set[int]
+    unmuted_stream_msgs: set[int]
     old_unreads_missing: bool
 
 
 class UnreadStreamInfo(TypedDict):
     stream_id: int
     topic: str
-    unread_message_ids: List[int]
+    unread_message_ids: list[int]
 
 
-class UnreadPrivateMessageInfo(TypedDict):
+class UnreadDirectMessageInfo(TypedDict):
     other_user_id: int
     # Deprecated and misleading synonym for other_user_id
     sender_id: int
-    unread_message_ids: List[int]
+    unread_message_ids: list[int]
 
 
-class UnreadHuddleInfo(TypedDict):
+class UnreadDirectMessageGroupInfo(TypedDict):
     user_ids_string: str
-    unread_message_ids: List[int]
+    unread_message_ids: list[int]
 
 
 class UnreadMessagesResult(TypedDict):
-    pms: List[UnreadPrivateMessageInfo]
-    streams: List[UnreadStreamInfo]
-    huddles: List[UnreadHuddleInfo]
-    mentions: List[int]
+    pms: list[UnreadDirectMessageInfo]
+    streams: list[UnreadStreamInfo]
+    huddles: list[UnreadDirectMessageGroupInfo]
+    mentions: list[int]
     count: int
     old_unreads_missing: bool
 
@@ -143,33 +124,73 @@ class UnreadMessagesResult(TypedDict):
 class SendMessageRequest:
     message: Message
     rendering_result: MessageRenderingResult
-    stream: Optional[Stream]
-    local_id: Optional[str]
-    sender_queue_id: Optional[str]
+    stream: Stream | None
+    sender_muted_stream: bool | None
+    local_id: str | None
+    sender_queue_id: str | None
     realm: Realm
     mention_data: MentionData
-    mentioned_user_groups_map: Dict[int, int]
-    active_user_ids: Set[int]
-    online_push_user_ids: Set[int]
-    pm_mention_push_disabled_user_ids: Set[int]
-    pm_mention_email_disabled_user_ids: Set[int]
-    stream_push_user_ids: Set[int]
-    stream_email_user_ids: Set[int]
-    muted_sender_user_ids: Set[int]
-    um_eligible_user_ids: Set[int]
-    long_term_idle_user_ids: Set[int]
-    default_bot_user_ids: Set[int]
-    service_bot_tuples: List[Tuple[int, int]]
-    all_bot_user_ids: Set[int]
-    wildcard_mention_user_ids: Set[int]
-    links_for_embed: Set[str]
-    widget_content: Optional[Dict[str, Any]]
-    submessages: List[Dict[str, Any]] = field(default_factory=list)
-    deliver_at: Optional[datetime.datetime] = None
-    delivery_type: Optional[str] = None
-    limit_unread_user_ids: Optional[Set[int]] = None
-    service_queue_events: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    mentioned_user_groups_map: dict[int, int]
+    active_user_ids: set[int]
+    online_push_user_ids: set[int]
+    dm_mention_push_disabled_user_ids: set[int]
+    dm_mention_email_disabled_user_ids: set[int]
+    stream_push_user_ids: set[int]
+    stream_email_user_ids: set[int]
+    # IDs of users who have followed the topic the message is being sent to,
+    # and have the followed topic push notifications setting ON.
+    followed_topic_push_user_ids: set[int]
+    # IDs of users who have followed the topic the message is being sent to,
+    # and have the followed topic email notifications setting ON.
+    followed_topic_email_user_ids: set[int]
+    muted_sender_user_ids: set[int]
+    um_eligible_user_ids: set[int]
+    long_term_idle_user_ids: set[int]
+    default_bot_user_ids: set[int]
+    service_bot_tuples: list[tuple[int, int]]
+    all_bot_user_ids: set[int]
+    push_device_registered_user_ids: set[int]
+    # IDs of topic participants who should be notified of topic wildcard mention.
+    # The 'user_allows_notifications_in_StreamTopic' with 'wildcard_mentions_notify'
+    # setting ON should return True.
+    # A user_id can exist in either or both of the 'topic_wildcard_mention_user_ids'
+    # and 'topic_wildcard_mention_in_followed_topic_user_ids' sets.
+    topic_wildcard_mention_user_ids: set[int]
+    # IDs of users subscribed to the stream who should be notified of
+    # stream wildcard mention.
+    # The 'user_allows_notifications_in_StreamTopic' with 'wildcard_mentions_notify'
+    # setting ON should return True.
+    # A user_id can exist in either or both of the 'stream_wildcard_mention_user_ids'
+    # and 'stream_wildcard_mention_in_followed_topic_user_ids' sets.
+    stream_wildcard_mention_user_ids: set[int]
+    # IDs of topic participants who have followed the topic the message
+    # (having topic wildcard) is being sent to, and have the
+    # 'followed_topic_wildcard_mentions_notify' setting ON.
+    topic_wildcard_mention_in_followed_topic_user_ids: set[int]
+    # IDs of users who have followed the topic the message
+    # (having stream wildcard) is being sent to, and have the
+    # 'followed_topic_wildcard_mentions_notify' setting ON.
+    stream_wildcard_mention_in_followed_topic_user_ids: set[int]
+    # A topic participant is anyone who either sent or reacted to messages in the topic.
+    topic_participant_user_ids: set[int]
+    links_for_embed: set[str]
+    widget_content: dict[str, Any] | None
+    submessages: list[dict[str, Any]] = field(default_factory=list)
+    deliver_at: datetime | None = None
+    delivery_type: str | None = None
+    limit_unread_user_ids: set[int] | None = None
+    service_queue_events: dict[str, list[dict[str, Any]]] | None = None
     disable_external_notifications: bool = False
+    automatic_new_visibility_policy: int | None = None
+    recipients_for_user_creation_events: dict[UserProfile, set[int]] | None = None
+    reminder_target_message_id: int | None = None
+    reminder_note: str | None = None
+
+
+@dataclass
+class OnlyMessageFields:
+    select_related: list[str]
+    fields: list[str]
 
 
 # We won't try to fetch more unread message IDs from the database than
@@ -194,543 +215,170 @@ def normalize_body(body: str) -> str:
     return truncate_content(body, settings.MAX_MESSAGE_LENGTH, "\n[message truncated]")
 
 
-def truncate_topic(topic: str) -> str:
-    return truncate_content(topic, MAX_TOPIC_NAME_LENGTH, "...")
+def normalize_body_for_import(body: str) -> str:
+    if "\x00" in body:
+        body = re.sub(r"\x00", "", body)
+    return truncate_content(body, settings.MAX_MESSAGE_LENGTH, "\n[message truncated]")
+
+
+TOPIC_TRUNCATION_MESSAGE = "..."
+
+
+def truncate_topic(topic_name: str) -> str:
+    return truncate_content(topic_name, MAX_TOPIC_NAME_LENGTH, TOPIC_TRUNCATION_MESSAGE)
+
+
+def visible_edit_history_for_message(
+    message_edit_history_visibility_policy: int,
+    edit_history: list[FormattedEditHistoryEvent],
+) -> list[FormattedEditHistoryEvent]:
+    # Makes sure that we send message edit history to clients
+    # in realms as per `message_edit_history_visibility_policy`.
+    if message_edit_history_visibility_policy == MessageEditHistoryVisibilityPolicyEnum.all.value:
+        return edit_history
+
+    visible_edit_history: list[FormattedEditHistoryEvent] = []
+    for edit_history_event in edit_history:
+        if "prev_content" in edit_history_event:
+            if "prev_topic" in edit_history_event:
+                del edit_history_event["prev_content"]
+                del edit_history_event["prev_rendered_content"]
+                del edit_history_event["content_html_diff"]
+            else:
+                continue
+        visible_edit_history.append(edit_history_event)
+
+    return visible_edit_history
+
+
+# This is similar to what we do in build_message_edit_request in
+# zerver/actions/message_edit.py, but since we don't have the
+# pre-truncation topic name in the message edit history object,
+# the logic for the topic resolved case is different here.
+def topic_resolve_toggled(topic: str, prev_topic: str) -> bool:
+    resolved_prefix_len = len(RESOLVED_TOPIC_PREFIX)
+    truncation_len = len(TOPIC_TRUNCATION_MESSAGE)
+    # Topic unresolved
+    if prev_topic.startswith(RESOLVED_TOPIC_PREFIX) and not topic.startswith(RESOLVED_TOPIC_PREFIX):
+        return prev_topic[resolved_prefix_len:] == topic
+
+    # Topic resolved
+    if topic.startswith(RESOLVED_TOPIC_PREFIX) and not prev_topic.startswith(RESOLVED_TOPIC_PREFIX):
+        if len(prev_topic) <= MAX_TOPIC_NAME_LENGTH - resolved_prefix_len:
+            # When the topic was resolved, it was not truncated,
+            # so we remove the resolved prefix and compare.
+            return topic[resolved_prefix_len:] == prev_topic
+        if topic.endswith(TOPIC_TRUNCATION_MESSAGE):
+            # When the topic was resolved, it was likely truncated,
+            # so we confirm the previous topic starts with the topic
+            # without the resolved prefix and truncation message.
+            topic_without_resolved_prefix_and_truncation_message = topic[
+                resolved_prefix_len:-truncation_len
+            ]
+            return prev_topic.startswith(topic_without_resolved_prefix_and_truncation_message)
+
+    return False
 
 
 def messages_for_ids(
-    message_ids: List[int],
-    user_message_flags: Dict[int, List[str]],
-    search_fields: Dict[int, Dict[str, str]],
+    message_ids: list[int],
+    user_message_flags: dict[int, list[str]],
+    search_fields: dict[int, dict[str, str]],
     apply_markdown: bool,
     client_gravatar: bool,
-    allow_edit_history: bool,
-) -> List[Dict[str, Any]]:
-    cache_transformer = MessageDict.build_dict_from_raw_db_row
+    allow_empty_topic_name: bool,
+    message_edit_history_visibility_policy: int,
+    user_profile: UserProfile | None,
+    realm: Realm,
+) -> list[dict[str, Any]]:
     id_fetcher = lambda row: row["id"]
 
     message_dicts = generic_bulk_cached_fetch(
         to_dict_cache_key_id,
-        MessageDict.get_raw_db_rows,
+        MessageDict.ids_to_dict,
         message_ids,
         id_fetcher=id_fetcher,
-        cache_transformer=cache_transformer,
+        cache_transformer=lambda obj: obj,
         extractor=extract_message_dict,
         setter=stringify_message_dict,
+        pickled_tupled=False,
     )
 
-    message_list: List[Dict[str, Any]] = []
+    message_list: list[dict[str, Any]] = []
+
+    sender_ids = [message_dicts[message_id]["sender_id"] for message_id in message_ids]
+    inaccessible_sender_ids = get_inaccessible_user_ids(sender_ids, user_profile)
 
     for message_id in message_ids:
         msg_dict = message_dicts[message_id]
-        msg_dict.update(flags=user_message_flags[message_id])
+        flags = user_message_flags[message_id]
+        # TODO/compatibility: The `wildcard_mentioned` flag was deprecated in favor of
+        # the `stream_wildcard_mentioned` and `topic_wildcard_mentioned` flags.  The
+        # `wildcard_mentioned` flag exists for backwards-compatibility with older
+        # clients.  Remove this when we no longer support legacy clients that have not
+        # been updated to access `stream_wildcard_mentioned`.
+        if "stream_wildcard_mentioned" in flags or "topic_wildcard_mentioned" in flags:
+            flags.append("wildcard_mentioned")
+        msg_dict.update(flags=flags)
         if message_id in search_fields:
             msg_dict.update(search_fields[message_id])
-        # Make sure that we never send message edit history to clients
-        # in realms with allow_edit_history disabled.
-        if "edit_history" in msg_dict and not allow_edit_history:
-            del msg_dict["edit_history"]
+        if "edit_history" in msg_dict:
+            # In addition to computing last_moved_timestamp, we recompute
+            # last_edit_timestamp, because the logic powering the database
+            # field updates it on moves as well, and we'd like to show the
+            # correct value for messages that had only been moved.
+            last_moved_timestamp = 0
+            last_edit_timestamp = 0
+            for item in msg_dict["edit_history"]:
+                if "prev_stream" in item:
+                    last_moved_timestamp = max(last_moved_timestamp, item["timestamp"])
+                elif "prev_topic" in item and not topic_resolve_toggled(
+                    item["topic"], item["prev_topic"]
+                ):
+                    last_moved_timestamp = max(last_moved_timestamp, item["timestamp"])
+                if "prev_content" in item:
+                    last_edit_timestamp = max(last_edit_timestamp, item["timestamp"])
+            if last_moved_timestamp != 0:
+                msg_dict["last_moved_timestamp"] = last_moved_timestamp
+            if last_edit_timestamp != 0:
+                msg_dict["last_edit_timestamp"] = last_edit_timestamp
+            else:
+                # Remove it if it was already present.
+                msg_dict.pop("last_edit_timestamp", None)
+
+            if (
+                message_edit_history_visibility_policy
+                == MessageEditHistoryVisibilityPolicyEnum.none.value
+            ):
+                del msg_dict["edit_history"]
+            else:
+                visible_edit_history = visible_edit_history_for_message(
+                    message_edit_history_visibility_policy, msg_dict["edit_history"]
+                )
+                msg_dict["edit_history"] = visible_edit_history
+
+        msg_dict["can_access_sender"] = msg_dict["sender_id"] not in inaccessible_sender_ids
         message_list.append(msg_dict)
 
-    MessageDict.post_process_dicts(message_list, apply_markdown, client_gravatar)
+    MessageDict.post_process_dicts(
+        message_list,
+        apply_markdown=apply_markdown,
+        client_gravatar=client_gravatar,
+        allow_empty_topic_name=allow_empty_topic_name,
+        realm=realm,
+        user_recipient_id=None if user_profile is None else user_profile.recipient_id,
+    )
 
     return message_list
-
-
-def sew_messages_and_reactions(
-    messages: List[Dict[str, Any]], reactions: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """Given a iterable of messages and reactions stitch reactions
-    into messages.
-    """
-    # Add all messages with empty reaction item
-    for message in messages:
-        message["reactions"] = []
-
-    # Convert list of messages into dictionary to make reaction stitching easy
-    converted_messages = {message["id"]: message for message in messages}
-
-    for reaction in reactions:
-        converted_messages[reaction["message_id"]]["reactions"].append(reaction)
-
-    return list(converted_messages.values())
-
-
-def sew_messages_and_submessages(
-    messages: List[Dict[str, Any]], submessages: List[Dict[str, Any]]
-) -> None:
-    # This is super similar to sew_messages_and_reactions.
-    for message in messages:
-        message["submessages"] = []
-
-    message_dict = {message["id"]: message for message in messages}
-
-    for submessage in submessages:
-        message_id = submessage["message_id"]
-        if message_id in message_dict:
-            message = message_dict[message_id]
-            message["submessages"].append(submessage)
-
-
-def extract_message_dict(message_bytes: bytes) -> Dict[str, Any]:
-    return orjson.loads(zlib.decompress(message_bytes))
-
-
-def stringify_message_dict(message_dict: Dict[str, Any]) -> bytes:
-    return zlib.compress(orjson.dumps(message_dict))
-
-
-@cache_with_key(to_dict_cache_key, timeout=3600 * 24)
-def message_to_dict_json(message: Message, realm_id: Optional[int] = None) -> bytes:
-    return MessageDict.to_dict_uncached([message], realm_id)[message.id]
-
-
-def save_message_rendered_content(message: Message, content: str) -> str:
-    rendering_result = render_markdown(message, content, realm=message.get_realm())
-    rendered_content = None
-    if rendering_result is not None:
-        rendered_content = rendering_result.rendered_content
-    message.rendered_content = rendered_content
-    message.rendered_content_version = markdown_version
-    message.save_rendered_content()
-    return rendered_content
-
-
-class MessageDict:
-    """MessageDict is the core class responsible for marshalling Message
-    objects obtained from the database into a format that can be sent
-    to clients via the Zulip API, whether via `GET /messages`,
-    outgoing webhooks, or other code paths.  There are two core flows through
-    which this class is used:
-
-    * For just-sent messages, we construct a single `wide_dict` object
-      containing all the data for the message and the related
-      UserProfile models (sender_info and recipient_info); this object
-      can be stored in queues, caches, etc., and then later turned
-      into an API-format JSONable dictionary via finalize_payload.
-
-    * When fetching messages from the database, we fetch their data in
-      bulk using messages_for_ids, which makes use of caching, bulk
-      fetches that skip the Django ORM, etc., to provide an optimized
-      interface for fetching hundreds of thousands of messages from
-      the database and then turning them into API-format JSON
-      dictionaries.
-
-    """
-
-    @staticmethod
-    def wide_dict(message: Message, realm_id: Optional[int] = None) -> Dict[str, Any]:
-        """
-        The next two lines get the cacheable field related
-        to our message object, with the side effect of
-        populating the cache.
-        """
-        json = message_to_dict_json(message, realm_id)
-        obj = extract_message_dict(json)
-
-        """
-        The steps below are similar to what we do in
-        post_process_dicts(), except we don't call finalize_payload(),
-        since that step happens later in the queue
-        processor.
-        """
-        MessageDict.bulk_hydrate_sender_info([obj])
-        MessageDict.bulk_hydrate_recipient_info([obj])
-
-        return obj
-
-    @staticmethod
-    def post_process_dicts(
-        objs: List[Dict[str, Any]], apply_markdown: bool, client_gravatar: bool
-    ) -> None:
-        """
-        NOTE: This function mutates the objects in
-              the `objs` list, rather than making
-              shallow copies.  It might be safer to
-              make shallow copies here, but performance
-              is somewhat important here, as we are
-              often fetching hundreds of messages.
-        """
-        MessageDict.bulk_hydrate_sender_info(objs)
-        MessageDict.bulk_hydrate_recipient_info(objs)
-
-        for obj in objs:
-            MessageDict.finalize_payload(obj, apply_markdown, client_gravatar, skip_copy=True)
-
-    @staticmethod
-    def finalize_payload(
-        obj: Dict[str, Any],
-        apply_markdown: bool,
-        client_gravatar: bool,
-        keep_rendered_content: bool = False,
-        skip_copy: bool = False,
-    ) -> Dict[str, Any]:
-        """
-        By default, we make a shallow copy of the incoming dict to avoid
-        mutation-related bugs.  Code paths that are passing a unique object
-        can pass skip_copy=True to avoid this extra work.
-        """
-        if not skip_copy:
-            obj = copy.copy(obj)
-
-        if obj["sender_email_address_visibility"] != UserProfile.EMAIL_ADDRESS_VISIBILITY_EVERYONE:
-            # If email address of the sender is only available to administrators,
-            # clients cannot compute gravatars, so we force-set it to false.
-            # If we plumbed the current user's role, we could allow client_gravatar=True
-            # here if the current user's role has access to the target user's email address.
-            client_gravatar = False
-
-        MessageDict.set_sender_avatar(obj, client_gravatar)
-        if apply_markdown:
-            obj["content_type"] = "text/html"
-            obj["content"] = obj["rendered_content"]
-        else:
-            obj["content_type"] = "text/x-markdown"
-
-        if not keep_rendered_content:
-            del obj["rendered_content"]
-        del obj["sender_realm_id"]
-        del obj["sender_avatar_source"]
-        del obj["sender_delivery_email"]
-        del obj["sender_avatar_version"]
-
-        del obj["recipient_type"]
-        del obj["recipient_type_id"]
-        del obj["sender_is_mirror_dummy"]
-        del obj["sender_email_address_visibility"]
-        return obj
-
-    @staticmethod
-    def sew_submessages_and_reactions_to_msgs(
-        messages: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        msg_ids = [msg["id"] for msg in messages]
-        submessages = SubMessage.get_raw_db_rows(msg_ids)
-        sew_messages_and_submessages(messages, submessages)
-
-        reactions = Reaction.get_raw_db_rows(msg_ids)
-        return sew_messages_and_reactions(messages, reactions)
-
-    @staticmethod
-    def to_dict_uncached(
-        messages: List[Message], realm_id: Optional[int] = None
-    ) -> Dict[int, bytes]:
-        messages_dict = MessageDict.to_dict_uncached_helper(messages, realm_id)
-        encoded_messages = {msg["id"]: stringify_message_dict(msg) for msg in messages_dict}
-        return encoded_messages
-
-    @staticmethod
-    def to_dict_uncached_helper(
-        messages: List[Message], realm_id: Optional[int] = None
-    ) -> List[Dict[str, Any]]:
-        # Near duplicate of the build_message_dict + get_raw_db_rows
-        # code path that accepts already fetched Message objects
-        # rather than message IDs.
-
-        def get_rendering_realm_id(message: Message) -> int:
-            # realm_id can differ among users, currently only possible
-            # with cross realm bots.
-            if realm_id is not None:
-                return realm_id
-            if message.recipient.type == Recipient.STREAM:
-                return Stream.objects.get(id=message.recipient.type_id).realm_id
-            return message.sender.realm_id
-
-        message_rows = [
-            {
-                "id": message.id,
-                DB_TOPIC_NAME: message.topic_name(),
-                "date_sent": message.date_sent,
-                "last_edit_time": message.last_edit_time,
-                "edit_history": message.edit_history,
-                "content": message.content,
-                "rendered_content": message.rendered_content,
-                "rendered_content_version": message.rendered_content_version,
-                "recipient_id": message.recipient.id,
-                "recipient__type": message.recipient.type,
-                "recipient__type_id": message.recipient.type_id,
-                "rendering_realm_id": get_rendering_realm_id(message),
-                "sender_id": message.sender.id,
-                "sending_client__name": message.sending_client.name,
-                "sender__realm_id": message.sender.realm_id,
-            }
-            for message in messages
-        ]
-
-        MessageDict.sew_submessages_and_reactions_to_msgs(message_rows)
-        return [MessageDict.build_dict_from_raw_db_row(row) for row in message_rows]
-
-    @staticmethod
-    def get_raw_db_rows(needed_ids: List[int]) -> List[Dict[str, Any]]:
-        # This is a special purpose function optimized for
-        # callers like get_messages_backend().
-        fields = [
-            "id",
-            DB_TOPIC_NAME,
-            "date_sent",
-            "last_edit_time",
-            "edit_history",
-            "content",
-            "rendered_content",
-            "rendered_content_version",
-            "recipient_id",
-            "recipient__type",
-            "recipient__type_id",
-            "sender_id",
-            "sending_client__name",
-            "sender__realm_id",
-        ]
-        messages = Message.objects.filter(id__in=needed_ids).values(*fields)
-        return MessageDict.sew_submessages_and_reactions_to_msgs(messages)
-
-    @staticmethod
-    def build_dict_from_raw_db_row(row: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        row is a row from a .values() call, and it needs to have
-        all the relevant fields populated
-        """
-        return MessageDict.build_message_dict(
-            message_id=row["id"],
-            last_edit_time=row["last_edit_time"],
-            edit_history_json=row["edit_history"],
-            content=row["content"],
-            topic_name=row[DB_TOPIC_NAME],
-            date_sent=row["date_sent"],
-            rendered_content=row["rendered_content"],
-            rendered_content_version=row["rendered_content_version"],
-            sender_id=row["sender_id"],
-            sender_realm_id=row["sender__realm_id"],
-            sending_client_name=row["sending_client__name"],
-            rendering_realm_id=row.get("rendering_realm_id", row["sender__realm_id"]),
-            recipient_id=row["recipient_id"],
-            recipient_type=row["recipient__type"],
-            recipient_type_id=row["recipient__type_id"],
-            reactions=row["reactions"],
-            submessages=row["submessages"],
-        )
-
-    @staticmethod
-    def build_message_dict(
-        message_id: int,
-        last_edit_time: Optional[datetime.datetime],
-        edit_history_json: Optional[str],
-        content: str,
-        topic_name: str,
-        date_sent: datetime.datetime,
-        rendered_content: Optional[str],
-        rendered_content_version: Optional[int],
-        sender_id: int,
-        sender_realm_id: int,
-        sending_client_name: str,
-        rendering_realm_id: int,
-        recipient_id: int,
-        recipient_type: int,
-        recipient_type_id: int,
-        reactions: List[RawReactionRow],
-        submessages: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        obj = dict(
-            id=message_id,
-            sender_id=sender_id,
-            content=content,
-            recipient_type_id=recipient_type_id,
-            recipient_type=recipient_type,
-            recipient_id=recipient_id,
-            timestamp=datetime_to_timestamp(date_sent),
-            client=sending_client_name,
-        )
-
-        obj[TOPIC_NAME] = topic_name
-        obj["sender_realm_id"] = sender_realm_id
-
-        # Render topic_links with the stream's realm instead of the
-        # sender's realm; this is important for messages sent by
-        # cross-realm bots like NOTIFICATION_BOT.
-        obj[TOPIC_LINKS] = topic_links(rendering_realm_id, topic_name)
-
-        if last_edit_time is not None:
-            obj["last_edit_timestamp"] = datetime_to_timestamp(last_edit_time)
-            assert edit_history_json is not None
-            edit_history: List[EditHistoryEvent] = orjson.loads(edit_history_json)
-            obj["edit_history"] = edit_history
-
-        if Message.need_to_render_content(
-            rendered_content, rendered_content_version, markdown_version
-        ):
-            # We really shouldn't be rendering objects in this method, but there is
-            # a scenario where we upgrade the version of Markdown and fail to run
-            # management commands to re-render historical messages, and then we
-            # need to have side effects.  This method is optimized to not need full
-            # blown ORM objects, but the Markdown renderer is unfortunately highly
-            # coupled to Message, and we also need to persist the new rendered content.
-            # If we don't have a message object passed in, we get one here.  The cost
-            # of going to the DB here should be overshadowed by the cost of rendering
-            # and updating the row.
-            # TODO: see #1379 to eliminate Markdown dependencies
-            message = Message.objects.select_related().get(id=message_id)
-
-            assert message is not None  # Hint for mypy.
-            # It's unfortunate that we need to have side effects on the message
-            # in some cases.
-            rendered_content = save_message_rendered_content(message, content)
-
-        if rendered_content is not None:
-            obj["rendered_content"] = rendered_content
-        else:
-            obj[
-                "rendered_content"
-            ] = "<p>[Zulip note: Sorry, we could not understand the formatting of your message]</p>"
-
-        if rendered_content is not None:
-            obj["is_me_message"] = Message.is_status_message(content, rendered_content)
-        else:
-            obj["is_me_message"] = False
-
-        obj["reactions"] = [
-            ReactionDict.build_dict_from_raw_db_row(reaction) for reaction in reactions
-        ]
-        obj["submessages"] = submessages
-        return obj
-
-    @staticmethod
-    def bulk_hydrate_sender_info(objs: List[Dict[str, Any]]) -> None:
-        sender_ids = list({obj["sender_id"] for obj in objs})
-
-        if not sender_ids:
-            return
-
-        query = UserProfile.objects.values(
-            "id",
-            "full_name",
-            "delivery_email",
-            "email",
-            "realm__string_id",
-            "avatar_source",
-            "avatar_version",
-            "is_mirror_dummy",
-            "email_address_visibility",
-        )
-
-        rows = query_for_ids(query, sender_ids, "zerver_userprofile.id")
-
-        sender_dict = {row["id"]: row for row in rows}
-
-        for obj in objs:
-            sender_id = obj["sender_id"]
-            user_row = sender_dict[sender_id]
-            obj["sender_full_name"] = user_row["full_name"]
-            obj["sender_email"] = user_row["email"]
-            obj["sender_delivery_email"] = user_row["delivery_email"]
-            obj["sender_realm_str"] = user_row["realm__string_id"]
-            obj["sender_avatar_source"] = user_row["avatar_source"]
-            obj["sender_avatar_version"] = user_row["avatar_version"]
-            obj["sender_is_mirror_dummy"] = user_row["is_mirror_dummy"]
-            obj["sender_email_address_visibility"] = user_row["email_address_visibility"]
-
-    @staticmethod
-    def hydrate_recipient_info(obj: Dict[str, Any], display_recipient: DisplayRecipientT) -> None:
-        """
-        This method hyrdrates recipient info with things
-        like full names and emails of senders.  Eventually
-        our clients should be able to hyrdrate these fields
-        themselves with info they already have on users.
-        """
-
-        recipient_type = obj["recipient_type"]
-        recipient_type_id = obj["recipient_type_id"]
-        sender_is_mirror_dummy = obj["sender_is_mirror_dummy"]
-        sender_email = obj["sender_email"]
-        sender_full_name = obj["sender_full_name"]
-        sender_id = obj["sender_id"]
-
-        if recipient_type == Recipient.STREAM:
-            display_type = "stream"
-        elif recipient_type in (Recipient.HUDDLE, Recipient.PERSONAL):
-            assert not isinstance(display_recipient, str)
-            display_type = "private"
-            if len(display_recipient) == 1:
-                # add the sender in if this isn't a message between
-                # someone and themself, preserving ordering
-                recip: UserDisplayRecipient = {
-                    "email": sender_email,
-                    "full_name": sender_full_name,
-                    "id": sender_id,
-                    "is_mirror_dummy": sender_is_mirror_dummy,
-                }
-                if recip["email"] < display_recipient[0]["email"]:
-                    display_recipient = [recip, display_recipient[0]]
-                elif recip["email"] > display_recipient[0]["email"]:
-                    display_recipient = [display_recipient[0], recip]
-        else:
-            raise AssertionError(f"Invalid recipient type {recipient_type}")
-
-        obj["display_recipient"] = display_recipient
-        obj["type"] = display_type
-        if obj["type"] == "stream":
-            obj["stream_id"] = recipient_type_id
-
-    @staticmethod
-    def bulk_hydrate_recipient_info(objs: List[Dict[str, Any]]) -> None:
-        recipient_tuples = {  # We use set to eliminate duplicate tuples.
-            (
-                obj["recipient_id"],
-                obj["recipient_type"],
-                obj["recipient_type_id"],
-            )
-            for obj in objs
-        }
-        display_recipients = bulk_fetch_display_recipients(recipient_tuples)
-
-        for obj in objs:
-            MessageDict.hydrate_recipient_info(obj, display_recipients[obj["recipient_id"]])
-
-    @staticmethod
-    def set_sender_avatar(obj: Dict[str, Any], client_gravatar: bool) -> None:
-        sender_id = obj["sender_id"]
-        sender_realm_id = obj["sender_realm_id"]
-        sender_delivery_email = obj["sender_delivery_email"]
-        sender_avatar_source = obj["sender_avatar_source"]
-        sender_avatar_version = obj["sender_avatar_version"]
-
-        obj["avatar_url"] = get_avatar_field(
-            user_id=sender_id,
-            realm_id=sender_realm_id,
-            email=sender_delivery_email,
-            avatar_source=sender_avatar_source,
-            avatar_version=sender_avatar_version,
-            medium=False,
-            client_gravatar=client_gravatar,
-        )
-
-
-class ReactionDict:
-    @staticmethod
-    def build_dict_from_raw_db_row(row: RawReactionRow) -> Dict[str, Any]:
-        return {
-            "emoji_name": row["emoji_name"],
-            "emoji_code": row["emoji_code"],
-            "reaction_type": row["reaction_type"],
-            # TODO: We plan to remove this redundant user dictionary once
-            # clients are updated to support accessing use user_id.  See
-            # https://github.com/zulip/zulip/pull/14711 for details.
-            #
-            # When we do that, we can likely update the `.values()` query to
-            # not fetch the extra user_profile__* fields from the database
-            # as a small performance optimization.
-            "user": {
-                "email": row["user_profile__email"],
-                "id": row["user_profile_id"],
-                "full_name": row["user_profile__full_name"],
-            },
-            "user_id": row["user_profile_id"],
-        }
 
 
 def access_message(
     user_profile: UserProfile,
     message_id: int,
     lock_message: bool = False,
-) -> Tuple[Message, Optional[UserMessage]]:
+    *,
+    is_modifying_message: bool,
+) -> Message:
     """You can access a message by ID in our APIs that either:
     (1) You received or have previously accessed via starring
         (aka have a UserMessage row for).
@@ -747,7 +395,49 @@ def access_message(
     pass lock_message when inside a @transaction.atomic block.
     """
     try:
-        base_query = Message.objects.select_related()
+        base_query = Message.objects.select_related(*Message.DEFAULT_SELECT_RELATED)
+        if lock_message:
+            # We want to lock only the `Message` row, and not the related fields
+            # because the `Message` row only has a possibility of races.
+            base_query = base_query.select_for_update(of=("self",))
+        message = base_query.get(id=message_id)
+    except Message.DoesNotExist:
+        raise JsonableError(_("Invalid message(s)"))
+
+    has_user_message = lambda: UserMessage.objects.filter(
+        user_profile=user_profile, message_id=message_id
+    ).exists()
+
+    user_group_membership_details = UserGroupMembershipDetails(user_recursive_group_ids=None)
+    if has_message_access(
+        user_profile,
+        message,
+        has_user_message=has_user_message,
+        user_group_membership_details=user_group_membership_details,
+        is_modifying_message=is_modifying_message,
+    ):
+        return message
+    raise JsonableError(_("Invalid message(s)"))
+
+
+def access_message_and_usermessage(
+    user_profile: UserProfile,
+    message_id: int,
+    lock_message: bool = False,
+    *,
+    is_modifying_message: bool,
+    # Fetches only specified fields from Message and related models.
+    # Use for performance-critical paths.
+    only_message_fields: OnlyMessageFields | None = None,
+) -> tuple[Message, UserMessage | None]:
+    """As access_message, but also returns the usermessage, if any."""
+    try:
+        if only_message_fields is None:
+            base_query = Message.objects.select_related(*Message.DEFAULT_SELECT_RELATED)
+        else:
+            base_query = Message.objects.select_related(*only_message_fields.select_related).only(
+                *only_message_fields.fields
+            )
         if lock_message:
             # We want to lock only the `Message` row, and not the related fields
             # because the `Message` row only has a possibility of races.
@@ -757,8 +447,16 @@ def access_message(
         raise JsonableError(_("Invalid message(s)"))
 
     user_message = get_usermessage_by_message_id(user_profile, message_id)
+    has_user_message = lambda: user_message is not None
 
-    if has_message_access(user_profile, message, has_user_message=user_message is not None):
+    user_group_membership_details = UserGroupMembershipDetails(user_recursive_group_ids=None)
+    if has_message_access(
+        user_profile,
+        message,
+        has_user_message=has_user_message,
+        user_group_membership_details=user_group_membership_details,
+        is_modifying_message=is_modifying_message,
+    ):
         return (message, user_message)
     raise JsonableError(_("Invalid message(s)"))
 
@@ -779,11 +477,11 @@ def access_web_public_message(
         raise MissingAuthenticationError
 
     try:
-        message = Message.objects.select_related().get(id=message_id)
+        message = Message.objects.select_related(*Message.DEFAULT_SELECT_RELATED).get(id=message_id)
     except Message.DoesNotExist:
         raise MissingAuthenticationError
 
-    if not message.is_stream_message():
+    if not message.is_channel_message:
         raise MissingAuthenticationError
 
     queryset = get_web_public_streams_queryset(realm)
@@ -795,7 +493,6 @@ def access_web_public_message(
     # These should all have been enforced by the code in
     # get_web_public_streams_queryset
     assert stream.is_web_public
-    assert not stream.deactivated
     assert not stream.invite_only
     assert stream.history_public_to_subscribers
 
@@ -805,13 +502,61 @@ def access_web_public_message(
     return message
 
 
+def has_channel_content_access_helper(
+    stream: Stream,
+    user_profile: UserProfile,
+    user_group_membership_details: UserGroupMembershipDetails,
+    *,
+    is_subscribed: bool | None,
+) -> bool:
+    """
+    Checks whether a user has content access to a channel specifically
+    via being subscribed or group membership.
+
+    Does not consider the implicit permissions associated with web-public
+    or public channels; callers are responsible for that.
+
+    This logic is mirrored in zerver.lib.narrow.get_base_query_for_search.
+    """
+    if is_subscribed is None:
+        assert stream.recipient_id is not None
+        is_user_subscribed = Subscription.objects.filter(
+            user_profile=user_profile, active=True, recipient_id=stream.recipient_id
+        ).exists()
+    else:
+        is_user_subscribed = is_subscribed
+
+    if is_user_subscribed:
+        return True
+
+    if user_profile.is_guest:
+        # All existing groups granting content access have allow_everyone_group=False.
+        #
+        # TODO: is_user_in_groups_granting_content_access needs to
+        # accept at least `is_guest`, and maybe just the user, when we
+        # have groups granting content access with
+        # allow_everyone_group=True.
+        return False
+
+    if user_group_membership_details.user_recursive_group_ids is None:
+        user_group_membership_details.user_recursive_group_ids = set(
+            get_recursive_membership_groups(user_profile).values_list("id", flat=True)
+        )
+
+    return is_user_in_groups_granting_content_access(
+        stream, user_group_membership_details.user_recursive_group_ids
+    )
+
+
 def has_message_access(
     user_profile: UserProfile,
     message: Message,
     *,
-    has_user_message: bool,
-    stream: Optional[Stream] = None,
-    is_subscribed: Optional[bool] = None,
+    has_user_message: Callable[[], bool],
+    stream: Stream | None = None,
+    is_subscribed: bool | None = None,
+    user_group_membership_details: UserGroupMembershipDetails,
+    is_modifying_message: bool,
 ) -> bool:
     """
     Returns whether a user has access to a given message.
@@ -821,13 +566,9 @@ def has_message_access(
     * The optional stream parameter is validated; is_subscribed is not.
     """
 
-    # If you have a user_message object, you have access.
-    if has_user_message:
-        return True
-
     if message.recipient.type != Recipient.STREAM:
-        # You can't access private messages you didn't receive
-        return False
+        # You can only access direct messages you received
+        return has_user_message()
 
     if stream is None:
         stream = Stream.objects.get(id=message.recipient.type_id)
@@ -838,26 +579,123 @@ def has_message_access(
         # You can't access public stream messages in other realms
         return False
 
-    if not stream.is_history_public_to_subscribers():
-        # You can't access messages you didn't directly receive
-        # unless history is public to subscribers.
+    if is_modifying_message and stream.deactivated:
+        # You can't access messages in deactivated streams
         return False
 
     if stream.is_public() and user_profile.can_access_public_streams():
         return True
 
-    # is_history_public_to_subscribers, so check if you're subscribed
-    if is_subscribed is not None:
-        return is_subscribed
+    if not stream.is_history_public_to_subscribers():
+        # Unless history is public to subscribers, you need to both:
+        # (1) Have directly received the message.
+        # AND
+        # (2) Be subscribed to the stream.
+        return has_user_message() and has_channel_content_access_helper(
+            stream, user_profile, user_group_membership_details, is_subscribed=is_subscribed
+        )
 
-    return Subscription.objects.filter(
-        user_profile=user_profile, active=True, recipient=message.recipient
-    ).exists()
+    # is_history_public_to_subscribers, so check if you're subscribed
+    return has_channel_content_access_helper(
+        stream, user_profile, user_group_membership_details, is_subscribed=is_subscribed
+    )
+
+
+def event_recipient_ids_for_action_on_messages(
+    message_ids: list[int],
+    is_channel_message: bool,
+    *,
+    channel: Stream | None = None,
+    exclude_long_term_idle_users: bool = True,
+) -> set[int]:
+    """Returns IDs of users who should receive events when an action
+    (delete, react, etc) is performed on given set of messages, which
+    are expected to all be in a single conversation.
+
+    is_channel_message needs to be passed from the caller to inform about
+    whether we're processing channel or private messages without having
+    to do any work to determine it here in this function.
+    This is independent from the "channel" optional kwarg, in which the caller
+    may pass the relevant channel, but doesn't have to.
+    If needed, the channel will be fetched inside this function.
+
+    This function aligns with the 'has_message_access' above to ensure
+    that events reach only those users who have access to the messages.
+
+    Notably, for performance reasons, we do not send live-update
+    events to everyone who could potentially have a cached copy of a
+    message because they fetched messages in a public channel to which
+    they are not subscribed. Such events are limited to those messages
+    where the user has a UserMessage row (including `historical` rows).
+    """
+    assert len(message_ids) > 0
+
+    def get_user_ids_having_usermessage_row_for_messages(message_ids: list[int]) -> set[int]:
+        """Returns the IDs of users who actually received the messages."""
+        usermessages = UserMessage.objects.filter(message_id__in=message_ids)
+        if exclude_long_term_idle_users:
+            usermessages = usermessages.exclude(user_profile__long_term_idle=True)
+        return set(usermessages.values_list("user_profile_id", flat=True))
+
+    if not is_channel_message:
+        # For DM, event is sent to users who actually received the message.
+        return get_user_ids_having_usermessage_row_for_messages(message_ids)
+
+    if channel is None:
+        sample_message_id = message_ids[0]
+        channel = Stream.objects.get(
+            recipient_id=Subquery(
+                Message.objects.filter(id=sample_message_id).values("recipient_id")[:1]
+            )
+        )
+
+    subscriptions = get_active_subscriptions_for_stream_id(
+        channel.id, include_deactivated_users=False
+    )
+    if exclude_long_term_idle_users:
+        subscriptions = subscriptions.exclude(user_profile__long_term_idle=True)
+    subscriber_ids = set(subscriptions.values_list("user_profile_id", flat=True))
+
+    if not channel.is_history_public_to_subscribers():
+        # For protected history, only users who are subscribed and
+        # received the original message are notified.
+        assert not channel.is_public()
+        user_ids_with_usermessage_row = get_user_ids_having_usermessage_row_for_messages(
+            message_ids
+        )
+        return user_ids_with_usermessage_row & subscriber_ids
+
+    if not channel.is_public():
+        # For private channel with shared history, the set of
+        # users with access is exactly the subscribers.
+        return subscriber_ids
+
+    # The remaining case is public channels with public history. Events are sent to:
+    # 1. Current channel subscribers
+    # 2. Unsubscribed users having usermessage row & channel access.
+    #    * Users who never subscribed but starred or reacted on messages
+    #      (usermessages with historical flag exists for such cases).
+    #    * Users who were initially subscribed and later unsubscribed
+    #      (usermessages exist for messages they received while subscribed).
+    usermessage_rows = UserMessage.objects.filter(message_id__in=message_ids).exclude(
+        # Excluding guests here implements can_access_public_channels.
+        user_profile__role=UserProfile.ROLE_GUEST
+    )
+    if exclude_long_term_idle_users:
+        usermessage_rows = usermessage_rows.exclude(user_profile__long_term_idle=True)
+    user_ids_with_usermessage_row_and_channel_access = set(
+        usermessage_rows.values_list("user_profile_id", flat=True)
+    )
+    return user_ids_with_usermessage_row_and_channel_access | subscriber_ids
 
 
 def bulk_access_messages(
-    user_profile: UserProfile, messages: Collection[Message], *, stream: Optional[Stream] = None
-) -> List[Message]:
+    user_profile: UserProfile,
+    messages: Collection[Message] | QuerySet[Message],
+    *,
+    stream: Stream | None = None,
+    is_modifying_message: bool,
+) -> list[Message]:
     """This function does the full has_message_access check for each
     message.  If stream is provided, it is used to avoid unnecessary
     database queries, and will use exactly 2 bulk queries instead.
@@ -869,7 +707,7 @@ def bulk_access_messages(
     filtered_messages = []
 
     user_message_set = set(
-        bulk_access_messages_expect_usermessage(
+        get_messages_with_usermessage_rows_for_user(
             user_profile.id, [message.id for message in messages]
         )
     )
@@ -888,35 +726,70 @@ def bulk_access_messages(
 
     subscribed_recipient_ids = set(get_subscribed_stream_recipient_ids_for_user(user_profile))
 
+    user_group_membership_details = UserGroupMembershipDetails(user_recursive_group_ids=None)
     for message in messages:
-        has_user_message = message.id in user_message_set
         is_subscribed = message.recipient_id in subscribed_recipient_ids
         if has_message_access(
             user_profile,
             message,
-            has_user_message=has_user_message,
+            has_user_message=partial(lambda m: m.id in user_message_set, message),
             stream=streams.get(message.recipient_id) if stream is None else stream,
             is_subscribed=is_subscribed,
+            user_group_membership_details=user_group_membership_details,
+            is_modifying_message=False,
         ):
             filtered_messages.append(message)
     return filtered_messages
 
 
-def bulk_access_messages_expect_usermessage(
-    user_profile_id: int, message_ids: Sequence[int]
-) -> ValuesQuerySet[UserMessage, int]:
+def bulk_access_stream_messages_query(
+    user_profile: UserProfile, messages: QuerySet[Message], stream: Stream
+) -> QuerySet[Message]:
+    """This function mirrors bulk_access_messages, above, but applies the
+    limits to a QuerySet and returns a new QuerySet which only
+    contains messages in the given stream which the user can access.
+    Note that this only works with streams.  It may return an empty
+    QuerySet if the user has access to no messages (for instance, for
+    a private stream which the user is not subscribed to).
+
+    This logic is mirrored in zerver.lib.narrow.get_base_query_for_search.
     """
-    Like bulk_access_messages, but faster and potentially stricter.
 
+    assert stream.recipient_id is not None
+    messages = messages.filter(realm_id=user_profile.realm_id, recipient_id=stream.recipient_id)
+
+    if stream.is_public() and user_profile.can_access_public_streams():
+        return messages
+
+    user_group_membership_details = UserGroupMembershipDetails(user_recursive_group_ids=None)
+    has_content_access = has_channel_content_access_helper(
+        stream, user_profile, user_group_membership_details, is_subscribed=None
+    )
+
+    if not has_content_access:
+        return Message.objects.none()
+    if not stream.is_history_public_to_subscribers():
+        messages = messages.alias(
+            has_usermessage=Exists(
+                UserMessage.objects.filter(
+                    user_profile_id=user_profile.id, message_id=OuterRef("id")
+                )
+            )
+        ).filter(has_usermessage=True)
+    return messages
+
+
+def get_messages_with_usermessage_rows_for_user(
+    user_profile_id: int, message_ids: Sequence[int]
+) -> QuerySet[UserMessage, int]:
+    """
     Returns a subset of `message_ids` containing only messages the
-    user can access.  Makes O(1) database queries.
+    user has a UserMessage for.  Makes O(1) database queries.
+    Note that this is not sufficient for access verification for
+    stream messages.
 
-    Use this function only when the user is expected to have a
-    UserMessage row for every message in `message_ids`.  If a
-    UserMessage row is missing, the message will be omitted even if
-    the user has access (e.g. because it went to a public stream.)
-
-    See also: `access_message`, `bulk_access_messages`.
+    See `access_message`, `bulk_access_messages` for proper message access
+    checks that follow our security model.
     """
     return UserMessage.objects.filter(
         user_profile_id=user_profile_id,
@@ -924,57 +797,19 @@ def bulk_access_messages_expect_usermessage(
     ).values_list("message_id", flat=True)
 
 
-def render_markdown(
-    message: Message,
-    content: str,
-    realm: Optional[Realm] = None,
-    realm_alert_words_automaton: Optional[ahocorasick.Automaton] = None,
-    url_embed_data: Optional[Dict[str, Optional[UrlEmbedData]]] = None,
-    mention_data: Optional[MentionData] = None,
-    email_gateway: bool = False,
-) -> MessageRenderingResult:
-    """
-    This is basically just a wrapper for do_render_markdown.
-    """
-
-    if realm is None:
-        realm = message.get_realm()
-
-    sender = message.sender
-    sent_by_bot = sender.is_bot
-    translate_emoticons = sender.translate_emoticons
-
-    rendering_result = markdown_convert(
-        content,
-        realm_alert_words_automaton=realm_alert_words_automaton,
-        message=message,
-        message_realm=realm,
-        sent_by_bot=sent_by_bot,
-        translate_emoticons=translate_emoticons,
-        url_embed_data=url_embed_data,
-        mention_data=mention_data,
-        email_gateway=email_gateway,
-    )
-
-    return rendering_result
-
-
-def huddle_users(recipient_id: int) -> str:
-    display_recipient: DisplayRecipientT = get_display_recipient_by_id(
+def direct_message_group_users(recipient_id: int) -> str:
+    display_recipient: list[UserDisplayRecipient] = get_display_recipient_by_id(
         recipient_id,
-        Recipient.HUDDLE,
+        Recipient.DIRECT_MESSAGE_GROUP,
         None,
     )
 
-    # str is for streams.
-    assert not isinstance(display_recipient, str)
-
-    user_ids: List[int] = [obj["id"] for obj in display_recipient]
+    user_ids: list[int] = [obj["id"] for obj in display_recipient]
     user_ids = sorted(user_ids)
     return ",".join(str(uid) for uid in user_ids)
 
 
-def get_inactive_recipient_ids(user_profile: UserProfile) -> List[int]:
+def get_inactive_recipient_ids(user_profile: UserProfile) -> list[int]:
     rows = (
         get_stream_subscriptions_for_user(user_profile)
         .filter(
@@ -988,7 +823,7 @@ def get_inactive_recipient_ids(user_profile: UserProfile) -> List[int]:
     return inactive_recipient_ids
 
 
-def get_muted_stream_ids(user_profile: UserProfile) -> List[int]:
+def get_muted_stream_ids(user_profile: UserProfile) -> set[int]:
     rows = (
         get_stream_subscriptions_for_user(user_profile)
         .filter(
@@ -999,16 +834,16 @@ def get_muted_stream_ids(user_profile: UserProfile) -> List[int]:
             "recipient__type_id",
         )
     )
-    muted_stream_ids = [row["recipient__type_id"] for row in rows]
+    muted_stream_ids = {row["recipient__type_id"] for row in rows}
     return muted_stream_ids
 
 
-def get_starred_message_ids(user_profile: UserProfile) -> List[int]:
+def get_starred_message_ids(user_profile: UserProfile) -> list[int]:
     return list(
         UserMessage.objects.filter(
             user_profile=user_profile,
         )
-        .extra(
+        .extra(  # noqa: S610
             where=[UserMessage.where_starred()],
         )
         .order_by(
@@ -1019,26 +854,31 @@ def get_starred_message_ids(user_profile: UserProfile) -> List[int]:
 
 
 def get_raw_unread_data(
-    user_profile: UserProfile, message_ids: Optional[List[int]] = None
+    user_profile: UserProfile, message_ids: list[int] | None = None
 ) -> RawUnreadMessagesResult:
     excluded_recipient_ids = get_inactive_recipient_ids(user_profile)
-
+    first_visible_message_id = get_first_visible_message_id(user_profile.realm)
     user_msgs = (
         UserMessage.objects.filter(
             user_profile=user_profile,
+            message_id__gte=first_visible_message_id,
         )
         .exclude(
             message__recipient_id__in=excluded_recipient_ids,
         )
+        .annotate(
+            recipient_id=F("message__recipient_id"),
+            sender_id=F("message__sender_id"),
+            topic=F(MESSAGE__TOPIC),
+        )
         .values(
             "message_id",
-            "message__sender_id",
-            MESSAGE__TOPIC,
-            "message__recipient_id",
-            "message__recipient__type",
-            "message__recipient__type_id",
+            "sender_id",
+            "topic",
             "flags",
+            "recipient_id",
         )
+        # Descending order, so truncation keeps the latest unreads.
         .order_by("-message_id")
     )
 
@@ -1048,33 +888,77 @@ def get_raw_unread_data(
         user_msgs = user_msgs.filter(message_id__in=message_ids)
     else:
         # At page load we need all unread messages.
-        user_msgs = user_msgs.extra(
+        user_msgs = user_msgs.extra(  # noqa: S610
             where=[UserMessage.where_unread()],
         )
 
-    # Limit unread messages for performance reasons.
-    user_msgs = list(user_msgs[:MAX_UNREAD_MESSAGES])
+    with connection.cursor() as cursor:
+        try:
+            # Force-disable (parallel) bitmap heap scans.  The
+            # parallel nature of this means that the LIMIT cannot be
+            # pushed down into the walk of the index, and it also
+            # requires an additional outer sort -- which is all
+            # unnecessary, as the zerver_usermessage_unread_message_id
+            # index is properly ordered already.  This is all due to
+            # statistics mis-estimations, since partial indexes do not
+            # have their own statistics.
+            cursor.execute("SET enable_bitmapscan TO off")
 
-    rows = list(reversed(user_msgs))
-    return extract_unread_data_from_um_rows(rows, user_profile)
+            # Limit unread messages for performance reasons.  We do this
+            # inside a CTE, such that the join to Recipients, below, can't be
+            # implied to remove rows, and thus allows a Nested Loop join,
+            # potentially memoized to reduce the number of Recipient lookups.
+            cte = CTE(user_msgs[:MAX_UNREAD_MESSAGES])
+
+            user_msgs = (
+                with_cte(cte, select=cte.join(Recipient, id=cte.col.recipient_id))
+                .annotate(
+                    message_id=cte.col.message_id,
+                    sender_id=cte.col.sender_id,
+                    recipient_id=cte.col.recipient_id,
+                    topic=cte.col.topic,
+                    flags=cte.col.flags,
+                    recipient__type=F("type"),
+                    recipient__type_id=F("type_id"),
+                )
+                .values(
+                    "message_id",
+                    "sender_id",
+                    "topic",
+                    "flags",
+                    "recipient_id",
+                    "recipient__type",
+                    "recipient__type_id",
+                )
+                # Output in ascending order. We can't just reverse,
+                # since the CTE join does not guarantee that it
+                # preserves the original descending order.
+                .order_by("message_id")
+            )
+
+            rows = list(user_msgs)
+        finally:
+            cursor.execute("SET enable_bitmapscan TO on")
+        return extract_unread_data_from_um_rows(rows, user_profile)
 
 
 def extract_unread_data_from_um_rows(
-    rows: List[Dict[str, Any]], user_profile: Optional[UserProfile]
+    rows: list[dict[str, Any]], user_profile: UserProfile | None
 ) -> RawUnreadMessagesResult:
-    pm_dict: Dict[int, RawUnreadPrivateMessageDict] = {}
-    stream_dict: Dict[int, RawUnreadStreamDict] = {}
-    unmuted_stream_msgs: Set[int] = set()
-    huddle_dict: Dict[int, RawUnreadHuddleDict] = {}
-    mentions: Set[int] = set()
+    pm_dict: dict[int, RawUnreadDirectMessageDict] = {}
+    stream_dict: dict[int, RawUnreadStreamDict] = {}
+    muted_stream_ids: set[int] = set()
+    unmuted_stream_msgs: set[int] = set()
+    direct_message_group_dict: dict[int, RawUnreadDirectMessageGroupDict] = {}
+    mentions: set[int] = set()
     total_unreads = 0
 
     raw_unread_messages: RawUnreadMessagesResult = dict(
         pm_dict=pm_dict,
         stream_dict=stream_dict,
-        muted_stream_ids=[],
+        muted_stream_ids=muted_stream_ids,
         unmuted_stream_msgs=unmuted_stream_msgs,
-        huddle_dict=huddle_dict,
+        huddle_dict=direct_message_group_dict,
         mentions=mentions,
         old_unreads_missing=False,
     )
@@ -1085,13 +969,23 @@ def extract_unread_data_from_um_rows(
     muted_stream_ids = get_muted_stream_ids(user_profile)
     raw_unread_messages["muted_stream_ids"] = muted_stream_ids
 
-    topic_mute_checker = build_topic_mute_checker(user_profile)
+    get_topic_visibility_policy = build_get_topic_visibility_policy(user_profile)
 
-    def is_row_muted(stream_id: int, recipient_id: int, topic: str) -> bool:
-        if stream_id in muted_stream_ids:
+    def is_row_muted(stream_id: int, recipient_id: int, topic_name: str) -> bool:
+        stream_muted = stream_id in muted_stream_ids
+        visibility_policy = get_topic_visibility_policy(recipient_id, topic_name)
+
+        if stream_muted and visibility_policy in [
+            UserTopic.VisibilityPolicy.UNMUTED,
+            UserTopic.VisibilityPolicy.FOLLOWED,
+        ]:
+            return False
+
+        if stream_muted:
             return True
 
-        if topic_mute_checker(recipient_id, topic):
+        # muted topic in unmuted stream
+        if visibility_policy == UserTopic.VisibilityPolicy.MUTED:
             return True
 
         # Messages sent by muted users are never unread, so we don't
@@ -1099,36 +993,36 @@ def extract_unread_data_from_um_rows(
 
         return False
 
-    huddle_cache: Dict[int, str] = {}
+    direct_message_group_cache: dict[int, str] = {}
 
-    def get_huddle_users(recipient_id: int) -> str:
-        if recipient_id in huddle_cache:
-            return huddle_cache[recipient_id]
+    def get_direct_message_group_users(recipient_id: int) -> str:
+        if recipient_id in direct_message_group_cache:
+            return direct_message_group_cache[recipient_id]
 
-        user_ids_string = huddle_users(recipient_id)
-        huddle_cache[recipient_id] = user_ids_string
+        user_ids_string = direct_message_group_users(recipient_id)
+        direct_message_group_cache[recipient_id] = user_ids_string
         return user_ids_string
 
     for row in rows:
         total_unreads += 1
         message_id = row["message_id"]
-        msg_type = row["message__recipient__type"]
-        recipient_id = row["message__recipient_id"]
-        sender_id = row["message__sender_id"]
+        msg_type = row["recipient__type"]
+        recipient_id = row["recipient_id"]
+        sender_id = row["sender_id"]
 
         if msg_type == Recipient.STREAM:
-            stream_id = row["message__recipient__type_id"]
-            topic = row[MESSAGE__TOPIC]
+            stream_id = row["recipient__type_id"]
+            topic_name = row["topic"]
             stream_dict[message_id] = dict(
                 stream_id=stream_id,
-                topic=topic,
+                topic=topic_name,
             )
-            if not is_row_muted(stream_id, recipient_id, topic):
+            if not is_row_muted(stream_id, recipient_id, topic_name):
                 unmuted_stream_msgs.add(message_id)
 
         elif msg_type == Recipient.PERSONAL:
             if sender_id == user_profile.id:
-                other_user_id = row["message__recipient__type_id"]
+                other_user_id = row["recipient__type_id"]
             else:
                 other_user_id = sender_id
 
@@ -1136,24 +1030,46 @@ def extract_unread_data_from_um_rows(
                 other_user_id=other_user_id,
             )
 
-        elif msg_type == Recipient.HUDDLE:
-            user_ids_string = get_huddle_users(recipient_id)
-            huddle_dict[message_id] = dict(
-                user_ids_string=user_ids_string,
-            )
+        elif msg_type == Recipient.DIRECT_MESSAGE_GROUP:
+            user_ids_string = get_direct_message_group_users(recipient_id)
+            user_ids = [int(uid) for uid in user_ids_string.split(",")]
+
+            # For API compatibility, we populate pm_dict for 1:1 and self DMs
+            # so clients relying on pm_dict continue to work during the migration.
+            # We populate direct_message_group_dict for group size > 2.
+            if len(user_ids) <= 2:
+                if len(user_ids) == 1:
+                    # For self-DM, other_user_id is the user's own id
+                    other_user_id = user_ids[0]
+                else:
+                    # For 1:1 DM, other_user_id is the other participant
+                    other_user_id = user_ids[1] if user_ids[0] == user_profile.id else user_ids[0]
+
+                pm_dict[message_id] = dict(
+                    other_user_id=other_user_id,
+                )
+            else:
+                direct_message_group_dict[message_id] = dict(
+                    user_ids_string=user_ids_string,
+                )
 
         # TODO: Add support for alert words here as well.
         is_mentioned = (row["flags"] & UserMessage.flags.mentioned) != 0
-        is_wildcard_mentioned = (row["flags"] & UserMessage.flags.wildcard_mentioned) != 0
+        is_stream_wildcard_mentioned = (
+            row["flags"] & UserMessage.flags.stream_wildcard_mentioned
+        ) != 0
+        is_topic_wildcard_mentioned = (
+            row["flags"] & UserMessage.flags.topic_wildcard_mentioned
+        ) != 0
         if is_mentioned:
             mentions.add(message_id)
-        if is_wildcard_mentioned:
+        if is_stream_wildcard_mentioned or is_topic_wildcard_mentioned:
             if msg_type == Recipient.STREAM:
-                stream_id = row["message__recipient__type_id"]
-                topic = row[MESSAGE__TOPIC]
-                if not is_row_muted(stream_id, recipient_id, topic):
+                stream_id = row["recipient__type_id"]
+                topic_name = row["topic"]
+                if not is_row_muted(stream_id, recipient_id, topic_name):
                     mentions.add(message_id)
-            else:  # nocoverage # TODO: Test wildcard mentions in PMs.
+            else:  # nocoverage # TODO: Test wildcard mentions in direct messages.
                 mentions.add(message_id)
 
     # Record whether the user had more than MAX_UNREAD_MESSAGES total
@@ -1164,16 +1080,20 @@ def extract_unread_data_from_um_rows(
     return raw_unread_messages
 
 
-def aggregate_streams(*, input_dict: Dict[int, RawUnreadStreamDict]) -> List[UnreadStreamInfo]:
-    lookup_dict: Dict[Tuple[int, str], UnreadStreamInfo] = {}
+def aggregate_streams(
+    *, input_dict: dict[int, RawUnreadStreamDict], allow_empty_topic_name: bool
+) -> list[UnreadStreamInfo]:
+    lookup_dict: dict[tuple[int, str], UnreadStreamInfo] = {}
     for message_id, attribute_dict in input_dict.items():
         stream_id = attribute_dict["stream_id"]
-        topic = attribute_dict["topic"]
-        lookup_key = (stream_id, topic)
+        topic_name = attribute_dict["topic"]
+        if topic_name == "" and not allow_empty_topic_name:
+            topic_name = Message.EMPTY_TOPIC_FALLBACK_NAME
+        lookup_key = (stream_id, topic_name.lower())
         if lookup_key not in lookup_dict:
             obj = UnreadStreamInfo(
                 stream_id=stream_id,
-                topic=topic,
+                topic=topic_name,
                 unread_message_ids=[],
             )
             lookup_dict[lookup_key] = obj
@@ -1190,16 +1110,16 @@ def aggregate_streams(*, input_dict: Dict[int, RawUnreadStreamDict]) -> List[Unr
 
 
 def aggregate_pms(
-    *, input_dict: Dict[int, RawUnreadPrivateMessageDict]
-) -> List[UnreadPrivateMessageInfo]:
-    lookup_dict: Dict[int, UnreadPrivateMessageInfo] = {}
+    *, input_dict: dict[int, RawUnreadDirectMessageDict]
+) -> list[UnreadDirectMessageInfo]:
+    lookup_dict: dict[int, UnreadDirectMessageInfo] = {}
     for message_id, attribute_dict in input_dict.items():
         other_user_id = attribute_dict["other_user_id"]
         if other_user_id not in lookup_dict:
             # The `sender_id` field here is only supported for
             # legacy mobile clients. Its actual semantics are the same
             # as `other_user_id`.
-            obj = UnreadPrivateMessageInfo(
+            obj = UnreadDirectMessageInfo(
                 other_user_id=other_user_id,
                 sender_id=other_user_id,
                 unread_message_ids=[],
@@ -1217,12 +1137,14 @@ def aggregate_pms(
     return [lookup_dict[k] for k in sorted_keys]
 
 
-def aggregate_huddles(*, input_dict: Dict[int, RawUnreadHuddleDict]) -> List[UnreadHuddleInfo]:
-    lookup_dict: Dict[str, UnreadHuddleInfo] = {}
+def aggregate_direct_message_groups(
+    *, input_dict: dict[int, RawUnreadDirectMessageGroupDict]
+) -> list[UnreadDirectMessageGroupInfo]:
+    lookup_dict: dict[str, UnreadDirectMessageGroupInfo] = {}
     for message_id, attribute_dict in input_dict.items():
         user_ids_string = attribute_dict["user_ids_string"]
         if user_ids_string not in lookup_dict:
-            obj = UnreadHuddleInfo(
+            obj = UnreadDirectMessageGroupInfo(
                 user_ids_string=user_ids_string,
                 unread_message_ids=[],
             )
@@ -1239,23 +1161,27 @@ def aggregate_huddles(*, input_dict: Dict[int, RawUnreadHuddleDict]) -> List[Unr
     return [lookup_dict[k] for k in sorted_keys]
 
 
-def aggregate_unread_data(raw_data: RawUnreadMessagesResult) -> UnreadMessagesResult:
+def aggregate_unread_data(
+    raw_data: RawUnreadMessagesResult, allow_empty_topic_name: bool
+) -> UnreadMessagesResult:
     pm_dict = raw_data["pm_dict"]
     stream_dict = raw_data["stream_dict"]
     unmuted_stream_msgs = raw_data["unmuted_stream_msgs"]
-    huddle_dict = raw_data["huddle_dict"]
+    direct_message_group_dict = raw_data["huddle_dict"]
     mentions = list(raw_data["mentions"])
 
-    count = len(pm_dict) + len(unmuted_stream_msgs) + len(huddle_dict)
+    count = len(pm_dict) + len(unmuted_stream_msgs) + len(direct_message_group_dict)
 
     pm_objects = aggregate_pms(input_dict=pm_dict)
-    stream_objects = aggregate_streams(input_dict=stream_dict)
-    huddle_objects = aggregate_huddles(input_dict=huddle_dict)
+    stream_objects = aggregate_streams(
+        input_dict=stream_dict, allow_empty_topic_name=allow_empty_topic_name
+    )
+    direct_message_groups = aggregate_direct_message_groups(input_dict=direct_message_group_dict)
 
     result: UnreadMessagesResult = dict(
         pms=pm_objects,
         streams=stream_objects,
-        huddles=huddle_objects,
+        huddles=direct_message_groups,
         mentions=mentions,
         count=count,
         old_unreads_missing=raw_data["old_unreads_missing"],
@@ -1267,43 +1193,50 @@ def aggregate_unread_data(raw_data: RawUnreadMessagesResult) -> UnreadMessagesRe
 def apply_unread_message_event(
     user_profile: UserProfile,
     state: RawUnreadMessagesResult,
-    message: Dict[str, Any],
-    flags: List[str],
+    message: dict[str, Any],
+    flags: list[str],
 ) -> None:
     message_id = message["id"]
     if message["type"] == "stream":
-        message_type = "stream"
+        recipient_type = "stream"
     elif message["type"] == "private":
         others = [recip for recip in message["display_recipient"] if recip["id"] != user_profile.id]
         if len(others) <= 1:
-            message_type = "private"
+            recipient_type = "private"
         else:
-            message_type = "huddle"
+            recipient_type = "huddle"
     else:
         raise AssertionError("Invalid message type {}".format(message["type"]))
 
-    if message_type == "stream":
+    if recipient_type == "stream":
         stream_id = message["stream_id"]
-        topic = message[TOPIC_NAME]
+        topic_name = message[TOPIC_NAME]
         state["stream_dict"][message_id] = RawUnreadStreamDict(
             stream_id=stream_id,
-            topic=topic,
+            topic=topic_name,
         )
 
-        if (
-            stream_id not in state["muted_stream_ids"]
-            # This next check hits the database.
-            and not topic_is_muted(user_profile, stream_id, topic)
+        stream_muted = stream_id in state["muted_stream_ids"]
+        visibility_policy = get_topic_visibility_policy(
+            user_profile, stream_id, topic_name=maybe_rename_general_chat_to_empty_topic(topic_name)
+        )
+        # A stream message is unmuted if it belongs to:
+        # * a not muted topic in a normal stream
+        # * an unmuted or followed topic in a muted stream
+        if (not stream_muted and visibility_policy != UserTopic.VisibilityPolicy.MUTED) or (
+            stream_muted
+            and visibility_policy
+            in [UserTopic.VisibilityPolicy.UNMUTED, UserTopic.VisibilityPolicy.FOLLOWED]
         ):
             state["unmuted_stream_msgs"].add(message_id)
 
-    elif message_type == "private":
+    elif recipient_type == "private":
         if len(others) == 1:
             other_user_id = others[0]["id"]
         else:
             other_user_id = user_profile.id
 
-        state["pm_dict"][message_id] = RawUnreadPrivateMessageDict(
+        state["pm_dict"][message_id] = RawUnreadDirectMessageDict(
             other_user_id=other_user_id,
         )
 
@@ -1313,13 +1246,15 @@ def apply_unread_message_event(
         user_ids = sorted(user_ids)
         user_ids_string = ",".join(str(uid) for uid in user_ids)
 
-        state["huddle_dict"][message_id] = RawUnreadHuddleDict(
+        state["huddle_dict"][message_id] = RawUnreadDirectMessageGroupDict(
             user_ids_string=user_ids_string,
         )
 
     if "mentioned" in flags:
         state["mentions"].add(message_id)
-    if "wildcard_mentioned" in flags and message_id in state["unmuted_stream_msgs"]:
+    if (
+        "stream_wildcard_mentioned" in flags or "topic_wildcard_mentioned" in flags
+    ) and message_id in state["unmuted_stream_msgs"]:
         state["mentions"].add(message_id)
 
 
@@ -1336,7 +1271,7 @@ def remove_message_id_from_unread_mgs(state: RawUnreadMessagesResult, message_id
 def format_unread_message_details(
     my_user_id: int,
     raw_unread_data: RawUnreadMessagesResult,
-) -> Dict[str, MessageDetailsDict]:
+) -> dict[str, MessageDetailsDict]:
     unread_data = {}
 
     for message_id, private_message_details in raw_unread_data["pm_dict"].items():
@@ -1373,9 +1308,11 @@ def format_unread_message_details(
     for message_id, huddle_message_details in raw_unread_data["huddle_dict"].items():
         # The client wants a list of user_ids in the conversation, excluding ourself,
         # that is sorted in numerical order.
-        user_ids = [int(s) for s in huddle_message_details["user_ids_string"].split(",")]
-        user_ids = [user_id for user_id in user_ids if user_id != my_user_id]
-        user_ids.sort()
+        user_ids = sorted(
+            user_id
+            for s in huddle_message_details["user_ids_string"].split(",")
+            if (user_id := int(s)) != my_user_id
+        )
         message_details = MessageDetailsDict(
             type="private",
             user_ids=user_ids,
@@ -1397,20 +1334,20 @@ def add_message_to_unread_msgs(
         state["mentions"].add(message_id)
 
     if message_details["type"] == "private":
-        user_ids: List[int] = message_details["user_ids"]
+        user_ids: list[int] = message_details["user_ids"]
         user_ids = [user_id for user_id in user_ids if user_id != my_user_id]
         if user_ids == []:
-            state["pm_dict"][message_id] = RawUnreadPrivateMessageDict(
+            state["pm_dict"][message_id] = RawUnreadDirectMessageDict(
                 other_user_id=my_user_id,
             )
         elif len(user_ids) == 1:
-            state["pm_dict"][message_id] = RawUnreadPrivateMessageDict(
+            state["pm_dict"][message_id] = RawUnreadDirectMessageDict(
                 other_user_id=user_ids[0],
             )
         else:
             user_ids.append(my_user_id)
             user_ids_string = ",".join(str(user_id) for user_id in sorted(user_ids))
-            state["huddle_dict"][message_id] = RawUnreadHuddleDict(
+            state["huddle_dict"][message_id] = RawUnreadDirectMessageGroupDict(
                 user_ids_string=user_ids_string,
             )
     elif message_details["type"] == "stream":
@@ -1424,7 +1361,7 @@ def add_message_to_unread_msgs(
 
 def estimate_recent_messages(realm: Realm, hours: int) -> int:
     stat = COUNT_STATS["messages_sent:is_bot:hour"]
-    d = timezone_now() - datetime.timedelta(hours=hours)
+    d = timezone_now() - timedelta(hours=hours)
     return (
         RealmCount.objects.filter(property=stat.property, end_time__gt=d, realm=realm).aggregate(
             Sum("value")
@@ -1449,6 +1386,7 @@ def update_first_visible_message_id(realm: Realm) -> None:
     else:
         try:
             first_visible_message_id = (
+                # Uses index: zerver_message_realm_id
                 Message.objects.filter(realm=realm)
                 .values("id")
                 .order_by("-id")[realm.message_visibility_limit - 1]["id"]
@@ -1485,75 +1423,60 @@ def get_recent_conversations_recipient_id(
     return recipient_id
 
 
-def get_recent_private_conversations(user_profile: UserProfile) -> Dict[int, Dict[str, Any]]:
+def _get_recent_conversations_via_legacy_personal_recipient(
+    user_profile_id: int, recipient_id: int
+) -> list[tuple[int, int]]:
     """This function uses some carefully optimized SQL queries, designed
     to use the UserMessage index on private_messages.  It is
-    significantly complicated by the fact that for 1:1 private
+    somewhat complicated by the fact that for 1:1 direct
     messages, we store the message against a recipient_id of whichever
-    user was the recipient, and thus for 1:1 private messages sent
+    user was the recipient, and thus for 1:1 direct messages sent
     directly to us, we need to look up the other user from the
     sender_id on those messages.  You'll see that pattern repeated
     both here and also in zerver/lib/events.py.
 
-    Ideally, we would write these queries using Django, but even
-    without the UNION ALL, that seems to not be possible, because the
-    equivalent Django syntax (for the first part of this query):
-
-        message_data = UserMessage.objects.select_related("message__recipient_id").filter(
-            user_profile=user_profile,
-        ).extra(
-            where=[UserMessage.where_private()]
-        ).order_by("-message_id")[:1000].values(
-            "message__recipient_id").annotate(last_message_id=Max("message_id"))
-
-    does not properly nest the GROUP BY (from .annotate) with the slicing.
-
-    We return a dictionary structure for convenient modification
-    below; this structure is converted into its final form by
-    post_process.
-
+    It may be possible to write this query directly in Django, however
+    it is made much easier by using CTEs, which Django does not
+    natively support.
     """
     RECENT_CONVERSATIONS_LIMIT = 1000
 
-    recipient_map = {}
-    my_recipient_id = user_profile.recipient_id
-
     query = SQL(
         """
-    SELECT
-        subquery.recipient_id, MAX(subquery.message_id)
-    FROM (
-        (SELECT
-            um.message_id AS message_id,
-            m.recipient_id AS recipient_id
-        FROM
-            zerver_usermessage um
-        JOIN
-            zerver_message m
-        ON
-            um.message_id = m.id
-        WHERE
-            um.user_profile_id=%(user_profile_id)s AND
-            um.flags & 2048 <> 0 AND
-            m.recipient_id <> %(my_recipient_id)s
-        ORDER BY message_id DESC
-        LIMIT %(conversation_limit)s)
-        UNION ALL
-        (SELECT
-            m.id AS message_id,
-            sender_profile.recipient_id AS recipient_id
-        FROM
-            zerver_message m
-        JOIN
-            zerver_userprofile sender_profile
-        ON
-            m.sender_id = sender_profile.id
-        WHERE
-            m.recipient_id=%(my_recipient_id)s
-        ORDER BY message_id DESC
-        LIMIT %(conversation_limit)s)
-    ) AS subquery
-    GROUP BY subquery.recipient_id
+        WITH personals AS (
+            SELECT   um.message_id AS message_id
+            FROM     zerver_usermessage um
+            WHERE    um.user_profile_id = %(user_profile_id)s
+            AND      um.flags & 2048 <> 0
+            ORDER BY message_id DESC limit %(conversation_limit)s
+        ),
+        message AS (
+            SELECT message_id,
+                   CASE
+                          WHEN m.recipient_id = %(recipient_id)s
+                          THEN m.sender_id
+                          ELSE NULL
+                   END AS sender_id,
+                   CASE
+                          WHEN m.recipient_id <> %(recipient_id)s
+                          THEN m.recipient_id
+                          ELSE NULL
+                   END AS outgoing_recipient_id
+            FROM   personals
+            JOIN   zerver_message m
+            ON     personals.message_id = m.id
+        ),
+        unified AS (
+            SELECT    message_id,
+                      COALESCE(zerver_userprofile.recipient_id, outgoing_recipient_id) AS other_recipient_id
+            FROM      message
+            LEFT JOIN zerver_userprofile
+            ON        zerver_userprofile.id = sender_id
+        )
+        SELECT   other_recipient_id,
+                 MAX(message_id)
+        FROM     unified
+        GROUP BY other_recipient_id
     """
     )
 
@@ -1561,29 +1484,64 @@ def get_recent_private_conversations(user_profile: UserProfile) -> Dict[int, Dic
         cursor.execute(
             query,
             {
-                "user_profile_id": user_profile.id,
+                "user_profile_id": user_profile_id,
                 "conversation_limit": RECENT_CONVERSATIONS_LIMIT,
-                "my_recipient_id": my_recipient_id,
+                "recipient_id": recipient_id,
             },
         )
-        rows = cursor.fetchall()
+        return cursor.fetchall()
 
-    # The resulting rows will be (recipient_id, max_message_id)
-    # objects for all parties we've had recent (group?) private
-    # message conversations with, including PMs with yourself (those
-    # will generate an empty list of user_ids).
-    for recipient_id, max_message_id in rows:
-        recipient_map[recipient_id] = dict(
-            max_message_id=max_message_id,
-            user_ids=[],
+
+def _get_recent_conversations_via_direct_message_group(
+    user_profile_id: int,
+) -> list[tuple[int, int]]:
+    """
+    This functions fetches the most recent conversations given that all
+    private messages of this user are through direct message groups.
+    """
+    RECENT_CONVERSATIONS_LIMIT = 1000
+
+    recent_pm_message_ids = (
+        UserMessage.objects.filter(user_profile_id=user_profile_id)
+        .extra(where=[UserMessage.where_flag_is_present(UserMessage.flags.is_private)])  # noqa: S610
+        .order_by("-message_id")
+        .values_list("message_id", flat=True)[:RECENT_CONVERSATIONS_LIMIT]
+    )
+
+    return list(
+        Message.objects.filter(id__in=recent_pm_message_ids)
+        .values("recipient_id")
+        .annotate(max_message_id=Max("id"))
+        .values_list("recipient_id", "max_message_id")
+    )
+
+
+def get_recent_private_conversations(user_profile: UserProfile) -> dict[int, dict[str, Any]]:
+    """
+    We return a dictionary structure for convenient modification
+    below; this structure is converted into its final form by
+    post_process.
+    """
+    # Step 1: Collect recent message info
+    if user_profile.recipient_id is not None:
+        recent_conversations = _get_recent_conversations_via_legacy_personal_recipient(
+            user_profile.id, user_profile.recipient_id
         )
+    else:
+        recent_conversations = _get_recent_conversations_via_direct_message_group(user_profile.id)
+
+    recipient_map: dict[int, dict[str, Any]] = {
+        recipient_id: {"max_message_id": max_message_id, "user_ids": []}
+        for recipient_id, max_message_id in recent_conversations
+    }
 
     # Now we need to map all the recipient_id objects to lists of user IDs
-    for recipient_id, user_profile_id in (
+    subscriptions = (
         Subscription.objects.filter(recipient_id__in=recipient_map.keys())
         .exclude(user_profile_id=user_profile.id)
         .values_list("recipient_id", "user_profile_id")
-    ):
+    )
+    for recipient_id, user_profile_id in subscriptions:
         recipient_map[recipient_id]["user_ids"].append(user_profile_id)
 
     # Sort to prevent test flakes and client bugs.
@@ -1593,43 +1551,54 @@ def get_recent_private_conversations(user_profile: UserProfile) -> Dict[int, Dic
     return recipient_map
 
 
-def wildcard_mention_allowed(sender: UserProfile, stream: Stream) -> bool:
-    realm = sender.realm
+def can_mention_many_users(sender: UserProfile) -> bool:
+    """Helper function for 'topic_wildcard_mention_allowed' and
+    'stream_wildcard_mention_allowed' to check if the sender is allowed to use
+    wildcard mentions based on the 'can_mention_many_users_group' setting of that realm.
+    This check is used only if the participants count in the topic or the subscribers
+    count in the stream is greater than 'Realm.WILDCARD_MENTION_THRESHOLD'.
+    """
+    return sender.has_permission("can_mention_many_users_group")
 
+
+def topic_wildcard_mention_allowed(
+    sender: UserProfile, topic_participant_count: int, realm: Realm
+) -> bool:
+    if topic_participant_count <= Realm.WILDCARD_MENTION_THRESHOLD:
+        return True
+    return can_mention_many_users(sender)
+
+
+def stream_wildcard_mention_allowed(sender: UserProfile, stream: Stream, realm: Realm) -> bool:
     # If there are fewer than Realm.WILDCARD_MENTION_THRESHOLD, we
     # allow sending.  In the future, we may want to make this behavior
     # a default, and also just allow explicitly setting whether this
     # applies to a stream as an override.
     if num_subscribers_for_stream_id(stream.id) <= Realm.WILDCARD_MENTION_THRESHOLD:
         return True
+    return can_mention_many_users(sender)
 
-    if realm.wildcard_mention_policy == Realm.WILDCARD_MENTION_POLICY_NOBODY:
-        return False
 
-    if realm.wildcard_mention_policy == Realm.WILDCARD_MENTION_POLICY_EVERYONE:
-        return True
+def check_user_group_mention_allowed(sender: UserProfile, user_group_ids: list[int]) -> None:
+    user_groups = NamedUserGroup.objects.filter(id__in=user_group_ids).select_related(
+        "can_mention_group", "can_mention_group__named_user_group"
+    )
 
-    if realm.wildcard_mention_policy == Realm.WILDCARD_MENTION_POLICY_ADMINS:
-        return sender.is_realm_admin
-
-    if realm.wildcard_mention_policy == Realm.WILDCARD_MENTION_POLICY_MODERATORS:
-        return sender.is_realm_admin or sender.is_moderator
-
-    if realm.wildcard_mention_policy == Realm.WILDCARD_MENTION_POLICY_FULL_MEMBERS:
-        return sender.is_realm_admin or (not sender.is_provisional_member and not sender.is_guest)
-
-    if realm.wildcard_mention_policy == Realm.WILDCARD_MENTION_POLICY_MEMBERS:
-        return not sender.is_guest
-
-    raise AssertionError("Invalid wildcard mention policy")
+    for group in user_groups:
+        if not sender_can_mention_group(sender, group):
+            raise JsonableError(
+                _("You are not allowed to mention user group '{user_group_name}'.").format(
+                    user_group_name=group.name
+                )
+            )
 
 
 def parse_message_time_limit_setting(
-    value: Union[int, str],
-    special_values_map: Mapping[str, Optional[int]],
+    value: int | str,
+    special_values_map: Mapping[str, int | None],
     *,
     setting_name: str,
-) -> Optional[int]:
+) -> int | None:
     if isinstance(value, str) and value in special_values_map:
         return special_values_map[value]
     if isinstance(value, str) or value <= 0:
@@ -1638,18 +1607,206 @@ def parse_message_time_limit_setting(
     return value
 
 
-def update_to_dict_cache(
-    changed_messages: List[Message], realm_id: Optional[int] = None
-) -> List[int]:
-    """Updates the message as stored in the to_dict cache (for serving
-    messages)."""
-    items_for_remote_cache = {}
-    message_ids = []
-    changed_messages_to_dict = MessageDict.to_dict_uncached(changed_messages, realm_id)
-    for msg_id, msg in changed_messages_to_dict.items():
-        message_ids.append(msg_id)
-        key = to_dict_cache_key_id(msg_id)
-        items_for_remote_cache[key] = (msg,)
+def visibility_policy_for_participation(
+    sender: UserProfile,
+    is_stream_muted: bool | None,
+) -> int | None:
+    """
+    This function determines the visibility policy to set when a user
+    participates in a topic, depending on the 'automatically_follow_topics_policy'
+    and 'automatically_unmute_topics_in_muted_streams_policy' settings.
+    """
+    if (
+        sender.automatically_follow_topics_policy
+        == UserProfile.AUTOMATICALLY_CHANGE_VISIBILITY_POLICY_ON_PARTICIPATION
+    ):
+        return UserTopic.VisibilityPolicy.FOLLOWED
 
-    cache_set_many(items_for_remote_cache)
-    return message_ids
+    if (
+        is_stream_muted
+        and sender.automatically_unmute_topics_in_muted_streams_policy
+        == UserProfile.AUTOMATICALLY_CHANGE_VISIBILITY_POLICY_ON_PARTICIPATION
+    ):
+        return UserTopic.VisibilityPolicy.UNMUTED
+
+    return None
+
+
+def visibility_policy_for_send(
+    sender: UserProfile,
+    is_stream_muted: bool | None,
+) -> int | None:
+    if (
+        sender.automatically_follow_topics_policy
+        == UserProfile.AUTOMATICALLY_CHANGE_VISIBILITY_POLICY_ON_SEND
+    ):
+        return UserTopic.VisibilityPolicy.FOLLOWED
+
+    if (
+        is_stream_muted
+        and sender.automatically_unmute_topics_in_muted_streams_policy
+        == UserProfile.AUTOMATICALLY_CHANGE_VISIBILITY_POLICY_ON_SEND
+    ):
+        return UserTopic.VisibilityPolicy.UNMUTED
+
+    return None
+
+
+def visibility_policy_for_send_message(
+    sender: UserProfile,
+    message: Message,
+    stream: Stream,
+    is_stream_muted: bool | None,
+    current_visibility_policy: int,
+) -> int | None:
+    """
+    This function determines the visibility policy to set when a message
+    is sent to a topic, depending on the 'automatically_follow_topics_policy'
+    and 'automatically_unmute_topics_in_muted_streams_policy' settings.
+
+    It returns None when the policies can't make it more visible than the
+    current visibility policy.
+    """
+    # We prioritize 'FOLLOW' over 'UNMUTE' in muted streams.
+    # We need to carefully handle the following two cases:
+    #
+    # 1. When an action qualifies for multiple values. Example:
+    #    - starting a topic is INITIATION, PARTICIPATION as well as SEND
+    #    - sending a non-first message is PARTICIPATION as well as SEND
+    # action | 'automatically_follow_topics_policy' | 'automatically_unmute_topics_in_muted_streams_policy' | visibility_policy
+    #  start |    ON_PARTICIPATION / ON_SEND        |                   ON_INITIATION                       |     FOLLOWED
+    #  send  |    ON_SEND / ON_PARTICIPATION        |              ON_PARTICIPATION / ON_SEND               |     FOLLOWED
+    #
+    # 2. When both the policies have the same values.
+    # action | 'automatically_follow_topics_policy' | 'automatically_unmute_topics_in_muted_streams_policy' | visibility_policy
+    #  start |         ON_INITIATION                |                   ON_INITIATION                       |     FOLLOWED
+    #  partc |       ON_PARTICIPATION               |                 ON_PARTICIPATION                      |     FOLLOWED
+    #  send  |           ON_SEND                    |                     ON_SEND                           |     FOLLOWED
+    visibility_policy = None
+
+    if current_visibility_policy == UserTopic.VisibilityPolicy.FOLLOWED:
+        return visibility_policy
+
+    visibility_policy_participation = visibility_policy_for_participation(sender, is_stream_muted)
+    visibility_policy_send = visibility_policy_for_send(sender, is_stream_muted)
+
+    if UserTopic.VisibilityPolicy.FOLLOWED in (
+        visibility_policy_participation,
+        visibility_policy_send,
+    ):
+        return UserTopic.VisibilityPolicy.FOLLOWED
+
+    if UserTopic.VisibilityPolicy.UNMUTED in (
+        visibility_policy_participation,
+        visibility_policy_send,
+    ):
+        visibility_policy = UserTopic.VisibilityPolicy.UNMUTED
+
+    # If a topic has a visibility policy set, it can't be the case
+    # of initiation. We return early, thus saving a DB query.
+    if current_visibility_policy != UserTopic.VisibilityPolicy.INHERIT:
+        if visibility_policy and current_visibility_policy == visibility_policy:
+            return None
+        return visibility_policy
+
+    # Now we need to check if the user initiated the topic.
+    old_accessible_messages_in_topic: QuerySet[Message] | QuerySet[UserMessage]
+    if can_access_stream_history(sender, stream):
+        old_accessible_messages_in_topic = messages_for_topic(
+            realm_id=sender.realm_id,
+            stream_recipient_id=message.recipient_id,
+            topic_name=message.topic_name(),
+        ).exclude(id=message.id)
+    else:
+        # We use the user's own message access to avoid leaking information in
+        # private streams with protected history.
+        old_accessible_messages_in_topic = UserMessage.objects.filter(
+            user_profile=sender,
+            message__recipient_id=message.recipient_id,
+            message__subject__iexact=message.topic_name(),
+            message__is_channel_message=True,
+        ).exclude(message_id=message.id)
+
+    if (
+        sender.automatically_follow_topics_policy
+        == UserProfile.AUTOMATICALLY_CHANGE_VISIBILITY_POLICY_ON_INITIATION
+        and not old_accessible_messages_in_topic.exists()
+    ):
+        return UserTopic.VisibilityPolicy.FOLLOWED
+
+    if (
+        is_stream_muted
+        and sender.automatically_unmute_topics_in_muted_streams_policy
+        == UserProfile.AUTOMATICALLY_CHANGE_VISIBILITY_POLICY_ON_INITIATION
+        and not old_accessible_messages_in_topic.exists()
+    ):
+        visibility_policy = UserTopic.VisibilityPolicy.UNMUTED
+
+    return visibility_policy
+
+
+def should_change_visibility_policy(
+    new_visibility_policy: int,
+    sender: UserProfile,
+    stream_id: int,
+    topic_name: str,
+) -> bool:
+    try:
+        user_topic = UserTopic.objects.get(
+            user_profile=sender, stream_id=stream_id, topic_name__iexact=topic_name
+        )
+    except UserTopic.DoesNotExist:
+        return True
+    current_visibility_policy = user_topic.visibility_policy
+
+    if new_visibility_policy == current_visibility_policy:
+        return False
+
+    # The intent of these "automatically follow or unmute" policies is that they
+    # can only increase the user's visibility policy for the topic. If a topic is
+    # already FOLLOWED, we don't change the state to UNMUTED due to these policies.
+    if current_visibility_policy == UserTopic.VisibilityPolicy.FOLLOWED:
+        return False
+
+    return True
+
+
+def set_visibility_policy_possible(user_profile: UserProfile, message: Message) -> bool:
+    """If the user can set a visibility policy."""
+    if not message.is_channel_message:
+        return False
+
+    if user_profile.is_bot:
+        return False
+
+    if user_profile.realm != message.get_realm():
+        return False
+
+    return True
+
+
+def remove_single_newlines(content: str) -> str:
+    content = content.strip("\n")
+    return re.sub(r"(?<!\n)\n(?!\n|[-*] |[0-9]+\. ) *", " ", content)
+
+
+def is_1_to_1_message(message: Message) -> bool:
+    if message.recipient.type == Recipient.DIRECT_MESSAGE_GROUP:
+        direct_message_group = DirectMessageGroup.objects.get(id=message.recipient.type_id)
+        return direct_message_group.group_size <= 2
+
+    if message.recipient.type == Recipient.PERSONAL:
+        return True
+
+    return False
+
+
+def is_message_to_self(message: Message) -> bool:
+    if message.recipient.type == Recipient.DIRECT_MESSAGE_GROUP:
+        group_members = get_display_recipient(message.recipient)
+        return len(group_members) == 1 and group_members[0]["id"] == message.sender.id
+
+    if message.recipient.type == Recipient.PERSONAL:
+        return message.recipient == message.sender.recipient
+
+    return False

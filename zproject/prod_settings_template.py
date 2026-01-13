@@ -1,4 +1,4 @@
-from typing import Any, Dict, Tuple
+from typing import Any
 
 from .config import get_secret
 
@@ -44,7 +44,7 @@ EXTERNAL_HOST = "zulip.example.com"
 ## representing the host/domain names that your users can enter in
 ## their browsers to access Zulip.  This is a security measure; for
 ## details, see the Django documentation:
-## https://docs.djangoproject.com/en/3.2/ref/settings/#allowed-hosts
+## https://docs.djangoproject.com/en/5.0/ref/settings/#allowed-hosts
 ##
 ## Zulip automatically adds to this list "localhost", "127.0.0.1", and
 ## patterns representing EXTERNAL_HOST and subdomains of it.  If you are
@@ -71,7 +71,9 @@ EXTERNAL_HOST = "zulip.example.com"
 ## advice for troubleshooting, see the Zulip documentation:
 ##   https://zulip.readthedocs.io/en/latest/production/email.html
 
-## EMAIL_HOST and EMAIL_HOST_USER are generally required.
+## EMAIL_HOST and EMAIL_HOST_USER are generally required.  If your
+## SMTP server does not require authentication, leave EMAIL_HOST_USER
+## commented out.
 # EMAIL_HOST = "smtp.example.com"
 # EMAIL_HOST_USER = ""
 
@@ -98,6 +100,13 @@ EXTERNAL_HOST = "zulip.example.com"
 ## ADD_TOKENS_TO_NOREPLY_ADDRESS does not exist), as well as for
 ## confirmation emails when ADD_TOKENS_TO_NOREPLY_ADDRESS=False.
 # NOREPLY_EMAIL_ADDRESS = "noreply@example.com"
+
+## Emails sent by the Zulip server will use a sender name starting
+## with INSTALLATION_NAME. The default is EXTERNAL_HOST. If INSTALLATION_NAME is
+## "zulip.example.com", email senders names will include:
+## * "zulip.example.com notifications" (message notification emails).
+## * "zulip.example.com account security" (account security emails).
+# INSTALLATION_NAME = "My Zulip Server"
 
 ## Many countries and bulk mailers require certain types of email to display
 ## a physical mailing address to comply with anti-spam legislation.
@@ -139,12 +148,12 @@ EMAIL_GATEWAY_IMAP_FOLDER = "INBOX"
 ## The install process requires EmailAuthBackend (the default) to be
 ## enabled.  If you want to disable it, do so after creating the
 ## initial realm and user.
-AUTHENTICATION_BACKENDS: Tuple[str, ...] = (
+AUTHENTICATION_BACKENDS: tuple[str, ...] = (
     "zproject.backends.EmailAuthBackend",  # Email and password; just requires SMTP setup
     # "zproject.backends.GoogleAuthBackend",  # Google auth, setup below
     # "zproject.backends.GitHubAuthBackend",  # GitHub auth, setup below
     # "zproject.backends.GitLabAuthBackend",  # GitLab auth, setup below
-    # "zproject.backends.AzureADAuthBackend",  # Microsoft Azure Active Directory auth, setup below
+    # "zproject.backends.AzureADAuthBackend",  # Microsoft Entra ID (AzureAD) auth, setup below
     # "zproject.backends.AppleAuthBackend",  # Apple auth, setup below
     # "zproject.backends.SAMLAuthBackend",  # SAML, setup below
     # "zproject.backends.ZulipLDAPAuthBackend",  # LDAP, setup below
@@ -231,6 +240,11 @@ AUTH_LDAP_USER_ATTR_MAP = {
     "full_name": "cn",
     # "first_name": "fn",
     # "last_name": "ln",
+    #
+    ## A stable unique identifier for a user allows Zulip to
+    ## automatically handle email address changes.
+    ## See https://zulip.readthedocs.io/en/latest/production/authentication-methods.html#synchronizing-email-addresses
+    # "unique_account_id": "objectSid",
     ##
     ## Profile pictures can be pulled from the LDAP "thumbnailPhoto"/"jpegPhoto" field.
     # "avatar": "thumbnailPhoto",
@@ -262,6 +276,20 @@ AUTH_LDAP_USER_ATTR_MAP = {
 #          "employeeType": "staff"
 #      }
 #    ]
+# }
+
+
+## LDAP group sync configuration.
+## See: https://zulip.readthedocs.io/en/latest/production/authentication-methods.html#synchronizing-groups
+# AUTH_LDAP_GROUP_TYPE = GroupOfUniqueNamesType()
+# AUTH_LDAP_GROUP_SEARCH = LDAPSearch(
+#     "ou=groups,dc=www,dc=example,dc=com", ldap.SCOPE_SUBTREE, "(objectClass=groupOfUniqueNames)"
+# )
+# LDAP_SYNCHRONIZED_GROUPS_BY_REALM = {
+#   "subdomain1" : [
+#       "group1",
+#       "group2",
+#   ]
 # }
 
 ########
@@ -352,7 +380,7 @@ AUTH_LDAP_USER_ATTR_MAP = {
 ##     https://zulip.readthedocs.io/en/latest/production/authentication-methods.html#openid-connect
 ##
 
-SOCIAL_AUTH_OIDC_ENABLED_IDPS: Dict[str, Any] = {
+SOCIAL_AUTH_OIDC_ENABLED_IDPS: dict[str, Any] = {
     ## This field (example: "idp_name") may appear in URLs during
     ## authentication, but is otherwise not user-visible.
     "idp_name": {
@@ -369,6 +397,10 @@ SOCIAL_AUTH_OIDC_ENABLED_IDPS: Dict[str, Any] = {
         ## reads the secret with the specified name from zulip-secrets.conf.
         "client_id": "<your client id>",
         "secret": get_secret("social_auth_oidc_secret"),
+        ## If you want this IdP to only be enabled for authentication
+        ## to certain subdomains, uncomment and edit the setting below.
+        # "limit_to_subdomains": ["subdomain1", "subdomain2"],
+        ##
         ## Determines whether "Log in with OIDC" will automatically
         ## register a new account if one does not already exist. By
         ## default, Zulip asks the user whether they want to create an
@@ -398,7 +430,7 @@ SOCIAL_AUTH_SAML_ORG_INFO = {
         "url": "{}{}".format("https://", EXTERNAL_HOST),
     },
 }
-SOCIAL_AUTH_SAML_ENABLED_IDPS: Dict[str, Any] = {
+SOCIAL_AUTH_SAML_ENABLED_IDPS: dict[str, Any] = {
     ## The fields are explained in detail here:
     ##     https://python-social-auth.readthedocs.io/en/latest/backends/saml.html
     "idp_name": {
@@ -418,9 +450,9 @@ SOCIAL_AUTH_SAML_ENABLED_IDPS: Dict[str, Any] = {
         "attr_username": "email",
         "attr_email": "email",
         ## List of additional attributes to fetch from the SAMLResponse.
-        ## These attributes will be available for synchronizing custom profile fields.
-        ## in SOCIAL_AUTH_SYNC_CUSTOM_ATTRS_DICT.
-        # "extra_attrs": ["title", "mobilePhone"],
+        ## These attributes will be available for synchronizing user profile fields.
+        ## in SOCIAL_AUTH_SYNC_ATTRS_DICT.
+        # "extra_attrs": ["title", "mobilePhone", "zulip_role"],
         ##
         ## The "x509cert" attribute is automatically read from
         ## /etc/zulip/saml/idps/{idp_name}.crt; don't specify it here.
@@ -430,10 +462,12 @@ SOCIAL_AUTH_SAML_ENABLED_IDPS: Dict[str, Any] = {
         ## the login button.
         "display_name": "SAML",
         ##
-        ## Path to a square image file containing a logo to appear at
+        ## URL of a square image file containing a logo to appear at
         ## the left end of the login/register buttons for this IDP.
-        ## The default of None results in a text-only button.
-        # "display_icon": "/path/to/icon.png",
+        ## This can be a relative path, on the same host, most likely
+        ## under /static/ (stored in ~zulip/prod-static/). The default
+        ## of None results in a text-only button.
+        # "display_icon": "https://example.com/path/to/icon.png",
         ##
         ## If you want this IdP to only be enabled for authentication
         ## to certain subdomains, uncomment and edit the setting below.
@@ -448,12 +482,15 @@ SOCIAL_AUTH_SAML_ENABLED_IDPS: Dict[str, Any] = {
         ## default, Zulip asks the user whether they want to create an
         ## account or try to log in again using another method.
         # "auto_signup": False,
+        ## Determines whether Service Provider initiated SAML Single Logout should be enabled.
+        ## Note that IdP-initiated Single Logout must be configured before enabling this.
+        # "sp_initiated_logout_enabled": False,
     },
 }
 
 # More complete documentation of the configurable security settings
 # are available in the "security" part of https://github.com/onelogin/python3-saml#settings.
-SOCIAL_AUTH_SAML_SECURITY_CONFIG: Dict[str, Any] = {
+SOCIAL_AUTH_SAML_SECURITY_CONFIG: dict[str, Any] = {
     ## If you've set up the optional private and public server keys,
     ## set this to True to enable signing of SAMLRequests using the
     ## private key.
@@ -482,14 +519,23 @@ SOCIAL_AUTH_SAML_SUPPORT_CONTACT = {
     "emailAddress": ZULIP_ADMINISTRATOR,
 }
 
-# SOCIAL_AUTH_SYNC_CUSTOM_ATTRS_DICT = {
-#    "example_org": {
-#        "saml": {
-#            # Format: "<custom profile field name>": "<attribute name from extra_attrs above>"
-#            "title": "title",
-#            "phone_number": "mobilePhone",
-#        }
-#    }
+## Note: Any additional SAML attributes that'll be used here must be
+## listed in the "extra_attrs" field in the SOCIAL_AUTH_SAML_ENABLED_IDPS
+## configuration for your IdP.
+# SOCIAL_AUTH_SYNC_ATTRS_DICT = {
+#     "example_org": {
+#         "saml": {
+#             # role is currently the only supported major attribute.
+#             "role": "zulip_role",
+#             # Specify custom profile fields with a custom__ prefix for the
+#             # Zulip field name.
+#             "custom__title": "title",
+#             # Sync the membership of the listed Zulip groups with
+#             # the list of group names sent in the "zulip_groups"
+#             # attribute in the SAMLResponse.
+#             "groups": ["group1", "group2", ("samlgroup3", "zulipgroup3"), "group4"],
+#         }
+#     }
 # }
 
 ########
@@ -505,9 +551,9 @@ SOCIAL_AUTH_SAML_SUPPORT_CONTACT = {
 # SOCIAL_AUTH_APPLE_KEY = "<your Key ID>"
 
 ########
-## Azure Active Directory OAuth.
+## Microsoft Entra ID (AzureAD) OAuth.
 ##
-## To set up Microsoft Azure AD authentication, you'll need to do the following:
+## To set up Microsoft Entra ID authentication, you'll need to do the following:
 ##
 ## (1) Open "App registrations" at
 ## https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade
@@ -540,8 +586,8 @@ SOCIAL_AUTH_SAML_SUPPORT_CONTACT = {
 ## into Zulip or to fetch users' API keys. The JWT secret key and
 ## algorithm must be configured here.
 ##
-## See https://zulip.readthedocs.io/en/latest/production/authentication-methods.html#jwt
-# JWT_AUTH_KEYS: Dict[str, Any] = {
+## See https://zulip.readthedocs.io/en/latest/production/authentication-methods.html#json-web-tokens-jwt
+# JWT_AUTH_KEYS = {
 #     # Subdomain for which this JWT configuration will apply.
 #     "zulip": {
 #         # Shared secret key used to validate jwt tokens, which should be stored
@@ -569,17 +615,25 @@ SOCIAL_AUTH_SAML_SUPPORT_CONTACT = {
 ##   https://www.postgresql.org/docs/9.5/static/libpq-ssl.html
 # REMOTE_POSTGRES_HOST = "dbserver.example.com"
 # REMOTE_POSTGRES_PORT = "5432"
-# REMOTE_POSTGRES_SSLMODE = "require"
+# REMOTE_POSTGRES_SSLMODE = "verify-full"
 
 ########
 ## RabbitMQ configuration.
 ##
-## By default, Zulip connects to RabbitMQ running locally on the machine,
-## but Zulip also supports connecting to RabbitMQ over the network;
-## to use a remote RabbitMQ instance, set RABBITMQ_HOST to the hostname here.
+## By default, Zulip connects to RabbitMQ running locally on the
+## machine, but Zulip also supports connecting to RabbitMQ over the
+## network; to use a remote RabbitMQ instance, set RABBITMQ_HOST, and
+## optionally RABBITMQ_PORT, to the hostname and port here.
 # RABBITMQ_HOST = "127.0.0.1"
+# RABBITMQ_PORT = 5672
+## To use a different RabbitMQ "virtual host", adjust this.
+# RABBITMQ_VHOST = "/"
 ## To use another RabbitMQ user than the default "zulip", set RABBITMQ_USERNAME here.
 # RABBITMQ_USERNAME = "zulip"
+## To access the RabbitMQ server over TLS, set this to True; this is
+## generally only necessary if RabbitMQ is running on a separate,
+## cloud-managed, host.
+# RABBITMQ_USE_TLS = False
 
 ########
 ## Redis configuration.
@@ -622,21 +676,6 @@ SOCIAL_AUTH_SAML_SUPPORT_CONTACT = {
 ## can also be disabled in a realm's organization settings.
 # INLINE_URL_EMBED_PREVIEW = True
 
-########
-## Twitter previews.
-##
-## Zulip supports showing inline Tweet previews when a tweet is linked
-## to in a message.  To support this, Zulip must have access to the
-## Twitter API via OAuth.  To obtain the various access tokens needed
-## below, you must register a new application under your Twitter
-## account by doing the following:
-##
-## 1. Log in to http://dev.twitter.com.
-## 2. In the menu under your username, click My Applications. From this page, create a new application.
-## 3. Click on the application you created and click "create my access token".
-## 4. Fill in the values for twitter_consumer_key, twitter_consumer_secret, twitter_access_token_key,
-##    and twitter_access_token_secret in /etc/zulip/zulip-secrets.conf.
-
 
 ################
 ## Logging and error reporting.
@@ -644,11 +683,13 @@ SOCIAL_AUTH_SAML_SUPPORT_CONTACT = {
 ## Controls whether or not error reports (tracebacks) are emailed to the
 ## server administrators.
 # ERROR_REPORTING = True
-## For frontend (JavaScript) tracebacks
-# BROWSER_ERROR_REPORTING = False
 
 ## Controls the DSN used to report errors to Sentry.io
-# SENTRY_DSN = "https://bbb@bbb.ingest.sentry.io/1235"
+# SENTRY_DSN = "https://aaa@bbb.ingest.sentry.io/1234"
+# SENTRY_FRONTEND_DSN = "https://aaa@bbb.ingest.sentry.io/1234"
+## What portion of events are sampled (https://docs.sentry.io/platforms/javascript/configuration/sampling/):
+# SENTRY_FRONTEND_SAMPLE_RATE = 1.0
+# SENTRY_FRONTEND_TRACE_RATE = 0.1
 
 ## If True, each log message in the server logs will identify the
 ## Python module where it came from.  Useful for tracking down a
@@ -661,16 +702,21 @@ SOCIAL_AUTH_SAML_SUPPORT_CONTACT = {
 # LOGGING_SHOW_PID = False
 
 #################
-## Animated GIF integration powered by GIPHY.  See:
-## https://zulip.readthedocs.io/en/latest/production/giphy-gif-integration.html
+## GIF picker / search engine integrations. To get an API key, see:
+## https://zulip.readthedocs.io/en/latest/production/gif-picker-integrations.html
 # GIPHY_API_KEY = "<Your API key from GIPHY>"
+# TENOR_API_KEY = "<Your API key from Tenor>"
 
 ################
 ## Video call integrations.
 ##
-## Controls the Zoom video call integration.  See:
+## Controls the Zoom video call integrations.  See:
 ## https://zulip.readthedocs.io/en/latest/production/video-calls.html
 # VIDEO_ZOOM_CLIENT_ID = "<your Zoom client ID>"
+# VIDEO_ZOOM_SERVER_TO_SERVER_ACCOUNT_ID = "<your Zoom account ID>"
+## Set these if using a Zoom host that is not https://zoom.us.
+# VIDEO_ZOOM_OAUTH_URL = "https://zoom.example.com"
+# VIDEO_ZOOM_API_URL = "https://api.zoom.example.com"
 
 ## Controls the Jitsi Meet video call integration.  By default, the
 ## integration uses the SaaS https://meet.jit.si server.  You can specify
@@ -682,45 +728,65 @@ SOCIAL_AUTH_SAML_SUPPORT_CONTACT = {
 ## set big_blue_button_secret in zulip-secrets.conf.
 # BIG_BLUE_BUTTON_URL = "https://bbb.example.com/bigbluebutton/"
 
+################
+## AI Features
+##
+## Specify the model and provider to use for topic summarization. The
+## `model` field from https://docs.litellm.ai/docs/providers specifies
+## your preferred provider/model combination.
+# TOPIC_SUMMARIZATION_MODEL = "huggingface/meta-llama/Meta-Llama-3-8B-Instruct"
+## Other configuration parameters, passed through to litellm's `completion` call
+## See https://docs.litellm.ai/docs/completion/input
+# TOPIC_SUMMARIZATION_PARAMETERS = {}
+
+## Set usage costs based on your model, and a maximum per-user monthly
+## quota. Units are USD or other currency of your choice.
+# OUTPUT_COST_PER_GIGATOKEN = 500
+# INPUT_COST_PER_GIGATOKEN = 400
+# MAX_PER_USER_MONTHLY_AI_COST = 0.5
 
 ################
 ## Miscellaneous settings.
 
+## If you host multiple organizations on the same Zulip server, you
+## can customize the hostname that one of them uses by adding it here.
+## See https://zulip.readthedocs.io/en/latest/production/multiple-organizations.html#other-hostnames
+## Note that you still need SSL certificates for this other custom hostname:
+## https://zulip.readthedocs.io/en/latest/production/multiple-organizations.html#ssl-certificates
+# REALM_HOSTS = {
+#     "example": "hostname.example.com",
+# }
+
 ## How long outgoing webhook requests time out after
 # OUTGOING_WEBHOOK_TIMEOUT_SECONDS = 10
 
-## Support for mobile push notifications.  Setting controls whether
-## push notifications will be forwarded through a Zulip push
-## notification bouncer server to the mobile apps.  See
-## https://zulip.readthedocs.io/en/latest/production/mobile-push-notifications.html
-## for information on how to sign up for and configure this.
-# PUSH_NOTIFICATION_BOUNCER_URL = "https://push.zulipchat.com"
-
-## Whether to redact the content of push notifications.  This is less
-## usable, but avoids sending message content over the wire.  In the
-## future, we're likely to replace this with an end-to-end push
-## notification encryption feature.
-# PUSH_NOTIFICATION_REDACT_CONTENT = False
-
-## Whether to submit basic usage statistics to help the Zulip core team.  Details at
+## Mobile push notifications require registering for the Zulip Mobile
+## Push Notification Service and configuring your server to use the
+## service here. For complete documentation, see:
 ##
-##   https://zulip.readthedocs.io/en/latest/production/mobile-push-notifications.html
+##   https://zulip.readthedocs.io/en/stable/production/mobile-push-notifications.html
 ##
-## Defaults to True if and only if the Mobile Push Notifications Service is enabled.
-# SUBMIT_USAGE_STATISTICS = True
+# ZULIP_SERVICE_PUSH_NOTIFICATIONS = True
+
+## By default, a Zulip server that has registered for Zulip services
+## submits both basic metadata (required for billing and for determining
+## free plan eligibility), as well as aggregate usage statistics. You
+## can disable submitting usage statistics here.
+# ZULIP_SERVICE_SUBMIT_USAGE_STATISTICS = False
 
 ## Whether to lightly advertise sponsoring Zulip in the gear menu.
 # PROMOTE_SPONSORING_ZULIP = True
 
 ## Controls whether session cookies expire when the browser closes
-SESSION_EXPIRE_AT_BROWSER_CLOSE = False
+# SESSION_EXPIRE_AT_BROWSER_CLOSE = False
 
 ## Session cookie expiry in seconds after the last page load
-SESSION_COOKIE_AGE = 60 * 60 * 24 * 7 * 2  # 2 weeks
+# SESSION_COOKIE_AGE = 60 * 60 * 24 * 7 * 2  # 2 weeks
 
 ## Password strength requirements; learn about configuration at
-## https://zulip.readthedocs.io/en/latest/production/security-model.html.
+## https://zulip.readthedocs.io/en/latest/production/securing-your-zulip-server.html.
 # PASSWORD_MIN_LENGTH = 6
+# PASSWORD_MAX_LENGTH = 100
 # PASSWORD_MIN_GUESSES = 10000
 
 ## Controls whether Zulip sends "new login" email notifications.
@@ -728,7 +794,7 @@ SESSION_COOKIE_AGE = 60 * 60 * 24 * 7 * 2  # 2 weeks
 
 ## Controls whether or not Zulip will parse links starting with
 ## "file:///" as a hyperlink (useful if you have e.g. an NFS share).
-ENABLE_FILE_LINKS = False
+# ENABLE_FILE_LINKS = False
 
 ## By default, files uploaded by users and profile pictures are stored
 ## directly on the Zulip server.  You can configure files being instead
@@ -743,31 +809,33 @@ ENABLE_FILE_LINKS = False
 LOCAL_UPLOADS_DIR = "/home/zulip/uploads"
 # S3_AUTH_UPLOADS_BUCKET = ""
 # S3_AVATAR_BUCKET = ""
+# S3_EXPORT_BUCKET = ""
 # S3_REGION = None
 # S3_ENDPOINT_URL = None
+# S3_AVATAR_PUBLIC_URL_PREFIX = None
+# S3_ADDRESSING_STYLE = "auto"
 # S3_SKIP_PROXY = True
+# S3_UPLOADS_STORAGE_CLASS = "STANDARD"
+# S3_SKIP_CHECKSUM = False
 
-## Maximum allowed size of uploaded files, in megabytes.  This value is
-## capped at 80MB in the nginx configuration, because the file upload
-## implementation doesn't use chunked uploads, and browsers may crash
-## with larger uploads.
-## Set MAX_FILE_UPLOAD_SIZE to 0 to disable file uploads completely
+## Maximum allowed size of uploaded files, in megabytes. Set
+## MAX_FILE_UPLOAD_SIZE to 0 to disable file uploads completely
 ## (including hiding upload-related options from UI).
-MAX_FILE_UPLOAD_SIZE = 25
+# MAX_FILE_UPLOAD_SIZE = 100
 
 ## Controls whether name changes are completely disabled for this
 ## installation.  This is useful when you're syncing names from an
 ## integrated LDAP/Active Directory.
-NAME_CHANGES_DISABLED = False
+# NAME_CHANGES_DISABLED = False
 
 ## Controls whether avatar changes are completely disabled for this
 ## installation.  This is useful when you're syncing avatars from an
 ## integrated LDAP/Active Directory.
-AVATAR_CHANGES_DISABLED = False
+# AVATAR_CHANGES_DISABLED = False
 
 ## Controls whether users who have not uploaded an avatar will receive an avatar
 ## from gravatar.com.
-ENABLE_GRAVATAR = True
+# ENABLE_GRAVATAR = True
 
 ## To override the default avatar image if ENABLE_GRAVATAR is False, place your
 ## custom default avatar image at /home/zulip/local-static/default-avatar.png
@@ -779,7 +847,9 @@ ENABLE_GRAVATAR = True
 ## to "" will disable the Camo integration.
 CAMO_URI = "/external_content/"
 
-## Controls the tutorial popups for new users.
+## Controls various features explaining Zulip to new users. Disabling
+## this is only recommended for installations that are using a limited
+## subset of the Zulip UI, such as embedding it in a larger app.
 # TUTORIAL_ENABLED = True
 
 ## Controls whether Zulip will rate-limit user requests.
@@ -815,3 +885,10 @@ CAMO_URI = "/external_content/"
 
 ## Directory containing Markdown files for the server's policies.
 # POLICIES_DIRECTORY = "/etc/zulip/policies/"
+
+## URL of the navigation tour video to show to new users. You can use this
+## to host the official video on your network, or to provide your own
+## introductory video with details on how your organization uses Zulip.
+##
+## A value of None disables the navigation tour video experience.
+# NAVIGATION_TOUR_VIDEO_URL = "https://static.zulipchat.com/static/navigation-tour-video/zulip-10.mp4"

@@ -1,44 +1,43 @@
 # Directory structure
 
-This page documents the Zulip directory structure, where to find
-things, and how to decide where to put a file.
-
-You may also find the [new application feature
-tutorial](../tutorials/new-feature-tutorial.md) helpful for understanding the
-flow through these files.
+This page documents the directory structure of the [Zulip server and
+web app project](https://github.com/zulip/zulip). You may also find
+the [new application feature
+tutorial](../tutorials/new-feature-tutorial.md) helpful for
+understanding the flow through these files.
 
 ### Core Python files
 
 Zulip uses the [Django web
-framework](https://docs.djangoproject.com/en/3.2/), so a lot of these
+framework](https://docs.djangoproject.com/en/5.0/), so a lot of these
 paths will be familiar to Django developers.
 
 - `zproject/urls.py` Main
-  [Django routes file](https://docs.djangoproject.com/en/3.2/topics/http/urls/).
+  [Django routes file](https://docs.djangoproject.com/en/5.0/topics/http/urls/).
   Defines which URLs are handled by which view functions or templates.
 
-- `zerver/models.py` Main
-  [Django models](https://docs.djangoproject.com/en/3.2/topics/db/models/)
-  file. Defines Zulip's database tables.
+- `zerver/models/*.py`
+  [Django models](https://docs.djangoproject.com/en/5.0/topics/db/models/)
+  files. Defines Zulip's database tables.
 
 - `zerver/lib/*.py` Most library code.
 
 - `zerver/actions/*.py` Most code doing writes to user-facing
   database tables lives here. In particular, we have a policy that
-  all code calling `send_event` to trigger [pushing data to
+  all code calling `send_event_on_commit` to trigger [pushing data to
   clients](../subsystems/events-system.md) must live here.
 
-- `zerver/views/*.py` Most [Django views](https://docs.djangoproject.com/en/3.2/topics/http/views/).
+- `zerver/views/*.py` Most [Django views](https://docs.djangoproject.com/en/5.0/topics/http/views/).
 
-- `zerver/webhooks/` Webhook views and tests for [Zulip's incoming webhook integrations](https://zulip.com/api/incoming-webhooks-overview).
+- `zerver/webhooks/` Webhook views and tests for [Zulip's incoming webhook integrations](../webhooks/incoming-webhooks-overview.md).
 
 - `zerver/tornado/views.py` Tornado views.
 
-- `zerver/worker/queue_processors.py` [Queue workers](../subsystems/queuing.md).
+- `zerver/worker/` [Queue workers](../subsystems/queuing.md).
 
 - `zerver/lib/markdown/` [Backend Markdown processor](../subsystems/markdown.md).
 
-- `zproject/backends.py` [Authentication backends](https://docs.djangoproject.com/en/3.2/topics/auth/customizing/).
+- `zproject/backends.py` [Authentication backends](https://docs.djangoproject.com/en/5.0/topics/auth/customizing/).
 
 ---
 
@@ -50,23 +49,25 @@ templating systems.
 - `templates/zerver/` For [Jinja2](http://jinja.pocoo.org/) templates
   for the backend (for zerver app; logged-in content is in `templates/zerver/app`).
 
-- `static/templates/` [Handlebars](https://handlebarsjs.com/) templates for the frontend.
+- `web/templates/` [Handlebars](https://handlebarsjs.com/) templates for the frontend.
 
 ---
 
-### JavaScript, TypeScript, and other static assets
+### JavaScript, TypeScript, and other frontend assets
 
-- `static/js/` Zulip's own JavaScript and TypeScript sources.
+- `web/src/` Zulip's own JavaScript and TypeScript sources.
 
-- `static/styles/` Zulip's own CSS.
+- `web/styles/` Zulip's own CSS.
 
-- `static/images/` Zulip's images.
+- `web/images/` Images bundled with webpack.
 
-- `static/third/` Third-party JavaScript and CSS that has been vendored.
+- `static/images/` Images served directly to the web.
 
-- `node_modules/` Third-party JavaScript installed via `yarn`.
+- `web/third/` Third-party JavaScript and CSS that has been vendored.
 
-- `static/shared/icons/` Icons placed in this directory are compiled
+- `node_modules/` Third-party JavaScript installed via pnpm.
+
+- `web/icons/` Icons placed in this directory are compiled
   into an icon font.
 
 ---
@@ -75,9 +76,9 @@ templating systems.
 
 - `zerver/tests/` Backend tests.
 
-- `frontend_tests/node_tests/` Node Frontend unit tests.
+- `web/tests/` Node Frontend unit tests.
 
-- `frontend_tests/puppeteer_tests/` Puppeteer frontend integration tests.
+- `web/e2e-tests/` Puppeteer frontend integration tests.
 
 - `tools/test-*` Developer-facing test runner scripts.
 
@@ -90,7 +91,7 @@ Django context (i.e. with database access).
 
 - `zerver/management/commands/`
   [Management commands](../subsystems/management-commands.md) one might run at a
-  production deployment site (e.g. scripts to change a value or
+  production deployment site (e.g., scripts to change a value or
   deactivate a user properly).
 
 - `zilencer/management/commands/` includes some dev-specific
@@ -113,7 +114,7 @@ Django context (i.e. with database access).
 - `tools/` Scripts used only in a Zulip development environment.
   These are not included in production release tarballs for Zulip, so
   that we can include scripts here one wouldn't want someone to run in
-  production accidentally (e.g. things that delete the Zulip database
+  production accidentally (e.g., things that delete the Zulip database
   without prompting).
 
 - `tools/setup/` Subdirectory of `tools/` for things only used during

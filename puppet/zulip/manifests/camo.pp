@@ -1,11 +1,4 @@
 class zulip::camo (String $listen_address = '0.0.0.0') {
-  # TODO/compatibility: Removed 2021-11 in version 5.0; these lines
-  # can be removed once one must have upgraded through Zulip 5.0 or
-  # higher to get to the next release.
-  package { 'camo':
-    ensure => purged,
-  }
-
   $version = $zulip::common::versions['go-camo']['version']
   $goversion = $zulip::common::versions['go-camo']['goversion']
   $dir = "/srv/zulip-go-camo-${version}"
@@ -15,6 +8,8 @@ class zulip::camo (String $listen_address = '0.0.0.0') {
     version        => $version,
     url            => "https://github.com/cactus/go-camo/releases/download/v${version}/go-camo-${version}.go${goversion}.linux-${zulip::common::goarch}.tar.gz",
     tarball_prefix => "go-camo-${version}",
+    bin            => [$bin],
+    cleanup_after  => [Service[supervisor]],
   }
 
   # We would like to not waste resources by going through Smokescreen,
@@ -40,12 +35,13 @@ class zulip::camo (String $listen_address = '0.0.0.0') {
     $proxy = ''
   }
 
+  $zulip_version = $facts['zulip_version']
+  $external_uri = pick(get_django_setting_slow('ROOT_DOMAIN_URI'), 'https://zulip.com')
   file { "${zulip::common::supervisor_conf_dir}/go-camo.conf":
     ensure  => file,
     require => [
-      Package['camo'],
       Package[supervisor],
-      Zulip::External_Dep['go-camo'],
+      File[$bin],
       File['/usr/local/bin/secret-env-wrapper'],
     ],
     owner   => 'root',

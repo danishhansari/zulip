@@ -1,7 +1,3 @@
-```{eval-rst}
-:orphan:
-```
-
 # Hosting multiple organizations
 
 The vast majority of Zulip servers host just a single organization (or
@@ -18,7 +14,7 @@ reading.
 
 Zulip's approach for supporting multiple organizations on a single
 Zulip server is for each organization to be hosted on its own
-subdomain. E.g. you'd have `org1.zulip.example.com` and
+subdomain. E.g., you'd have `org1.zulip.example.com` and
 `org2.zulip.example.com`.
 
 Web security standards mean that one subdomain per organization is
@@ -28,9 +24,6 @@ server at the same time.
 When you want to create a new organization, you need to do a few
 things:
 
-- If you're using Zulip older than 1.7, you'll need to set
-  `REALMS_HAVE_SUBDOMAINS=True` in your `/etc/zulip/settings.py`
-  file. That setting is the default in 1.7 and later.
 - Make sure you have SSL certificates for all of the subdomains you're
   going to use. If you're using
   [our Let's Encrypt instructions](ssl-certificates.md), it's easy to
@@ -88,12 +81,12 @@ into the database.
 ### The root domain
 
 Most Zulip servers host a single Zulip organization on the root domain
-(e.g. `zulip.example.com`). The way this is implemented internally
+(e.g., `zulip.example.com`). The way this is implemented internally
 involves the organization having the empty string (`''`) as its
 "subdomain".
 
 You can mix having an organization on the root domain and some others
-on subdomains (e.g. `subdivision.zulip.example.com`), but this only
+on subdomains (e.g., `subdivision.zulip.example.com`), but this only
 works well if there are no users in common between the two
 organizations, because the auth cookies for the root domain are
 visible to the subdomain (so it's not possible for a single
@@ -118,7 +111,7 @@ provider with a whitelist of callback URLs to your Zulip server (or
 even a single URL). For those vendors that support a whitelist, you
 can provide the callback URLs for each of your Zulip organizations.
 
-The cleaner solution is to register a special subdomain, e.g.
+The cleaner solution is to register a special subdomain, e.g.,
 `auth.zulip.example.com` with the third-party provider, and then set
 `SOCIAL_AUTH_SUBDOMAIN = 'auth'` in `/etc/zulip/settings.py`, so that
 Zulip knows to use that subdomain for these authentication callbacks.
@@ -146,7 +139,7 @@ browsers will experience weird/confusing redirects.
 
 ## Open realm creation
 
-Installations like [Zulip Cloud](https://zulip.com/plans) that wish to
+Installations like [Zulip Cloud](https://zulip.com/plans/) that wish to
 allow anyone on the Internet to create new Zulip organizations can do
 so by setting `OPEN_REALM_CREATION = True` in
 `/etc/zulip/settings.py`. Note that offering Zulip hosting to anyone

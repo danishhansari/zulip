@@ -1,13 +1,14 @@
-from typing import Dict, Optional
+from django.db import transaction
 
 from zerver.models import UserProfile
-from zerver.tornado.django_api import send_event
+from zerver.tornado.django_api import send_event_on_commit
 
 
-def do_set_zoom_token(user: UserProfile, token: Optional[Dict[str, object]]) -> None:
-    user.zoom_token = token
-    user.save(update_fields=["zoom_token"])
-    send_event(
+@transaction.atomic(durable=True)
+def do_set_zoom_token(user: UserProfile, /, token: dict[str, object] | None) -> None:
+    user.third_party_api_state["zoom"] = token
+    user.save(update_fields=["third_party_api_state"])
+    send_event_on_commit(
         user.realm,
         dict(type="has_zoom_token", value=token is not None),
         [user.id],

@@ -1,17 +1,16 @@
-from functools import lru_cache
-from typing import Dict
+from functools import cache
 
 from scripts.lib.zulip_tools import get_tzdata_zi
 
 
-@lru_cache(maxsize=None)
-def get_canonical_timezone_map() -> Dict[str, str]:
+@cache
+def get_canonical_timezone_map() -> dict[str, str]:
     canonical = {}
     with get_tzdata_zi() as f:
         for line in f:
             fields = line.split()
             if fields and "link".startswith(fields[0].lower()):  # zic(8) accepts any prefix of Link
-                code, name, alias = fields
+                _code, name, alias = fields
                 canonical[alias] = name
     return canonical
 

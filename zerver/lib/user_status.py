@@ -1,13 +1,13 @@
-from typing import Dict, Optional, TypedDict
+from typing import TypedDict
 
 from django.db.models import Q
 from django.utils.timezone import now as timezone_now
 
-from zerver.models import UserStatus
+from zerver.lib.users import check_user_can_access_all_users, get_accessible_user_ids
+from zerver.models import Realm, UserProfile, UserStatus
 
 
 class UserInfoDict(TypedDict, total=False):
-    status: int
     status_text: str
     emoji_name: str
     emoji_code: str
@@ -49,30 +49,32 @@ def format_user_status(row: RawUserInfoDict) -> UserInfoDict:
     return dct
 
 
-def get_user_status_dict(realm_id: int) -> Dict[str, UserInfoDict]:
-    rows = (
-        UserStatus.objects.filter(
-            user_profile__realm_id=realm_id,
-            user_profile__is_active=True,
-        )
-        .exclude(
-            Q(user_profile__presence_enabled=True)
-            & Q(status_text="")
-            & Q(emoji_name="")
-            & Q(emoji_code="")
-            & Q(reaction_type=UserStatus.UNICODE_EMOJI),
-        )
-        .values(
-            "user_profile_id",
-            "user_profile__presence_enabled",
-            "status_text",
-            "emoji_name",
-            "emoji_code",
-            "reaction_type",
-        )
+def get_all_users_status_dict(realm: Realm, user_profile: UserProfile) -> dict[str, UserInfoDict]:
+    query = UserStatus.objects.filter(
+        user_profile__realm_id=realm.id,
+        user_profile__is_active=True,
+    ).exclude(
+        Q(user_profile__presence_enabled=True)
+        & Q(status_text="")
+        & Q(emoji_name="")
+        & Q(emoji_code="")
+        & Q(reaction_type=UserStatus.UNICODE_EMOJI),
     )
 
-    user_dict: Dict[str, UserInfoDict] = {}
+    if not check_user_can_access_all_users(user_profile):
+        accessible_user_ids = get_accessible_user_ids(realm, user_profile)
+        query = query.filter(user_profile_id__in=accessible_user_ids)
+
+    rows = query.values(
+        "user_profile_id",
+        "user_profile__presence_enabled",
+        "status_text",
+        "emoji_name",
+        "emoji_code",
+        "reaction_type",
+    )
+
+    user_dict: dict[str, UserInfoDict] = {}
     for row in rows:
         user_id = row["user_profile_id"]
         user_dict[str(user_id)] = format_user_status(row)
@@ -82,11 +84,11 @@ def get_user_status_dict(realm_id: int) -> Dict[str, UserInfoDict]:
 
 def update_user_status(
     user_profile_id: int,
-    status_text: Optional[str],
+    status_text: str | None,
     client_id: int,
-    emoji_name: Optional[str],
-    emoji_code: Optional[str],
-    reaction_type: Optional[str],
+    emoji_name: str | None,
+    emoji_code: str | None,
+    reaction_type: str | None,
 ) -> None:
     timestamp = timezone_now()
 
@@ -111,3 +113,22 @@ def update_user_status(
         user_profile_id=user_profile_id,
         defaults=defaults,
     )
+
+
+def get_user_status(user_profile: UserProfile) -> UserInfoDict:
+    status_set_by_user = (
+        UserStatus.objects.filter(user_profile=user_profile)
+        .values(
+            "user_profile_id",
+            "user_profile__presence_enabled",
+            "status_text",
+            "emoji_name",
+            "emoji_code",
+            "reaction_type",
+        )
+        .first()
+    )
+
+    if not status_set_by_user:
+        return {}
+    return format_user_status(status_set_by_user)

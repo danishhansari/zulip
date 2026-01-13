@@ -32,7 +32,7 @@ The above command will output a URL which can be used for creating a
 new realm and an administrator user for that realm. The link expires
 after the creation of the realm. The link also expires if not used
 within 7 days. The expiration period can be changed by modifying
-`REALM_CREATION_LINK_VALIDITY_DAYS` in settings.py.
+`CAN_CREATE_REALM_LINK_VALIDITY_DAYS` in settings.py.
 
 ## Subdomains
 
@@ -92,5 +92,5 @@ lookup should still work even if you disable proxy for
 127.0.0.1    testsubdomain.zulipdev.com
 ```
 
-These records are also useful if you want to e.g. run the Puppeteer tests
-when you are not connected to the Internet.
+These records are also useful if you want to, for example, run the
+Puppeteer tests when you are not connected to the Internet.

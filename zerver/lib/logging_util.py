@@ -3,15 +3,17 @@ import hashlib
 import logging
 import threading
 import traceback
+from collections.abc import Iterable
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from logging import Logger
-from typing import Optional, Tuple, Union
 
 import orjson
 from django.conf import settings
 from django.core.cache import cache
+from django.http import HttpRequest
 from django.utils.timezone import now as timezone_now
+from typing_extensions import override
 
 
 class _RateLimitFilter:
@@ -37,7 +39,7 @@ class _RateLimitFilter:
     handling_exception = threading.local()
     should_reset_handling_exception = False
 
-    def can_use_remote_cache(self) -> Tuple[bool, bool]:
+    def can_use_remote_cache(self) -> tuple[bool, bool]:
         if getattr(self.handling_exception, "value", False):
             # If we're processing an exception that occurred
             # while handling an exception, this almost
@@ -78,7 +80,7 @@ class _RateLimitFilter:
             if rate > 0:
                 (use_cache, should_reset_handling_exception) = self.can_use_remote_cache()
                 if use_cache:
-                    if record.exc_info is not None:
+                    if record.exc_info is not None and isinstance(record.exc_info, Iterable):
                         tb = "\n".join(traceback.format_exception(*record.exc_info))
                     else:
                         tb = str(record)
@@ -107,21 +109,18 @@ class EmailLimiter(_RateLimitFilter):
 
 
 class ReturnTrue(logging.Filter):
+    @override
     def filter(self, record: logging.LogRecord) -> bool:
         return True
 
 
-class ReturnEnabled(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return settings.LOGGING_ENABLED
-
-
 class RequireReallyDeployed(logging.Filter):
+    @override
     def filter(self, record: logging.LogRecord) -> bool:
         return settings.PRODUCTION
 
 
-def find_log_caller_module(record: logging.LogRecord) -> Optional[str]:
+def find_log_caller_module(record: logging.LogRecord) -> str | None:
     """Find the module name corresponding to where this record was logged.
 
     Sadly `record.module` is just the innermost component of the full
@@ -151,7 +150,7 @@ def find_log_origin(record: logging.LogRecord) -> str:
 
     if settings.LOGGING_SHOW_MODULE:
         module_name = find_log_caller_module(record)
-        if module_name == logger_name or module_name == record.name:
+        if module_name in (logger_name, record.name):
             # Abbreviate a bit.
             pass
         else:
@@ -197,6 +196,7 @@ class ZulipFormatter(logging.Formatter):
         pieces.extend(["[%(zulip_origin)s]", "%(message)s"])
         return " ".join(pieces)
 
+    @override
     def format(self, record: logging.LogRecord) -> str:
         if not hasattr(record, "zulip_decorated"):
             record.zulip_level_abbrev = abbrev_log_levelname(record.levelname)
@@ -206,6 +206,7 @@ class ZulipFormatter(logging.Formatter):
 
 
 class ZulipWebhookFormatter(ZulipFormatter):
+    @override
     def _compute_fmt(self) -> str:
         basic = super()._compute_fmt()
         multiline = [
@@ -221,11 +222,10 @@ class ZulipWebhookFormatter(ZulipFormatter):
         ]
         return "\n".join(multiline)
 
+    @override
     def format(self, record: logging.LogRecord) -> str:
-        from zerver.lib.request import get_current_request
-
-        request = get_current_request()
-        if not request:
+        request: HttpRequest | None = getattr(record, "request", None)
+        if request is None:
             record.user = None
             record.client = None
             record.url = None
@@ -235,7 +235,7 @@ class ZulipWebhookFormatter(ZulipFormatter):
             return super().format(record)
 
         if request.content_type == "application/json":
-            payload: Union[str, bytes] = request.body
+            payload: str | bytes = request.body
         else:
             payload = request.POST["payload"]
 

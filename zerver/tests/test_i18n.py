@@ -6,13 +6,14 @@ import orjson
 from django.conf import settings
 from django.core import mail
 from django.utils import translation
+from typing_extensions import override
 
 from zerver.lib.email_notifications import enqueue_welcome_emails
 from zerver.lib.i18n import get_browser_language_code
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.test_helpers import HostRequestMock
 from zerver.management.commands import makemessages
-from zerver.models import get_realm_stream
+from zerver.models.streams import get_realm_stream
 
 if TYPE_CHECKING:
     from django.test.client import _MonkeyPatchedWSGIResponse as TestHttpResponse
@@ -21,10 +22,11 @@ if TYPE_CHECKING:
 class EmailTranslationTestCase(ZulipTestCase):
     def test_email_translation(self) -> None:
         def check_translation(phrase: str, request_type: str, *args: Any, **kwargs: Any) -> None:
-            if request_type == "post":
-                self.client_post(*args, **kwargs)
-            elif request_type == "patch":  # nocoverage: see comment below
-                self.client_patch(*args, **kwargs)
+            with self.captureOnCommitCallbacks(execute=True):
+                if request_type == "post":
+                    self.client_post(*args, **kwargs)
+                elif request_type == "patch":
+                    self.client_patch(*args, **kwargs)
 
             email_message = mail.outbox[0]
             self.assertIn(phrase, email_message.body)
@@ -42,20 +44,20 @@ class EmailTranslationTestCase(ZulipTestCase):
         invite_expires_in_minutes = 2 * 24 * 60
         self.login_user(hamlet)
 
-        # TODO: Uncomment and replace with translation once we have German translations for the strings
-        # in confirm_new_email.txt.
-        # Also remove the "nocoverage" from check_translation above.
-        # check_translation("Viele Grüße", "patch", "/json/settings", {"email": "hamlets-new@zulip.com"})
         check_translation(
-            "Incrível!",
+            "Wir haben eine Anfrage erhalten",
+            "patch",
+            "/json/settings",
+            {"email": "hamlets-new@zulip.com"},
+        )
+        check_translation(
+            "Excelente!",
             "post",
             "/accounts/home/",
             {"email": "new-email@zulip.com"},
             HTTP_ACCEPT_LANGUAGE="pt",
         )
-        check_translation(
-            "Danke, dass du", "post", "/accounts/find/", {"emails": hamlet.delivery_email}
-        )
+        check_translation("Danke für", "post", "/accounts/find/", {"emails": hamlet.delivery_email})
         check_translation(
             "Hallo",
             "post",
@@ -69,9 +71,7 @@ class EmailTranslationTestCase(ZulipTestCase):
 
         with self.settings(DEVELOPMENT_LOG_EMAILS=True):
             enqueue_welcome_emails(hamlet)
-        # TODO: Uncomment and replace with translation once we have German translations for the strings
-        # in followup_day1 emails.
-        # check_translation("Viele Grüße", "")
+        check_translation("Hier findest du einige Tipps", "")
 
 
 class TranslationTestCase(ZulipTestCase):
@@ -80,6 +80,7 @@ class TranslationTestCase(ZulipTestCase):
     aware.
     """
 
+    @override
     def tearDown(self) -> None:
         translation.activate(settings.LANGUAGE_CODE)
         super().tearDown()
@@ -88,7 +89,7 @@ class TranslationTestCase(ZulipTestCase):
     def fetch(
         self, method: str, url: str, expected_status: int, **kwargs: Any
     ) -> "TestHttpResponse":
-        response = getattr(self.client, method)(url, **kwargs)
+        response = getattr(self, f"client_{method}")(url, **kwargs)
         self.assertEqual(
             response.status_code,
             expected_status,
@@ -100,7 +101,7 @@ class TranslationTestCase(ZulipTestCase):
         languages = [
             ("en", "Sign up"),
             ("de", "Registrieren"),
-            ("sr", "Упишите се"),
+            ("sr", "Региструјте се"),
             ("zh-hans", "注册"),
         ]
 
@@ -112,7 +113,7 @@ class TranslationTestCase(ZulipTestCase):
         languages = [
             ("en", "Sign up"),
             ("de", "Registrieren"),
-            ("sr", "Упишите се"),
+            ("sr", "Региструјте се"),
             ("zh-hans", "注册"),
         ]
 
@@ -128,7 +129,7 @@ class TranslationTestCase(ZulipTestCase):
         languages = [
             ("en", "Sign up"),
             ("de", "Registrieren"),
-            ("sr", "Упишите се"),
+            ("sr", "Региструјте се"),
             ("zh-hans", "注册"),
         ]
 
@@ -162,8 +163,21 @@ class TranslationTestCase(ZulipTestCase):
         req.META["HTTP_ACCEPT_LANGUAGE"] = "*"
         self.assertIsNone(get_browser_language_code(req))
 
+        # Case when language with percent_translated less than
+        # 5 has higher weight.
+        mocked_language_list = [
+            {"code": "de", "locale": "de", "name": "Deutsch", "percent_translated": 97},
+            {"code": "en", "locale": "en", "name": "English"},
+            {"code": "no", "locale": "no", "name": "norsk", "percent_translated": 1},
+        ]
+        req = HostRequestMock()
+        req.META["HTTP_ACCEPT_LANGUAGE"] = "no;q=0.9,de;q=0.8"
+        with mock.patch("zerver.lib.i18n.get_language_list", return_value=mocked_language_list):
+            self.assertEqual(get_browser_language_code(req), "de")
+
 
 class JsonTranslationTestCase(ZulipTestCase):
+    @override
     def tearDown(self) -> None:
         translation.activate(settings.LANGUAGE_CODE)
         super().tearDown()

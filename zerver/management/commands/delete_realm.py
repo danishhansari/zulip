@@ -3,7 +3,9 @@ from typing import Any
 
 from django.conf import settings
 from django.core.management.base import CommandError
+from typing_extensions import override
 
+from zerver.actions.realm_settings import do_delete_all_realm_attachments
 from zerver.lib.management import ZulipBaseCommand
 from zerver.models import Message, UserProfile
 
@@ -12,9 +14,11 @@ class Command(ZulipBaseCommand):
     help = """Script to permanently delete a realm. Recommended only for removing
 realms used for testing; consider using deactivate_realm instead."""
 
+    @override
     def add_arguments(self, parser: ArgumentParser) -> None:
         self.add_realm_args(parser, required=True)
 
+    @override
     def handle(self, *args: Any, **options: str) -> None:
         realm = self.get_realm(options)
         assert realm is not None  # Should be ensured by parser
@@ -33,12 +37,13 @@ realms used for testing; consider using deactivate_realm instead."""
             # Deleting a Realm object also deletes associating billing
             # metadata in an invariant-violating way, so we should
             # never use this tool for a realm with billing set up.
-            from corporate.models import CustomerPlan, get_customer_by_realm
+            from corporate.models.customers import get_customer_by_realm
+            from corporate.models.plans import CustomerPlan
 
             customer = get_customer_by_realm(realm)
             if customer and (
                 customer.stripe_customer_id
-                or CustomerPlan.objects.filter(customer=customer).count() > 0
+                or CustomerPlan.objects.filter(customer=customer).exists()
             ):
                 raise CommandError("This realm has had a billing relationship associated with it!")
 
@@ -51,9 +56,13 @@ realms used for testing; consider using deactivate_realm instead."""
         if confirmation != realm.string_id:
             raise CommandError("Aborting!")
 
-        # TODO: This approach leaks Recipient and Huddle objects,
-        # because those don't have a foreign key to the Realm or any
-        # other model it cascades to (Realm/Stream/UserProfile/etc.).
+        # Explicitly remove the attachments and their files in backend
+        # storage; failing to do this leaves dangling files
+        do_delete_all_realm_attachments(realm)
+
+        # TODO: This approach leaks Recipient and DirectMessageGroup
+        # objects, because those don't have a foreign key to the Realm
+        # or any other model it cascades to (Realm/Stream/UserProfile/etc.).
         realm.delete()
 
         print("Realm has been successfully permanently deleted.")

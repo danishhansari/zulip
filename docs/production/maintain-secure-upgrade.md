@@ -1,6 +1,6 @@
-```{eval-rst}
-:orphan:
-```
+---
+orphan: true
+---
 
 # Maintain, secure, and upgrade
 
@@ -13,7 +13,7 @@ Moved to [Troubleshooting](troubleshooting.md#monitoring).
 
 ### Securing your Zulip server
 
-Moved to [Security model](security-model.md).
+Moved to [Securing your Zulip server](securing-your-zulip-server.md).
 
 ### Upgrading
 

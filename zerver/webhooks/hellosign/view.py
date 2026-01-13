@@ -1,11 +1,12 @@
-from typing import Dict, List
+from typing import Annotated
 
 from django.http import HttpRequest, HttpResponse
+from pydantic import Json
 
 from zerver.decorator import webhook_view
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_string, to_wild_value
+from zerver.lib.typed_endpoint import ApiParamConfig, typed_endpoint
+from zerver.lib.validator import WildValue, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import UserProfile
 
@@ -16,7 +17,7 @@ BODY = "The `{contract_title}` document {actions}."
 
 def get_message_body(payload: WildValue) -> str:
     contract_title = payload["signature_request"]["title"].tame(check_string)
-    recipients: Dict[str, List[str]] = {}
+    recipients: dict[str, list[str]] = {}
     signatures = payload["signature_request"]["signatures"]
 
     for signature in signatures:
@@ -43,7 +44,7 @@ def get_message_body(payload: WildValue) -> str:
     return BODY.format(contract_title=contract_title, actions=recipients_text).strip()
 
 
-def get_recipients_text(recipients: List[str]) -> str:
+def get_recipients_text(recipients: list[str]) -> str:
     recipients_text = ""
     if len(recipients) == 1:
         recipients_text = "{}".format(*recipients)
@@ -56,15 +57,16 @@ def get_recipients_text(recipients: List[str]) -> str:
 
 
 @webhook_view("HelloSign")
-@has_request_variables
+@typed_endpoint
 def api_hellosign_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(whence="json", converter=to_wild_value),
+    *,
+    payload: Annotated[Json[WildValue], ApiParamConfig("json")],
 ) -> HttpResponse:
     if "signature_request" in payload:
         body = get_message_body(payload)
-        topic = payload["signature_request"]["title"].tame(check_string)
-        check_send_webhook_message(request, user_profile, topic, body)
+        topic_name = payload["signature_request"]["title"].tame(check_string)
+        check_send_webhook_message(request, user_profile, topic_name, body)
 
     return json_success(request, data={"msg": "Hello API Event Received"})

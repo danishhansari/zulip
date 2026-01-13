@@ -1,12 +1,14 @@
 import time
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence, TypeVar, Union
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from typing import Any, TypeAlias, TypeVar
 
 from psycopg2.extensions import connection, cursor
 from psycopg2.sql import Composable
+from typing_extensions import override
 
 CursorObj = TypeVar("CursorObj", bound=cursor)
-Query = Union[str, bytes, Composable]
-Params = Union[Sequence[object], Mapping[str, object], None]
+Query: TypeAlias = str | bytes | Composable
+Params: TypeAlias = Sequence[object] | Mapping[str, object] | None
 ParamsT = TypeVar("ParamsT")
 
 
@@ -21,6 +23,7 @@ def wrapper_execute(
     finally:
         stop = time.time()
         duration = stop - start
+        assert isinstance(self.connection, TimeTrackingConnection)
         self.connection.queries.append(
             {
                 "time": f"{duration:.3f}",
@@ -31,11 +34,13 @@ def wrapper_execute(
 class TimeTrackingCursor(cursor):
     """A psycopg2 cursor class that tracks the time spent executing queries."""
 
+    @override
     def execute(self, query: Query, vars: Params = None) -> None:
         wrapper_execute(self, super().execute, query, vars)
 
-    def executemany(self, query: Query, vars: Iterable[Params]) -> None:  # nocoverage
-        wrapper_execute(self, super().executemany, query, vars)
+    @override
+    def executemany(self, query: Query, vars_list: Iterable[Params]) -> None:  # nocoverage
+        wrapper_execute(self, super().executemany, query, vars_list)
 
 
 CursorT = TypeVar("CursorT", bound=cursor)
@@ -45,13 +50,5 @@ class TimeTrackingConnection(connection):
     """A psycopg2 connection class that uses TimeTrackingCursors."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self.queries: List[Dict[str, str]] = []
+        self.queries: list[dict[str, str]] = []
         super().__init__(*args, **kwargs)
-
-
-def reset_queries() -> None:
-    from django.db import connections
-
-    for conn in connections.all():
-        if conn.connection is not None:
-            conn.connection.queries = []

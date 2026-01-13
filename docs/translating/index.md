@@ -12,7 +12,9 @@ finnish
 french
 german
 hindi
+japanese
 polish
 russian
 spanish
+urdu
 ```

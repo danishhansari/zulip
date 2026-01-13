@@ -2,7 +2,7 @@
 
 from django.conf import settings
 from django.db import migrations, models
-from django.db.backends.postgresql.schema import BaseDatabaseSchemaEditor
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 from django.db.migrations.state import StateApps
 
 
@@ -10,7 +10,7 @@ def set_users_for_existing_scheduledemails(
     apps: StateApps, schema_editor: BaseDatabaseSchemaEditor
 ) -> None:
     ScheduledEmail = apps.get_model("zerver", "ScheduledEmail")
-    for email in ScheduledEmail.objects.all():
+    for email in ScheduledEmail.objects.all().iterator():
         if email.user is not None:
             email.users.add(email.user)
         email.save()

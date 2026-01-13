@@ -1,5 +1,4 @@
 import time
-from typing import List
 from unittest.mock import patch
 
 from bs4 import BeautifulSoup
@@ -11,7 +10,7 @@ from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.test_helpers import HostRequestMock
 from zerver.lib.utils import assert_is_not_none
 from zerver.middleware import LogRequests, is_slow_query, write_log_line
-from zerver.models import get_realm
+from zerver.models.realms import get_realm
 from zilencer.models import RemoteZulipServer
 
 
@@ -31,26 +30,21 @@ class SlowQueryTest(ZulipTestCase):
         self.assertTrue(is_slow_query(2, "/some/random/url"))
         self.assertTrue(is_slow_query(5.1, "/activity"))
         self.assertFalse(is_slow_query(2, "/activity"))
-        self.assertFalse(is_slow_query(2, "/json/report/error"))
-        self.assertFalse(is_slow_query(2, "/api/v1/deployments/report_error"))
         self.assertFalse(is_slow_query(2, "/realm_activity/whatever"))
         self.assertFalse(is_slow_query(2, "/user_activity/whatever"))
-        self.assertFalse(is_slow_query(9, "/accounts/webathena_kerberos_login/"))
-        self.assertTrue(is_slow_query(11, "/accounts/webathena_kerberos_login/"))
 
     def test_slow_query_log(self) -> None:
         self.log_data["time_started"] = time.time() - self.SLOW_QUERY_TIME
-        with self.assertLogs(
-            "zulip.slow_queries", level="INFO"
-        ) as slow_query_logger, self.assertLogs(
-            "zulip.requests", level="INFO"
-        ) as middleware_normal_logger:
+        with (
+            self.assertLogs("zulip.slow_queries", level="INFO") as slow_query_logger,
+            self.assertLogs("zulip.requests", level="INFO") as middleware_normal_logger,
+        ):
             write_log_line(
                 self.log_data,
                 path="/some/endpoint/",
                 method="GET",
                 remote_ip="123.456.789.012",
-                requestor_for_logs="unknown",
+                requester_for_logs="unknown",
                 client_name="?",
             )
             self.assert_length(middleware_normal_logger.output, 1)
@@ -67,8 +61,8 @@ class OpenGraphTest(ZulipTestCase):
         self,
         path: str,
         title: str,
-        in_description: List[str],
-        not_in_description: List[str],
+        in_description: list[str],
+        not_in_description: list[str],
         status_code: int = 200,
     ) -> None:
         response = self.client_get(path)
@@ -88,54 +82,7 @@ class OpenGraphTest(ZulipTestCase):
         for substring in not_in_description:
             self.assertNotIn(substring, open_graph_description)
 
-    def test_admonition_and_link(self) -> None:
-        # disable-message-edit-history starts with an {!admin-only.md!}, and has a link
-        # in the first paragraph.
-        self.check_title_and_description(
-            "/help/disable-message-edit-history",
-            "Disable message edit history | Zulip help center",
-            [
-                "In Zulip, users can view the edit history of a message. | To remove the",
-                "best to delete the message entirely. ",
-            ],
-            [
-                "Disable message edit history",
-                "feature is only available",
-                "Related articles",
-                "Restrict message editing",
-            ],
-        )
-
-    def test_settings_tab(self) -> None:
-        # deactivate-your-account starts with {settings_tab|account-and-privacy}
-        self.check_title_and_description(
-            "/help/deactivate-your-account",
-            "Deactivate your account | Zulip help center",
-            ["Any bots that you maintain will be disabled. | Deactivating "],
-            ["Confirm by clicking", "  ", "\n"],
-        )
-
-    def test_tabs(self) -> None:
-        # logging-out starts with {start_tabs}
-        self.check_title_and_description(
-            "/help/logging-out",
-            "Logging out | Zulip help center",
-            # Ideally we'd do something better here
-            [
-                "Your feedback helps us make Zulip better for everyone! Please contact us with"
-                " questions, suggestions, and feature requests."
-            ],
-            ["Click on the gear"],
-        )
-
     def test_index_pages(self) -> None:
-        self.check_title_and_description(
-            "/help/",
-            "Zulip help center",
-            [("Welcome to the Zulip")],
-            [],
-        )
-
         self.check_title_and_description(
             "/api/",
             "Zulip API documentation",
@@ -145,14 +92,16 @@ class OpenGraphTest(ZulipTestCase):
                     "guide should help you find the API you need:"
                 )
             ],
-            [],
+            # This is added to maintain coverage for the not_in_description
+            # block since we might want to keep using that for future tests.
+            ["No such article."],
         )
 
     def test_nonexistent_page(self) -> None:
         self.check_title_and_description(
-            "/help/not-a-real-page",
-            # Probably we should make this "Zulip Help Center"
-            "No such article. | Zulip help center",
+            "/api/not-a-real-page",
+            # Probably we should make this "Zulip help center"
+            "No such article. | Zulip API documentation",
             [
                 "No such article.",
                 "Your feedback helps us make Zulip better for everyone! Please contact us",
@@ -206,7 +155,7 @@ class OpenGraphTest(ZulipTestCase):
         open_graph_image = assert_is_not_none(bs.select_one('meta[property="og:image"]')).get(
             "content"
         )
-        self.assertEqual(open_graph_image, f"{realm.uri}{realm_icon}")
+        self.assertEqual(open_graph_image, f"{realm.url}{realm_icon}")
 
     def test_login_page_realm_icon_absolute_url(self) -> None:
         realm = get_realm("zulip")
@@ -239,29 +188,29 @@ class OpenGraphTest(ZulipTestCase):
 class LogRequestsTest(ZulipTestCase):
     meta_data = {"REMOTE_ADDR": "127.0.0.1"}
 
-    def test_requestor_for_logs_as_user(self) -> None:
+    def test_requester_for_logs_as_user(self) -> None:
         hamlet = self.example_user("hamlet")
         request = HostRequestMock(user_profile=hamlet, meta_data=self.meta_data)
         RequestNotes.get_notes(request).log_data = None
 
         with self.assertLogs("zulip.requests", level="INFO") as m:
             LogRequests(lambda _: HttpResponse())(request)
-            self.assertIn(hamlet.format_requestor_for_logs(), m.output[0])
+            self.assertIn(hamlet.format_requester_for_logs(), m.output[0])
 
-    def test_requestor_for_logs_as_remote_server(self) -> None:
+    def test_requester_for_logs_as_remote_server(self) -> None:
         remote_server = RemoteZulipServer()
         request = HostRequestMock(remote_server=remote_server, meta_data=self.meta_data)
         RequestNotes.get_notes(request).log_data = None
 
         with self.assertLogs("zulip.requests", level="INFO") as m:
             LogRequests(lambda _: HttpResponse())(request)
-            self.assertIn(remote_server.format_requestor_for_logs(), m.output[0])
+            self.assertIn(remote_server.format_requester_for_logs(), m.output[0])
 
-    def test_requestor_for_logs_unauthenticated(self) -> None:
+    def test_requester_for_logs_unauthenticated(self) -> None:
         request = HostRequestMock(meta_data=self.meta_data)
         RequestNotes.get_notes(request).log_data = None
 
-        expected_requestor = "unauth@root"
+        expected_requester = "unauth@root"
         with self.assertLogs("zulip.requests", level="INFO") as m:
             LogRequests(lambda _: HttpResponse())(request)
-            self.assertIn(expected_requestor, m.output[0])
+            self.assertIn(expected_requester, m.output[0])

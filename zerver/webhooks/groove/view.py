@@ -1,25 +1,18 @@
 # Webhooks for external integrations.
-from functools import partial
-from typing import Callable, Dict, Optional
+from collections.abc import Callable
 
 from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
 from zerver.lib.exceptions import UnsupportedWebhookEventTypeError
-from zerver.lib.request import REQ, has_request_variables
+from zerver.lib.partial import partial
 from zerver.lib.response import json_success
-from zerver.lib.validator import (
-    WildValue,
-    check_int,
-    check_none_or,
-    check_string,
-    check_url,
-    to_wild_value,
-)
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_int, check_none_or, check_string, check_url
 from zerver.lib.webhooks.common import (
     check_send_webhook_message,
-    get_http_headers_from_filename,
-    validate_extract_webhook_http_header,
+    default_fixture_to_headers,
+    get_event_header,
 )
 from zerver.models import UserProfile
 
@@ -52,7 +45,7 @@ def ticket_started_body(payload: WildValue) -> str:
     )
 
 
-def ticket_assigned_body(payload: WildValue) -> Optional[str]:
+def ticket_assigned_body(payload: WildValue) -> str | None:
     state = payload["state"].tame(check_string)
     kwargs = {
         "state": "open" if state == "opened" else state,
@@ -66,9 +59,7 @@ def ticket_assigned_body(payload: WildValue) -> Optional[str]:
 
     if assignee or assigned_group:
         if assignee and assigned_group:
-            kwargs["assignee_info"] = "{assignee} from {assigned_group}".format(
-                assignee=assignee, assigned_group=assigned_group
-            )
+            kwargs["assignee_info"] = f"{assignee} from {assigned_group}"
         elif assignee:
             kwargs["assignee_info"] = f"{assignee}"
         elif assigned_group:
@@ -79,7 +70,7 @@ def ticket_assigned_body(payload: WildValue) -> Optional[str]:
         return None
 
 
-def replied_body(payload: WildValue, actor: str, action: str) -> str:
+def replied_body(actor: str, action: str, payload: WildValue) -> str:
     actor_url = "http://api.groovehq.com/v1/{}/".format(actor + "s")
     actor = payload["links"]["author"]["href"].tame(check_url).split(actor_url)[1]
     number = (
@@ -99,37 +90,37 @@ def replied_body(payload: WildValue, actor: str, action: str) -> str:
     return body
 
 
-EVENTS_FUNCTION_MAPPER: Dict[str, Callable[[WildValue], Optional[str]]] = {
+EVENTS_FUNCTION_MAPPER: dict[str, Callable[[WildValue], str | None]] = {
     "ticket_started": ticket_started_body,
     "ticket_assigned": ticket_assigned_body,
-    "agent_replied": partial(replied_body, actor="agent", action="replied to"),
-    "customer_replied": partial(replied_body, actor="customer", action="replied to"),
-    "note_added": partial(replied_body, actor="agent", action="left a note on"),
+    "agent_replied": partial(replied_body, "agent", "replied to"),
+    "customer_replied": partial(replied_body, "customer", "replied to"),
+    "note_added": partial(replied_body, "agent", "left a note on"),
 }
 
 ALL_EVENT_TYPES = list(EVENTS_FUNCTION_MAPPER.keys())
 
 
 @webhook_view("Groove", all_event_types=ALL_EVENT_TYPES)
-@has_request_variables
+@typed_endpoint
 def api_groove_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
+    *,
+    payload: JsonBodyPayload[WildValue],
 ) -> HttpResponse:
-    event = validate_extract_webhook_http_header(request, "X-Groove-Event", "Groove")
-    assert event is not None
+    event = get_event_header(request, "X-Groove-Event", "Groove")
     handler = EVENTS_FUNCTION_MAPPER.get(event)
     if handler is None:
         raise UnsupportedWebhookEventTypeError(event)
 
     body = handler(payload)
-    topic = "notifications"
+    topic_name = "notifications"
 
     if body is not None:
-        check_send_webhook_message(request, user_profile, topic, body, event)
+        check_send_webhook_message(request, user_profile, topic_name, body, event)
 
     return json_success(request)
 
 
-fixture_to_headers = get_http_headers_from_filename("HTTP_X_GROOVE_EVENT")
+fixture_to_headers = default_fixture_to_headers("HTTP_X_GROOVE_EVENT")

@@ -1,24 +1,26 @@
+import json
 import logging
 import os
 import sys
 import time
 from copy import deepcopy
-from typing import Any, Dict, Final, List, Tuple, Union
+from typing import Any, Final, Literal
 from urllib.parse import urljoin
 
 from scripts.lib.zulip_tools import get_tornado_ports
 from zerver.lib.db import TimeTrackingConnection, TimeTrackingCursor
+from zerver.lib.types import AnalyticsDataUploadLevel
 
 from .config import (
     DEPLOY_ROOT,
-    DEVELOPMENT,
-    PRODUCTION,
     config_file,
     get_config,
     get_from_file_if_exists,
     get_mandatory_secret,
     get_secret,
 )
+from .config import DEVELOPMENT as DEVELOPMENT
+from .config import PRODUCTION as PRODUCTION
 from .configured_settings import (
     ADMINS,
     ALLOWED_HOSTS,
@@ -43,6 +45,7 @@ from .configured_settings import (
     LOCAL_UPLOADS_DIR,
     MEMCACHED_LOCATION,
     MEMCACHED_USERNAME,
+    PUSH_NOTIFICATION_BOUNCER_URL,
     RATE_LIMITING_RULES,
     REALM_HOSTS,
     REGISTER_LINK_DISABLED,
@@ -50,6 +53,7 @@ from .configured_settings import (
     REMOTE_POSTGRES_PORT,
     REMOTE_POSTGRES_SSLMODE,
     ROOT_SUBDOMAIN_ALIASES,
+    S3_REGION,
     SENTRY_DSN,
     SOCIAL_AUTH_APPLE_APP_ID,
     SOCIAL_AUTH_APPLE_SERVICES_ID,
@@ -60,10 +64,16 @@ from .configured_settings import (
     SOCIAL_AUTH_SAML_ENABLED_IDPS,
     SOCIAL_AUTH_SAML_SECURITY_CONFIG,
     SOCIAL_AUTH_SUBDOMAIN,
-    STATSD_HOST,
+    STATIC_URL,
+    SUBMIT_USAGE_STATISTICS,
     TORNADO_PORTS,
+    USING_CAPTCHA,
     USING_PGROONGA,
     ZULIP_ADMINISTRATOR,
+    ZULIP_SERVICE_PUSH_NOTIFICATIONS,
+    ZULIP_SERVICE_SECURITY_ALERTS,
+    ZULIP_SERVICE_SUBMIT_USAGE_STATISTICS,
+    ZULIP_SERVICES_URL,
 )
 
 ########################################################################
@@ -90,6 +100,73 @@ SERVER_GENERATION = int(time.time())
 ZULIP_ORG_KEY = get_secret("zulip_org_key")
 ZULIP_ORG_ID = get_secret("zulip_org_id")
 
+raw_keys: str | None = get_secret("push_registration_encryption_keys")
+PUSH_REGISTRATION_ENCRYPTION_KEYS: dict[str, str] | None = None
+if raw_keys is not None:
+    PUSH_REGISTRATION_ENCRYPTION_KEYS = json.loads(raw_keys)
+
+
+service_name_to_required_upload_level = {
+    "security_alerts": AnalyticsDataUploadLevel.BASIC,
+    "mobile_push": AnalyticsDataUploadLevel.BILLING,
+    "submit_usage_statistics": AnalyticsDataUploadLevel.ALL,
+}
+
+services: list[str] | None = None
+
+
+def services_append(service_name: str) -> None:
+    global services
+    if services is None:
+        services = []
+    services.append(service_name)
+
+
+if ZULIP_SERVICE_PUSH_NOTIFICATIONS:
+    services_append("mobile_push")
+    if ZULIP_SERVICE_SUBMIT_USAGE_STATISTICS is None:
+        # This setting has special behavior where we want to activate
+        # it by default when push notifications are enabled - unless
+        # explicitly set otherwise in the config.
+        ZULIP_SERVICE_SUBMIT_USAGE_STATISTICS = True
+
+if ZULIP_SERVICE_SUBMIT_USAGE_STATISTICS:
+    services_append("submit_usage_statistics")
+if ZULIP_SERVICE_SECURITY_ALERTS:
+    services_append("security_alerts")
+
+if services is None and PUSH_NOTIFICATION_BOUNCER_URL is not None:
+    # ZULIP_SERVICE_* are the new settings that control the services
+    # enabled by the server, which in turn dictate the level of data
+    # uploaded to ZULIP_SERVICES_URL.
+    # As some older servers, predating the transition to the ZULIP_SERVICE_*
+    # settings, may have upgraded without redoing this part of their config,
+    # we need this block to set this level correctly based on the
+    # legacy settings.
+
+    # This is a setting that some servers from before 9.0 may have configured
+    # instead of the new ZULIP_SERVICE_* settings.
+    # Translate it to a correct configuration.
+    ZULIP_SERVICE_PUSH_NOTIFICATIONS = True
+    services_append("mobile_push")
+    ZULIP_SERVICES_URL = PUSH_NOTIFICATION_BOUNCER_URL
+    if SUBMIT_USAGE_STATISTICS:
+        ZULIP_SERVICE_SUBMIT_USAGE_STATISTICS = True
+        services_append("submit_usage_statistics")
+
+if services is not None and set(services).intersection(
+    {"submit_usage_statistics", "security_alerts", "mobile_push"}
+):
+    # None of these make sense enabled without ZULIP_SERVICES_URL.
+    assert ZULIP_SERVICES_URL is not None, (
+        "ZULIP_SERVICES_URL is required when any services are enabled."
+    )
+
+ANALYTICS_DATA_UPLOAD_LEVEL = max(
+    [service_name_to_required_upload_level[service] for service in (services or [])],
+    default=AnalyticsDataUploadLevel.NONE,
+)
+
 if DEBUG:
     INTERNAL_IPS = ("127.0.0.1",)
 
@@ -99,15 +176,17 @@ if len(sys.argv) > 2 and sys.argv[0].endswith("manage.py") and sys.argv[1] == "p
 else:
     IS_WORKER = False
 
+# This should primarily be used to customize error messages
+RUNNING_IN_DOCKER = os.path.exists("/.dockerenv")
 
-# This is overridden in test_settings.py for the test suites
-TEST_SUITE = False
 # This is overridden in test_settings.py for the test suites
 PUPPETEER_TESTS = False
 # This is overridden in test_settings.py for the test suites
 RUNNING_OPENAPI_CURL_TEST = False
 # This is overridden in test_settings.py for the test suites
 GENERATE_STRIPE_FIXTURES = False
+# This is overridden in test_settings.py for the test suites
+GENERATE_LITELLM_FIXTURES = False
 # This is overridden in test_settings.py for the test suites
 BAN_CONSOLE_OUTPUT = False
 # This is overridden in test_settings.py for the test suites
@@ -146,9 +225,6 @@ LANGUAGE_CODE = "en-us"
 # to load the internationalization machinery.
 USE_I18N = True
 
-# If you set this to False, Django will not use time-zone-aware datetimes.
-USE_TZ = True
-
 # this directory will be used to store logs for development environment
 DEVELOPMENT_LOG_DIRECTORY = os.path.join(DEPLOY_ROOT, "var", "log")
 
@@ -159,10 +235,9 @@ ALLOWED_HOSTS += [EXTERNAL_HOST_WITHOUT_PORT, "." + EXTERNAL_HOST_WITHOUT_PORT]
 # ... and with the hosts in REALM_HOSTS.
 ALLOWED_HOSTS += REALM_HOSTS.values()
 
-MIDDLEWARE = (
+MIDDLEWARE = [
     "zerver.middleware.TagRequests",
     "zerver.middleware.SetRemoteAddrFromRealIpHeader",
-    "zerver.middleware.RequestContext",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     # Important: All middleware before LogRequests should be
@@ -173,16 +248,15 @@ MIDDLEWARE = (
     "zerver.middleware.JsonErrorHandler",
     "zerver.middleware.RateLimitMiddleware",
     "zerver.middleware.FlushDisplayRecipientCache",
-    "zerver.middleware.ZulipCommonMiddleware",
+    "django.middleware.common.CommonMiddleware",
     "zerver.middleware.LocaleMiddleware",
     "zerver.middleware.HostDomainMiddleware",
+    "zerver.middleware.DetectProxyMisconfiguration",
     "django.middleware.csrf.CsrfViewMiddleware",
     # Make sure 2FA middlewares come after authentication middleware.
     "django_otp.middleware.OTPMiddleware",  # Required by two factor auth.
     "two_factor.middleware.threadlocals.ThreadLocals",  # Required by Twilio
-    # Needs to be after CommonMiddleware, which sets Content-Length
-    "zerver.middleware.FinalizeOpenGraphDescription",
-)
+]
 
 AUTH_USER_MODEL = "zerver.UserProfile"
 
@@ -222,14 +296,16 @@ if not TORNADO_PORTS:
     TORNADO_PORTS = get_tornado_ports(config_file)
 TORNADO_PROCESSES = len(TORNADO_PORTS)
 
-RUNNING_INSIDE_TORNADO = False
+RUNNING_INSIDE_TORNADO = (
+    len(sys.argv) > 1 and "manage.py" in sys.argv[0] and sys.argv[1] == "runtornado"
+)
 
 SILENCED_SYSTEM_CHECKS = [
     # auth.W004 checks that the UserProfile field named by USERNAME_FIELD has
     # `unique=True`.  For us this is `email`, and it's unique only per-realm.
     # Per Django docs, this is perfectly fine so long as our authentication
     # backends support the username not being unique; and they do.
-    # See: https://docs.djangoproject.com/en/3.2/topics/auth/customizing/#django.contrib.auth.models.CustomUser.USERNAME_FIELD
+    # See: https://docs.djangoproject.com/en/5.0/topics/auth/customizing/#django.contrib.auth.models.CustomUser.USERNAME_FIELD
     "auth.W004",
     # models.E034 limits index names to 30 characters for Oracle compatibility.
     # We aren't using Oracle.
@@ -268,7 +344,7 @@ SILENCED_SYSTEM_CHECKS = [
 # We implement these options with a default DATABASES configuration
 # supporting peer authentication, with logic to override it as
 # appropriate if DEVELOPMENT or REMOTE_POSTGRES_HOST is set.
-DATABASES: Dict[str, Dict[str, Any]] = {
+DATABASES: dict[str, dict[str, Any]] = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
         "NAME": get_config("postgresql", "database_name", "zulip"),
@@ -277,11 +353,15 @@ DATABASES: Dict[str, Dict[str, Any]] = {
         "PASSWORD": "",
         # Host = '' => connect to localhost by default
         "HOST": "",
-        "SCHEMA": "zulip",
         "CONN_MAX_AGE": 600,
         "OPTIONS": {
             "connection_factory": TimeTrackingConnection,
             "cursor_factory": TimeTrackingCursor,
+            # The default is null, which means no timeout; 2 is the
+            # minimum allowed value.  We set this low, so we move on
+            # quickly, in the case that the server is running but
+            # unable to handle new connections for some reason.
+            "connect_timeout": 2,
         },
     }
 }
@@ -297,14 +377,13 @@ elif REMOTE_POSTGRES_HOST != "":
         HOST=REMOTE_POSTGRES_HOST,
         PORT=REMOTE_POSTGRES_PORT,
     )
+    if "," in REMOTE_POSTGRES_HOST:
+        DATABASES["default"]["OPTIONS"]["target_session_attrs"] = "read-write"
     if get_secret("postgres_password") is not None:
         DATABASES["default"].update(
             PASSWORD=get_secret("postgres_password"),
         )
-    if REMOTE_POSTGRES_SSLMODE != "":
-        DATABASES["default"]["OPTIONS"]["sslmode"] = REMOTE_POSTGRES_SSLMODE
-    else:
-        DATABASES["default"]["OPTIONS"]["sslmode"] = "verify-full"
+    DATABASES["default"]["OPTIONS"]["sslmode"] = REMOTE_POSTGRES_SSLMODE
 elif (
     get_config("postgresql", "database_user", "zulip") != "zulip"
     and get_secret("postgres_password") is not None
@@ -313,9 +392,8 @@ elif (
         PASSWORD=get_secret("postgres_password"),
         HOST="localhost",
     )
-POSTGRESQL_MISSING_DICTIONARIES = bool(get_config("postgresql", "missing_dictionaries", None))
 
-DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 ########################################################################
 # RABBITMQ CONFIGURATION
@@ -332,7 +410,7 @@ SESSION_ENGINE = "zerver.lib.safe_session_cached_db"
 
 MEMCACHED_PASSWORD = get_secret("memcached_password")
 
-CACHES: Dict[str, Dict[str, object]] = {
+CACHES: dict[str, dict[str, object]] = {
     "default": {
         "BACKEND": "zerver.lib.singleton_bmemcached.SingletonBMemcached",
         "LOCATION": MEMCACHED_LOCATION,
@@ -340,15 +418,15 @@ CACHES: Dict[str, Dict[str, object]] = {
             "socket_timeout": 3600,
             "username": MEMCACHED_USERNAME,
             "password": MEMCACHED_PASSWORD,
-            "pickle_protocol": 4,
+            "pickle_protocol": 5,
         },
     },
     "database": {
         "BACKEND": "django.core.cache.backends.db.DatabaseCache",
         "LOCATION": "third_party_api_results",
-        # This cache shouldn't timeout; we're really just using the
-        # cache API to store the results of requests to third-party
-        # APIs like the Twitter API permanently.
+        # This is currently unused; it was previously used to cache
+        # API responses from third-party APIs like the Twitter API
+        # permanently.
         "TIMEOUT": None,
         "OPTIONS": {
             "MAX_ENTRIES": 100000000,
@@ -388,6 +466,11 @@ if DEVELOPMENT:
 else:
     TOR_EXIT_NODE_FILE_PATH = "/var/lib/zulip/tor-exit-nodes.json"
 
+if USING_CAPTCHA:
+    ALTCHA_HMAC_KEY = get_secret("altcha_hmac")
+else:
+    ALTCHA_HMAC_KEY = ""
+
 ########################################################################
 # SECURITY SETTINGS
 ########################################################################
@@ -417,20 +500,20 @@ LANGUAGE_COOKIE_SAMESITE: Final = "Lax"
 if DEVELOPMENT:
     # Use fast password hashing for creating testing users when not
     # PRODUCTION.  Saves a bunch of time.
-    PASSWORD_HASHERS = (
-        "django.contrib.auth.hashers.SHA1PasswordHasher",
+    PASSWORD_HASHERS = [
+        "django.contrib.auth.hashers.MD5PasswordHasher",
         "django.contrib.auth.hashers.PBKDF2PasswordHasher",
-    )
+    ]
     # Also we auto-generate passwords for the default users which you
     # can query using ./manage.py print_initial_password
     INITIAL_PASSWORD_SALT = get_secret("initial_password_salt")
 else:
     # For production, use the best password hashing algorithm: Argon2
     # Zulip was originally on PBKDF2 so we need it for compatibility
-    PASSWORD_HASHERS = (
+    PASSWORD_HASHERS = [
         "django.contrib.auth.hashers.Argon2PasswordHasher",
         "django.contrib.auth.hashers.PBKDF2PasswordHasher",
-    )
+    ]
 
 ########################################################################
 # API/BOT SETTINGS
@@ -440,23 +523,14 @@ ROOT_DOMAIN_URI = EXTERNAL_URI_SCHEME + EXTERNAL_HOST
 
 S3_KEY = get_secret("s3_key")
 S3_SECRET_KEY = get_secret("s3_secret_key")
+if LOCAL_UPLOADS_DIR is None and S3_REGION is None:
+    import boto3
 
-# GCM tokens are IP-whitelisted; if we deploy to additional
-# servers you will need to explicitly add their IPs here:
-# https://cloud.google.com/console/project/apps~zulip-android/apiui/credential
-ANDROID_GCM_API_KEY = get_secret("android_gcm_api_key")
+    S3_REGION = boto3.client("s3").meta.region_name
 
 DROPBOX_APP_KEY = get_secret("dropbox_app_key")
 
 BIG_BLUE_BUTTON_SECRET = get_secret("big_blue_button_secret")
-
-# Twitter API credentials
-# Secrecy not required because its only used for R/O requests.
-# Please don't make us go over our rate limit.
-TWITTER_CONSUMER_KEY = get_secret("twitter_consumer_key")
-TWITTER_CONSUMER_SECRET = get_secret("twitter_consumer_secret")
-TWITTER_ACCESS_TOKEN_KEY = get_secret("twitter_access_token_key")
-TWITTER_ACCESS_TOKEN_SECRET = get_secret("twitter_access_token_secret")
 
 # These are the bots that Zulip sends automated messages as.
 INTERNAL_BOTS = [
@@ -488,7 +562,7 @@ INTERNAL_BOTS = [
 ]
 
 # Bots that are created for each realm like the reminder-bot goes here.
-REALM_INTERNAL_BOTS: List[Dict[str, str]] = []
+REALM_INTERNAL_BOTS: list[dict[str, str]] = []
 # These are realm-internal bots that may exist in some organizations,
 # so configure power the setting, but should not be auto-created at this time.
 DISABLED_REALM_INTERNAL_BOTS = [
@@ -516,17 +590,6 @@ if PRODUCTION:
 INTERNAL_BOT_DOMAIN = "zulip.com"
 
 ########################################################################
-# STATSD CONFIGURATION
-########################################################################
-
-# Statsd is not super well supported; if you want to use it you'll need
-# to set STATSD_HOST and STATSD_PREFIX.
-if STATSD_HOST != "":
-    INSTALLED_APPS += ["django_statsd"]
-    STATSD_PORT = 8125
-    STATSD_CLIENT = "django_statsd.clients.normal"
-
-########################################################################
 # CAMO HTTPS CACHE CONFIGURATION
 ########################################################################
 
@@ -537,10 +600,11 @@ CAMO_KEY = get_secret("camo_key") if CAMO_URI != "" else None
 # STATIC CONTENT AND MINIFICATION SETTINGS
 ########################################################################
 
-if PRODUCTION or IS_DEV_DROPLET or os.getenv("EXTERNAL_HOST") is not None:
-    STATIC_URL = urljoin(ROOT_DOMAIN_URI, "/static/")
-else:
-    STATIC_URL = "http://localhost:9991/static/"
+if STATIC_URL is None:
+    if PRODUCTION or IS_DEV_DROPLET or os.getenv("EXTERNAL_HOST") is not None:
+        STATIC_URL = urljoin(ROOT_DOMAIN_URI, "/static/")
+    else:
+        STATIC_URL = "http://localhost:9991/static/"
 
 LOCAL_AVATARS_DIR = os.path.join(LOCAL_UPLOADS_DIR, "avatars") if LOCAL_UPLOADS_DIR else None
 LOCAL_FILES_DIR = os.path.join(LOCAL_UPLOADS_DIR, "files") if LOCAL_UPLOADS_DIR else None
@@ -554,7 +618,7 @@ LOCAL_FILES_DIR = os.path.join(LOCAL_UPLOADS_DIR, "files") if LOCAL_UPLOADS_DIR 
 # ZulipStorage when not DEBUG.
 
 if not DEBUG:
-    STATICFILES_STORAGE = "zerver.lib.storage.ZulipStorage"
+    STORAGES = {"staticfiles": {"BACKEND": "zerver.lib.storage.ZulipStorage"}}
     if PRODUCTION:
         STATIC_ROOT = "/home/zulip/prod-static"
     else:
@@ -582,7 +646,7 @@ else:
 ########################################################################
 
 # List of callables that know how to import templates from various sources.
-LOADERS: List[Union[str, Tuple[object, ...]]] = [
+LOADERS: list[str | tuple[object, ...]] = [
     "django.template.loaders.filesystem.Loader",
     "django.template.loaders.app_directories.Loader",
 ]
@@ -590,7 +654,7 @@ if PRODUCTION:
     # Template caching is a significant performance win in production.
     LOADERS = [("django.template.loaders.cached.Loader", LOADERS)]
 
-base_template_engine_settings: Dict[str, Any] = {
+base_template_engine_settings: dict[str, Any] = {
     "BACKEND": "django.template.backends.jinja2.Jinja2",
     "OPTIONS": {
         "environment": "zproject.jinja2.environment",
@@ -604,6 +668,11 @@ base_template_engine_settings: Dict[str, Any] = {
     },
 }
 
+if CORPORATE_ENABLED:
+    base_template_engine_settings["OPTIONS"]["context_processors"].append(
+        "zerver.context_processors.zulip_default_corporate_context"
+    )
+
 default_template_engine_settings = deepcopy(base_template_engine_settings)
 default_template_engine_settings.update(
     NAME="Jinja2",
@@ -612,6 +681,10 @@ default_template_engine_settings.update(
         os.path.join(DEPLOY_ROOT, "templates"),
         # The webhook integration templates
         os.path.join(DEPLOY_ROOT, "zerver", "webhooks"),
+        # The python-zulip-api:integrations package templates
+        # Keep above the zulip_bots templates to override bots with the same names
+        # (e.g., the Jira plugin doc and the Jira bot both use "jira/doc.md").
+        os.path.join("static" if DEBUG else STATIC_ROOT, "generated", "integrations"),
         # The python-zulip-api:zulip_bots package templates
         os.path.join("static" if DEBUG else STATIC_ROOT, "generated", "bots"),
     ],
@@ -683,18 +756,21 @@ QUEUE_ERROR_DIR = zulip_path("/var/log/zulip/queue_error")
 QUEUE_STATS_DIR = zulip_path("/var/log/zulip/queue_stats")
 DIGEST_LOG_PATH = zulip_path("/var/log/zulip/digest.log")
 ANALYTICS_LOG_PATH = zulip_path("/var/log/zulip/analytics.log")
-ANALYTICS_LOCK_DIR = zulip_path("/home/zulip/deployments/analytics-lock-dir")
 WEBHOOK_LOG_PATH = zulip_path("/var/log/zulip/webhooks_errors.log")
 WEBHOOK_ANOMALOUS_PAYLOADS_LOG_PATH = zulip_path("/var/log/zulip/webhooks_anomalous_payloads.log")
 WEBHOOK_UNSUPPORTED_EVENTS_LOG_PATH = zulip_path("/var/log/zulip/webhooks_unsupported_events.log")
 SOFT_DEACTIVATION_LOG_PATH = zulip_path("/var/log/zulip/soft_deactivation.log")
 TRACEMALLOC_DUMP_DIR = zulip_path("/var/log/zulip/tracemalloc")
-DELIVER_SCHEDULED_MESSAGES_LOG_PATH = zulip_path("/var/log/zulip/deliver_scheduled_messages.log")
 RETENTION_LOG_PATH = zulip_path("/var/log/zulip/message_retention.log")
 AUTH_LOG_PATH = zulip_path("/var/log/zulip/auth.log")
 SCIM_LOG_PATH = zulip_path("/var/log/zulip/scim.log")
+REGISTRATION_LOG_PATH = zulip_path("/var/log/zulip/registration.log")
 
 ZULIP_WORKER_TEST_FILE = zulip_path("/var/log/zulip/zulip-worker-test-file")
+
+LOCKFILE_DIRECTORY = (
+    "/srv/zulip-locks" if not DEVELOPMENT else os.path.join(os.path.join(DEPLOY_ROOT, "var/locks"))
+)
 
 
 if IS_WORKER:
@@ -702,11 +778,8 @@ if IS_WORKER:
 else:
     FILE_LOG_PATH = SERVER_LOG_PATH
 
-# This is disabled in a few tests.
-LOGGING_ENABLED = True
-
 DEFAULT_ZULIP_HANDLERS = [
-    *(["zulip_admins"] if ERROR_REPORTING else []),
+    *(["mail_admins"] if ERROR_REPORTING else []),
     "console",
     "file",
     "errors_file",
@@ -727,7 +800,20 @@ def skip_site_packages_logs(record: logging.LogRecord) -> bool:
     return "site-packages" not in record.pathname
 
 
-LOGGING: Dict[str, Any] = {
+def file_handler(
+    filename: str,
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "DEBUG",
+    formatter: str = "default",
+) -> dict[str, str]:
+    return {
+        "filename": filename,
+        "level": level,
+        "formatter": formatter,
+        "class": "logging.handlers.WatchedFileHandler",
+    }
+
+
+LOGGING: dict[str, Any] = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
@@ -754,9 +840,6 @@ LOGGING: Dict[str, Any] = {
         "nop": {
             "()": "zerver.lib.logging_util.ReturnTrue",
         },
-        "require_logging_enabled": {
-            "()": "zerver.lib.logging_util.ReturnEnabled",
-        },
         "require_really_deployed": {
             "()": "zerver.lib.logging_util.RequireReallyDeployed",
         },
@@ -770,75 +853,35 @@ LOGGING: Dict[str, Any] = {
         },
     },
     "handlers": {
-        "zulip_admins": {
-            "level": "ERROR",
-            "class": "zerver.logging_handlers.AdminNotifyHandler",
-            "filters": (
-                ["ZulipLimiter", "require_debug_false", "require_really_deployed"]
-                if not DEBUG_ERROR_REPORTING
-                else []
-            ),
-            "formatter": "default",
-        },
-        "auth_file": {
-            "level": "DEBUG",
-            "class": "logging.handlers.WatchedFileHandler",
-            "formatter": "default",
-            "filename": AUTH_LOG_PATH,
-        },
         "console": {
             "level": "DEBUG",
             "class": "logging.StreamHandler",
             "formatter": "default",
         },
-        "file": {
-            "level": "DEBUG",
-            "class": "logging.handlers.WatchedFileHandler",
-            "formatter": "default",
-            "filename": FILE_LOG_PATH,
+        "mail_admins": {
+            "level": "ERROR",
+            "class": "django.utils.log.AdminEmailHandler",
+            "filters": (
+                ["ZulipLimiter", "require_debug_false", "require_really_deployed"]
+                if not DEBUG_ERROR_REPORTING
+                else []
+            ),
         },
-        "errors_file": {
-            "level": "WARNING",
-            "class": "logging.handlers.WatchedFileHandler",
-            "formatter": "default",
-            "filename": ERROR_FILE_LOG_PATH,
-        },
-        "ldap_file": {
-            "level": "DEBUG",
-            "class": "logging.handlers.WatchedFileHandler",
-            "formatter": "default",
-            "filename": LDAP_LOG_PATH,
-        },
-        "scim_file": {
-            "level": "DEBUG",
-            "class": "logging.handlers.WatchedFileHandler",
-            "formatter": "default",
-            "filename": SCIM_LOG_PATH,
-        },
-        "slow_queries_file": {
-            "level": "INFO",
-            "class": "logging.handlers.WatchedFileHandler",
-            "formatter": "default",
-            "filename": SLOW_QUERIES_LOG_PATH,
-        },
-        "webhook_file": {
-            "level": "DEBUG",
-            "class": "logging.handlers.WatchedFileHandler",
-            "formatter": "webhook_request_data",
-            "filename": WEBHOOK_LOG_PATH,
-        },
-        "webhook_unsupported_file": {
-            "level": "DEBUG",
-            "class": "logging.handlers.WatchedFileHandler",
-            "formatter": "webhook_request_data",
-            "filename": WEBHOOK_UNSUPPORTED_EVENTS_LOG_PATH,
-        },
-        "webhook_anomalous_file": {
-            "level": "DEBUG",
-            "class": "logging.handlers.WatchedFileHandler",
-            "formatter": "webhook_request_data",
-            "filename": WEBHOOK_ANOMALOUS_PAYLOADS_LOG_PATH,
-        },
+        "analytics_file": file_handler(ANALYTICS_LOG_PATH),
+        "auth_file": file_handler(AUTH_LOG_PATH),
+        "errors_file": file_handler(ERROR_FILE_LOG_PATH, level="WARNING"),
+        "file": file_handler(FILE_LOG_PATH),
+        "ldap_file": file_handler(LDAP_LOG_PATH),
+        "scim_file": file_handler(SCIM_LOG_PATH),
+        "slow_queries_file": file_handler(SLOW_QUERIES_LOG_PATH, level="INFO"),
+        "registration_file": file_handler(REGISTRATION_LOG_PATH, level="INFO"),
+        "webhook_anomalous_file": file_handler(
+            WEBHOOK_ANOMALOUS_PAYLOADS_LOG_PATH, formatter="webhook_request_data"
+        ),
+        "webhook_file": file_handler(WEBHOOK_LOG_PATH, formatter="webhook_request_data"),
+        "webhook_unsupported_file": file_handler(
+            WEBHOOK_UNSUPPORTED_EVENTS_LOG_PATH, formatter="webhook_request_data"
+        ),
     },
     "loggers": {
         # The Python logging module uses a hierarchy of logger names for config:
@@ -866,7 +909,6 @@ LOGGING: Dict[str, Any] = {
         # root logger
         "": {
             "level": "INFO",
-            "filters": ["require_logging_enabled"],
             "handlers": DEFAULT_ZULIP_HANDLERS,
         },
         # Django, alphabetized
@@ -922,6 +964,14 @@ LOGGING: Dict[str, Any] = {
             "handlers": ["scim_file", "errors_file"],
             "propagate": False,
         },
+        "mail.log": {
+            "level": "WARNING",
+        },
+        "pyvips": {
+            "level": "ERROR",
+            "handlers": ["console", "errors_file"],
+            "propagate": False,
+        },
         "pika": {
             # pika is super chatty on INFO.
             "level": "WARNING",
@@ -947,6 +997,10 @@ LOGGING: Dict[str, Any] = {
         "zerver.management.commands.deliver_scheduled_messages": {
             "level": "DEBUG",
         },
+        "zulip.analytics": {
+            "handlers": ["analytics_file", "errors_file"],
+            "propagate": False,
+        },
         "zulip.auth": {
             "level": "DEBUG",
             "handlers": [*DEFAULT_ZULIP_HANDLERS, "auth_file"],
@@ -964,6 +1018,10 @@ LOGGING: Dict[str, Any] = {
         "zulip.queue": {
             "level": "WARNING",
         },
+        "zulip.registration": {
+            "handlers": ["registration_file", "errors_file"],
+            "propagate": False,
+        },
         "zulip.retention": {
             "handlers": ["file", "errors_file"],
             "propagate": False,
@@ -975,12 +1033,6 @@ LOGGING: Dict[str, Any] = {
         },
         "zulip.soft_deactivation": {
             "handlers": ["file", "errors_file"],
-            "propagate": False,
-        },
-        # This logger is used only for automated tests validating the
-        # error-handling behavior of the zulip_admins handler.
-        "zulip.test_zulip_admins_handler": {
-            "handlers": ["zulip_admins"],
             "propagate": False,
         },
         "zulip.zerver.webhooks": {
@@ -1074,6 +1126,11 @@ SOCIAL_AUTH_FIELDS_STORED_IN_SESSION = [
     "mobile_flow_otp",
     "desktop_flow_otp",
     "multiuse_object_key",
+    # Include "next" so python-social-auth treats it like other session fields
+    # and clears it when absent in subsequent auth requests. Otherwise,
+    # it saves it in the session due to its being the redirect field,
+    # but doesn't clear it from the session when the "next" is absent.
+    "next",
 ]
 SOCIAL_AUTH_LOGIN_ERROR_URL = "/login/"
 
@@ -1119,6 +1176,15 @@ if PRODUCTION:
         "/etc/zulip/saml/zulip-private-key.key"
     )
 
+    if SOCIAL_AUTH_SAML_SP_PUBLIC_CERT and SOCIAL_AUTH_SAML_SP_PRIVATE_KEY:
+        # If the certificates are set up, it's certainly desirable to sign
+        # LogoutRequests and LogoutResponses unless explicitly specified otherwise
+        # in the configuration.
+        if "logoutRequestSigned" not in SOCIAL_AUTH_SAML_SECURITY_CONFIG:
+            SOCIAL_AUTH_SAML_SECURITY_CONFIG["logoutRequestSigned"] = True
+        if "logoutResponseSigned" not in SOCIAL_AUTH_SAML_SECURITY_CONFIG:
+            SOCIAL_AUTH_SAML_SECURITY_CONFIG["logoutResponseSigned"] = True
+
 if "signatureAlgorithm" not in SOCIAL_AUTH_SAML_SECURITY_CONFIG:
     # If the configuration doesn't explicitly specify the algorithm,
     # we set RSA1 with SHA256 to override the python3-saml default, which uses
@@ -1142,6 +1208,7 @@ for idp_name, idp_dict in SOCIAL_AUTH_SAML_ENABLED_IDPS.items():
         path = f"/etc/zulip/saml/idps/{idp_name}.crt"
     idp_dict["x509cert"] = get_from_file_if_exists(path)
 
+
 SOCIAL_AUTH_PIPELINE = [
     "social_core.pipeline.social_auth.social_details",
     "zproject.backends.social_auth_associate_user",
@@ -1159,7 +1226,7 @@ if EMAIL_BACKEND is not None:
     # If the server admin specified a custom email backend, use that.
     pass
 elif DEVELOPMENT:
-    # In the dev environment, emails are printed to the run-dev.py console.
+    # In the dev environment, emails are printed to the run-dev console.
     EMAIL_BACKEND = "zproject.email_backends.EmailLogBackEnd"
 elif not EMAIL_HOST:
     # If an email host is not specified, fail gracefully
@@ -1197,6 +1264,11 @@ CROSS_REALM_BOT_EMAILS = {
     "emailgateway@zulip.com",
 }
 
+MOBILE_NOTIFICATIONS_SHARDS = int(
+    get_config("application_server", "mobile_notification_shards", "1")
+)
+USER_ACTIVITY_SHARDS = int(get_config("application_server", "user_activity_shards", "1"))
+
 TWO_FACTOR_PATCH_ADMIN = False
 
 # Allow the environment to override the default DSN
@@ -1205,6 +1277,9 @@ SENTRY_DSN = os.environ.get("SENTRY_DSN", SENTRY_DSN)
 SCIM_SERVICE_PROVIDER = {
     "USER_ADAPTER": "zerver.lib.scim.ZulipSCIMUser",
     "USER_FILTER_PARSER": "zerver.lib.scim_filter.ZulipUserFilterQuery",
+    "GROUP_ADAPTER": "zerver.lib.scim.ZulipSCIMGroup",
+    "GROUP_MODEL": "zerver.models.groups.NamedUserGroup",
+    "GROUP_FILTER_PARSER": "zerver.lib.scim_filter.ZulipGroupFilterQuery",
     # NETLOC is actually overridden by the behavior of base_scim_location_getter,
     # but django-scim2 requires it to be set, even though it ends up not being used.
     # So we need to give it some value here, and EXTERNAL_HOST is the most generic.
@@ -1221,3 +1296,8 @@ SCIM_SERVICE_PROVIDER = {
         },
     ],
 }
+
+# Which API key to use will be determined based on TOPIC_SUMMARIZATION_MODEL.
+TOPIC_SUMMARIZATION_API_KEY = get_secret("topic_summarization_api_key", None)
+
+PARTIAL_USERS = bool(os.environ.get("PARTIAL_USERS"))

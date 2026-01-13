@@ -13,7 +13,7 @@ over 100 native integrations. The entire Zulip codebase is 100% open source.
 
 Zulip has been gaining in popularity since it was [released as open source
 software][oss-release] in late 2015, with code contributions from [over 1000
-people](https://zulip.com/team) from all around the world. Thousands of people
+people](https://zulip.com/team/) from all around the world. Thousands of people
 use Zulip every day, and your work on Zulip will have meaningful impact
 on their experience.
 
@@ -30,9 +30,9 @@ your internship experience with the Zulip project will be highly interactive.
 > and welcoming. You learn a lot just by watching others work and talk.”_ – Sai
 > Rohitth Chiluka, Zulip GSoC 2021 participant
 
-As part of our commitment to mentorship, Zulip has over 160,000 words of
+As part of our commitment to mentorship, Zulip has over 185,000 words of
 [documentation for
-developers](../index.md#welcome-to-the-zulip-documentation), much of it
+developers](../index.md#zulip-documentation-overview), much of it
 designed to explain not just how Zulip works, but why Zulip works the way that
 it does. To learn more about our mission and values, check out [this blog
 post](https://blog.zulip.com/2021/04/28/why-zulip-is-on-github-sponsors/)!
@@ -40,7 +40,7 @@ post](https://blog.zulip.com/2021/04/28/why-zulip-is-on-github-sponsors/)!
 ## Outreach program experience
 
 Zulip has been a [GSoC](https://summerofcode.withgoogle.com/) mentoring
-organization since 2016, and we accept 15-20 GSoC participants each summer. We
+organization since 2016, and we accept 12-20 GSoC participants each summer. We
 have also mentored several interns through the
 [Outreachy](https://www.outreachy.org/) program, and hundreds of Google Code-In
 participants.
@@ -48,7 +48,7 @@ participants.
 Zulip operates under a **group mentorship** model. While you will have an
 assigned mentor, you will also get lots of feedback from other members of the
 [Zulip development community](https://zulip.com/development-community/) by
-posting your questions and ideas in public streams. We encourage outreach
+posting your questions and ideas in public channels. We encourage outreach
 program participants to help each other out as well!
 
 Program participants work on a variety of issues in their areas of interest,
@@ -64,7 +64,9 @@ maintainers.
 To learn more about the experience of doing an outreach program with Zulip:
 
 - Check out our blog posts about Zulip's
-  [2022](https://blog.zulip.com/2022/11/02/google-summer-of-code-2022/) and
+  [2024](https://blog.zulip.com/2024/10/09/google-summer-of-code-2024/),
+  [2023](https://blog.zulip.com/2024/01/24/google-summer-of-code-2023/),
+  [2022](https://blog.zulip.com/2022/11/02/google-summer-of-code-2022/), and
   [2021](https://blog.zulip.com/2021/09/30/google-summer-of-code-2021/) Google
   Summer of Code programs.
 

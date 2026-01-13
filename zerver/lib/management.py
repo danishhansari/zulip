@@ -1,16 +1,25 @@
 # Library code for use in management commands
 import logging
-from argparse import ArgumentParser, RawTextHelpFormatter
+import os
+import sys
+import time
+from argparse import ArgumentParser, BooleanOptionalAction, RawTextHelpFormatter, _ActionsContainer
 from dataclasses import dataclass
-from typing import Any, Collection, Dict, Optional
+from functools import reduce, wraps
+from typing import Any, Protocol
 
 from django.conf import settings
 from django.core import validators
 from django.core.exceptions import MultipleObjectsReturned, ValidationError
 from django.core.management.base import BaseCommand, CommandError, CommandParser
+from django.db.models import Q, QuerySet
+from typing_extensions import override
 
+from scripts.lib.zulip_tools import LOCK_DIR as DEPLOYMENT_LOCK_DIR
+from zerver.lib.context_managers import lockfile_nonblocking
 from zerver.lib.initial_password import initial_password
-from zerver.models import Client, Realm, UserProfile, get_client
+from zerver.models import Client, Realm, UserProfile
+from zerver.models.clients import get_client
 
 
 def is_integer_string(val: str) -> bool:
@@ -21,35 +30,83 @@ def is_integer_string(val: str) -> bool:
         return False
 
 
-def check_config() -> None:
-    for setting_name, default in settings.REQUIRED_SETTINGS:
-        # if required setting is the same as default OR is not found in settings,
-        # throw error to add/set that setting in config
-        try:
-            if getattr(settings, setting_name) != default:
-                continue
-        except AttributeError:
-            pass
+class HandleMethod(Protocol):
+    def __call__(self, *args: Any, **kwargs: Any) -> None: ...
 
-        raise CommandError(f"Error: You must set {setting_name} in /etc/zulip/settings.py.")
+
+def abort_unless_locked(handle_func: HandleMethod) -> HandleMethod:
+    @wraps(handle_func)
+    def our_handle(self: BaseCommand, *args: Any, **kwargs: Any) -> None:
+        os.makedirs(settings.LOCKFILE_DIRECTORY, exist_ok=True)
+        # Trim out just the last part of the module name, which is the
+        # command name, to use as the lockfile name;
+        # `zerver.management.commands.send_zulip_update_announcements`
+        # becomes `/srv/zulip-locks/send_zulip_update_announcements.lock`
+        lockfile_name = handle_func.__module__.split(".")[-1]
+        lockfile_path = settings.LOCKFILE_DIRECTORY + "/" + lockfile_name + ".lock"
+        with lockfile_nonblocking(lockfile_path) as lock_acquired:
+            if not lock_acquired:  # nocoverage
+                self.stdout.write(
+                    self.style.ERROR(f"Lock {lockfile_path} is unavailable; exiting.")
+                )
+                sys.exit(1)
+            handle_func(self, *args, **kwargs)
+
+    return our_handle
+
+
+def abort_cron_during_deploy(handle_func: HandleMethod) -> HandleMethod:
+    @wraps(handle_func)
+    def our_handle(self: BaseCommand, *args: Any, **kwargs: Any) -> None:
+        # For safety, we only trust the lock directory if it was
+        # created within the last hour -- otherwise, a spurious
+        # deploy lock could linger and block all hourly crons.
+        if (
+            os.environ.get("RUNNING_UNDER_CRON")
+            and os.path.exists(DEPLOYMENT_LOCK_DIR)
+            and time.time() - os.path.getctime(DEPLOYMENT_LOCK_DIR) < 3600
+        ):  # nocoverage
+            self.stdout.write(
+                self.style.ERROR("Deployment in process; aborting cron management command.")
+            )
+            sys.exit(1)
+        handle_func(self, *args, **kwargs)
+
+    return our_handle
 
 
 @dataclass
 class CreateUserParameters:
     email: str
     full_name: str
-    password: Optional[str]
+    password: str | None
 
 
 class ZulipBaseCommand(BaseCommand):
     # Fix support for multi-line usage
+    @override
     def create_parser(self, prog_name: str, subcommand: str, **kwargs: Any) -> CommandParser:
         parser = super().create_parser(prog_name, subcommand, **kwargs)
+        parser.add_argument(
+            "--automated",
+            help="This command is run non-interactively (enables Sentry, etc)",
+            action=BooleanOptionalAction,
+            default=not sys.stdin.isatty(),
+        )
         parser.formatter_class = RawTextHelpFormatter
         return parser
 
+    @override
+    def execute(self, *args: Any, **options: Any) -> None:
+        if settings.SENTRY_DSN and not options["automated"]:  # nocoverage
+            import sentry_sdk
+
+            # This deactivates Sentry
+            sentry_sdk.init()
+        super().execute(*args, **options)
+
     def add_realm_args(
-        self, parser: ArgumentParser, *, required: bool = False, help: Optional[str] = None
+        self, parser: _ActionsContainer, *, required: bool = False, help: str | None = None
     ) -> None:
         if help is None:
             help = """The numeric or string ID (subdomain) of the Zulip organization to modify.
@@ -84,7 +141,7 @@ server via `ps -ef` or reading bash history. Prefer
 
     def add_user_list_args(
         self,
-        parser: ArgumentParser,
+        parser: _ActionsContainer,
         help: str = "A comma-separated list of email addresses.",
         all_users_help: str = "All users in realm.",
     ) -> None:
@@ -92,7 +149,7 @@ server via `ps -ef` or reading bash history. Prefer
 
         parser.add_argument("-a", "--all-users", action="store_true", help=all_users_help)
 
-    def get_realm(self, options: Dict[str, Any]) -> Optional[Realm]:
+    def get_realm(self, options: dict[str, Any]) -> Realm | None:
         val = options["realm_id"]
         if val is None:
             return None
@@ -111,11 +168,11 @@ server via `ps -ef` or reading bash history. Prefer
 
     def get_users(
         self,
-        options: Dict[str, Any],
-        realm: Optional[Realm],
-        is_bot: Optional[bool] = None,
+        options: dict[str, Any],
+        realm: Realm | None,
+        is_bot: bool | None = None,
         include_deactivated: bool = False,
-    ) -> Collection[UserProfile]:
+    ) -> QuerySet[UserProfile]:
         if "all_users" in options:
             all_users = options["all_users"]
 
@@ -137,16 +194,32 @@ server via `ps -ef` or reading bash history. Prefer
                 return user_profiles
 
         if options["users"] is None:
-            return []
+            return UserProfile.objects.none()
         emails = {email.strip() for email in options["users"].split(",")}
-        return [self.get_user(email, realm) for email in emails]
+        # This is inefficient, but we fetch (and throw away) the
+        # get_user of each email, so that we verify that the email
+        # address/realm returned only one result; it may return more
+        # if realm is not specified but email address was.
+        for email in emails:
+            self.get_user(email, realm)
 
-    def get_user(self, email: str, realm: Optional[Realm]) -> UserProfile:
+        user_profiles = UserProfile.objects.all().select_related("realm")
+        if realm is not None:
+            user_profiles = user_profiles.filter(realm=realm)
+        email_matches = [Q(delivery_email__iexact=e) for e in emails]
+        user_profiles = user_profiles.filter(reduce(lambda a, b: a | b, email_matches)).order_by(
+            "id"
+        )
+
+        # Return the single query, for ease of composing.
+        return user_profiles
+
+    def get_user(self, email: str, realm: Realm | None) -> UserProfile:
         # If a realm is specified, try to find the user there, and
         # throw an error if they don't exist.
         if realm is not None:
             try:
-                return UserProfile.objects.select_related().get(
+                return UserProfile.objects.select_related("realm").get(
                     delivery_email__iexact=email.strip(), realm=realm
                 )
             except UserProfile.DoesNotExist:
@@ -158,7 +231,9 @@ server via `ps -ef` or reading bash history. Prefer
         # optimistically try to see if there is exactly one user with
         # that email; if so, we'll return it.
         try:
-            return UserProfile.objects.select_related().get(delivery_email__iexact=email.strip())
+            return UserProfile.objects.select_related("realm").get(
+                delivery_email__iexact=email.strip()
+            )
         except MultipleObjectsReturned:
             raise CommandError(
                 "This Zulip server contains multiple users with that email (in different realms);"
@@ -171,7 +246,7 @@ server via `ps -ef` or reading bash history. Prefer
         """Returns a Zulip Client object to be used for things done in management commands"""
         return get_client("ZulipServer")
 
-    def get_create_user_params(self, options: Dict[str, Any]) -> CreateUserParameters:  # nocoverage
+    def get_create_user_params(self, options: dict[str, Any]) -> CreateUserParameters:  # nocoverage
         """
         Parses parameters for user creation defined in add_create_user_args.
         """
@@ -192,7 +267,7 @@ server via `ps -ef` or reading bash history. Prefer
 
         if options["password_file"] is not None:
             with open(options["password_file"]) as f:
-                password: Optional[str] = f.read().strip()
+                password: str | None = f.read().strip()
         elif options["password"] is not None:
             logging.warning(
                 "Passing password on the command line is insecure; prefer --password-file."

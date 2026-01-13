@@ -18,9 +18,10 @@ if [ "$#" -eq 0 ]; then
             ':!docs/translating' \
             ':!locale' \
             ':!postgresql.conf.template.erb' \
+            ':!tools/build-demo-organization-wordlist' \
             ':!tools/setup/emoji/emoji_map.json' \
             ':!tools/setup/emoji/emoji_names.py' \
-            ':!yarn.lock' \
+            ':!pnpm-lock.yaml' \
             ':!zerver/management/data/unified_reactions.json'
     )"
     mapfile -t FILES_TO_BE_CHECKED <<<"$FILES_TO_BE_CHECKED"

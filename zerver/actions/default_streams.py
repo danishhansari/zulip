@@ -1,48 +1,50 @@
-from typing import Any, Dict, Iterable, List
+from collections.abc import Iterable
+from typing import Any
 
 from django.db import transaction
 from django.utils.translation import gettext as _
 
+from zerver.lib.default_streams import get_default_stream_ids_for_realm
 from zerver.lib.exceptions import JsonableError
-from zerver.lib.types import APIStreamDict
-from zerver.models import (
-    DefaultStream,
-    DefaultStreamGroup,
-    Realm,
-    Stream,
-    active_non_guest_user_ids,
-    get_default_stream_groups,
-)
-from zerver.tornado.django_api import send_event
+from zerver.models import DefaultStream, DefaultStreamGroup, Realm, Stream
+from zerver.models.streams import get_default_stream_groups
+from zerver.models.users import active_non_guest_user_ids
+from zerver.tornado.django_api import send_event_on_commit
 
 
 def check_default_stream_group_name(group_name: str) -> None:
     if group_name.strip() == "":
-        raise JsonableError(_("Invalid default stream group name '{}'").format(group_name))
+        raise JsonableError(
+            _("Invalid default channel group name '{group_name}'").format(group_name=group_name)
+        )
     if len(group_name) > DefaultStreamGroup.MAX_NAME_LENGTH:
         raise JsonableError(
-            _("Default stream group name too long (limit: {} characters)").format(
-                DefaultStreamGroup.MAX_NAME_LENGTH,
+            _("Default channel group name too long (limit: {max_length} characters)").format(
+                max_length=DefaultStreamGroup.MAX_NAME_LENGTH,
             )
         )
     for i in group_name:
         if ord(i) == 0:
             raise JsonableError(
-                _("Default stream group name '{}' contains NULL (0x00) characters.").format(
-                    group_name,
+                _(
+                    "Default channel group name '{group_name}' contains NULL (0x00) characters."
+                ).format(
+                    group_name=group_name,
                 )
             )
 
 
 def lookup_default_stream_groups(
-    default_stream_group_names: List[str], realm: Realm
-) -> List[DefaultStreamGroup]:
+    default_stream_group_names: list[str], realm: Realm
+) -> list[DefaultStreamGroup]:
     default_stream_groups = []
     for group_name in default_stream_group_names:
         try:
             default_stream_group = DefaultStreamGroup.objects.get(name=group_name, realm=realm)
         except DefaultStreamGroup.DoesNotExist:
-            raise JsonableError(_("Invalid default stream group {}").format(group_name))
+            raise JsonableError(
+                _("Invalid default channel group {group_name}").format(group_name=group_name)
+            )
         default_stream_groups.append(default_stream_group)
     return default_stream_groups
 
@@ -50,9 +52,9 @@ def lookup_default_stream_groups(
 def notify_default_streams(realm: Realm) -> None:
     event = dict(
         type="default_streams",
-        default_streams=streams_to_dicts_sorted(get_default_streams_for_realm(realm.id)),
+        default_streams=list(get_default_stream_ids_for_realm(realm.id)),
     )
-    transaction.on_commit(lambda: send_event(realm, event, active_non_guest_user_ids(realm.id)))
+    send_event_on_commit(realm, event, active_non_guest_user_ids(realm.id))
 
 
 def notify_default_stream_groups(realm: Realm) -> None:
@@ -62,7 +64,7 @@ def notify_default_stream_groups(realm: Realm) -> None:
             get_default_stream_groups(realm)
         ),
     )
-    transaction.on_commit(lambda: send_event(realm, event, active_non_guest_user_ids(realm.id)))
+    send_event_on_commit(realm, event, active_non_guest_user_ids(realm.id))
 
 
 def do_add_default_stream(stream: Stream) -> None:
@@ -82,15 +84,15 @@ def do_remove_default_stream(stream: Stream) -> None:
 
 
 def do_create_default_stream_group(
-    realm: Realm, group_name: str, description: str, streams: List[Stream]
+    realm: Realm, group_name: str, description: str, streams: list[Stream]
 ) -> None:
-    default_streams = get_default_streams_for_realm(realm.id)
+    default_stream_ids = get_default_stream_ids_for_realm(realm.id)
     for stream in streams:
-        if stream in default_streams:
+        if stream.id in default_stream_ids:
             raise JsonableError(
                 _(
-                    "'{stream_name}' is a default stream and cannot be added to '{group_name}'",
-                ).format(stream_name=stream.name, group_name=group_name)
+                    "'{channel_name}' is a default channel and cannot be added to '{group_name}'",
+                ).format(channel_name=stream.name, group_name=group_name)
             )
 
     check_default_stream_group_name(group_name)
@@ -100,7 +102,7 @@ def do_create_default_stream_group(
     if not created:
         raise JsonableError(
             _(
-                "Default stream group '{group_name}' already exists",
+                "Default channel group '{group_name}' already exists",
             ).format(group_name=group_name)
         )
 
@@ -109,21 +111,21 @@ def do_create_default_stream_group(
 
 
 def do_add_streams_to_default_stream_group(
-    realm: Realm, group: DefaultStreamGroup, streams: List[Stream]
+    realm: Realm, group: DefaultStreamGroup, streams: list[Stream]
 ) -> None:
-    default_streams = get_default_streams_for_realm(realm.id)
+    default_stream_ids = get_default_stream_ids_for_realm(realm.id)
     for stream in streams:
-        if stream in default_streams:
+        if stream.id in default_stream_ids:
             raise JsonableError(
                 _(
-                    "'{stream_name}' is a default stream and cannot be added to '{group_name}'",
-                ).format(stream_name=stream.name, group_name=group.name)
+                    "'{channel_name}' is a default channel and cannot be added to '{group_name}'",
+                ).format(channel_name=stream.name, group_name=group.name)
             )
         if stream in group.streams.all():
             raise JsonableError(
                 _(
-                    "Stream '{stream_name}' is already present in default stream group '{group_name}'",
-                ).format(stream_name=stream.name, group_name=group.name)
+                    "Channel '{channel_name}' is already present in default channel group '{group_name}'",
+                ).format(channel_name=stream.name, group_name=group.name)
             )
         group.streams.add(stream)
 
@@ -132,18 +134,20 @@ def do_add_streams_to_default_stream_group(
 
 
 def do_remove_streams_from_default_stream_group(
-    realm: Realm, group: DefaultStreamGroup, streams: List[Stream]
+    realm: Realm, group: DefaultStreamGroup, streams: list[Stream]
 ) -> None:
+    group_stream_ids = {stream.id for stream in group.streams.all()}
     for stream in streams:
-        if stream not in group.streams.all():
+        if stream.id not in group_stream_ids:
             raise JsonableError(
                 _(
-                    "Stream '{stream_name}' is not present in default stream group '{group_name}'",
-                ).format(stream_name=stream.name, group_name=group.name)
+                    "Channel '{channel_name}' is not present in default channel group '{group_name}'",
+                ).format(channel_name=stream.name, group_name=group.name)
             )
-        group.streams.remove(stream)
 
-    group.save()
+    delete_stream_ids = {stream.id for stream in streams}
+
+    group.streams.remove(*delete_stream_ids)
     notify_default_stream_groups(realm)
 
 
@@ -152,11 +156,17 @@ def do_change_default_stream_group_name(
 ) -> None:
     if group.name == new_group_name:
         raise JsonableError(
-            _("This default stream group is already named '{}'").format(new_group_name)
+            _("This default channel group is already named '{group_name}'").format(
+                group_name=new_group_name
+            )
         )
 
     if DefaultStreamGroup.objects.filter(name=new_group_name, realm=realm).exists():
-        raise JsonableError(_("Default stream group '{}' already exists").format(new_group_name))
+        raise JsonableError(
+            _("Default channel group '{group_name}' already exists").format(
+                group_name=new_group_name
+            )
+        )
 
     group.name = new_group_name
     group.save()
@@ -176,19 +186,7 @@ def do_remove_default_stream_group(realm: Realm, group: DefaultStreamGroup) -> N
     notify_default_stream_groups(realm)
 
 
-def get_default_streams_for_realm(realm_id: int) -> List[Stream]:
-    return [
-        default.stream
-        for default in DefaultStream.objects.select_related().filter(realm_id=realm_id)
-    ]
-
-
-# returns default streams in JSON serializable format
-def streams_to_dicts_sorted(streams: List[Stream]) -> List[APIStreamDict]:
-    return sorted((stream.to_dict() for stream in streams), key=lambda elt: elt["name"])
-
-
 def default_stream_groups_to_dicts_sorted(
     groups: Iterable[DefaultStreamGroup],
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     return sorted((group.to_dict() for group in groups), key=lambda elt: elt["name"])

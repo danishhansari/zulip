@@ -2,45 +2,63 @@
 
 Zulip's API will always return a JSON format response.
 The HTTP status code indicates whether the request was successful
-(200 = success, 40x = user error, 50x = server error).  Every response
-will contain at least two keys: `msg` (a human-readable error message)
-and `result`, which will be either `error` or `success` (this is
-redundant with the HTTP status code, but is convenient when printing
-responses while debugging).
+(200 = success, 4xx = user error, 5xx = server error).
 
-For some common errors, Zulip provides a `code` attribute.  Where
-present, clients should check `code`, rather than `msg`, when looking
-for specific error conditions, since the `msg` strings are
-internationalized (e.g. the server will send the error message
-translated into French if the user has a French locale).
+Every response, both success and error responses, will contain at least
+two keys:
 
-Each endpoint documents its own unique errors; below, we document
-errors common to many endpoints:
+- `msg`: an internationalized, human-readable error message string.
+
+- `result`: either `"error"` or `"success"`, which is redundant with the
+  HTTP status code, but is convenient when print debugging.
+
+Every error response will also contain an additional key:
+
+- `code`: a machine-readable error string, with a default value of
+  `"BAD_REQUEST"` for general errors.
+
+Clients should always check `code`, rather than `msg`, when looking for
+specific error conditions. The string values for `msg` are
+internationalized (e.g., the server will send the error message
+translated into French if the user has a French locale), so checking
+those strings will result in buggy code.
+
+!!! tip ""
+
+     If a client needs information that is only present in the string value
+     of `msg` for a particular error response, then the developers
+     implementing the client should [start a conversation here][api-design]
+     in order to discuss getting a specific error `code` and/or relevant
+     additional key/value pairs for that error response.
+
+In addition to the keys described above, some error responses will
+contain other keys with further details that are useful for clients. The
+specific keys present depend on the error `code`, and are documented at
+the API endpoints where these particular errors appear.
+
+**Changes**: Before Zulip 5.0 (feature level 76), all error responses
+did not contain a `code` key, and its absence indicated that no specific
+error `code` had been allocated for that error.
+
+## Common error responses
+
+Documented below are some error responses that are common to many
+endpoints:
 
 {generate_code_example|/rest-error-handling:post|fixture}
 
-To help clients avoid exceeding rate limits, Zulip sets the following
-HTTP headers in all API responses:
+## Ignored Parameters
 
-* `X-RateLimit-Remaining`: The number of additional requests of this
-  type that the client can send before exceeding its limit.
-* `X-RateLimit-Limit`: The limit that would be applicable to a client
-  that had not made any recent requests of this type. This is useful
-  for designing a client's burst behavior so as to avoid ever reaching
-  a rate limit.
-* `X-RateLimit-Reset`: The time at which the client will no longer
-  have any rate limits applied to it (and thus could do a burst of
-  `X-RateLimit-Limit` requests).
+In JSON success responses, all Zulip REST API endpoints may return
+an array of parameters sent in the request that are not supported
+by that specific endpoint.
 
-[Zulip's rate limiting rules are configurable][rate-limiting-rules],
-and can vary by server and over time. The default configuration
-currently limits:
+While this can be expected, e.g., when sending both current and legacy
+names for a parameter to a Zulip server of unknown version, this often
+indicates either a bug in the client implementation or an attempt to
+configure a new feature while connected to an older Zulip server that
+does not support said feature.
 
-* Every user is limited to 200 total API requests per minute.
-* Separate, much lower limits for authentication/login attempts.
+{generate_code_example|/settings:patch|fixture}
 
-When the Zulip server has configured multiple rate limits that apply
-to a given request, the values returned will be for the strictest
-limit.
-
-[rate-limiting-rules]: https://zulip.readthedocs.io/en/latest/production/security-model.html#rate-limiting
+[api-design]: https://chat.zulip.org/#narrow/channel/378-api-design

@@ -1,9 +1,9 @@
+from typing_extensions import override
+
 from zerver.lib.test_classes import WebhookTestCase
 
 
 class WekanHookTests(WebhookTestCase):
-    STREAM_NAME = "wekan"
-    URL_TEMPLATE = "/api/v1/external/wekan?stream={stream}&api_key={api_key}"
     FIXTURE_DIR_NAME = "wekan"
 
     def test_add_attachment_message(self) -> None:
@@ -213,5 +213,6 @@ class WekanHookTests(WebhookTestCase):
             content_type="application/x-www-form-urlencoded",
         )
 
+    @override
     def get_body(self, fixture_name: str) -> str:
         return self.webhook_fixture_data("wekan", fixture_name, file_type="json")

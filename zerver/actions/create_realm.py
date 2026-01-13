@@ -1,39 +1,52 @@
-import datetime
 import logging
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta
+from typing import Any
 
 from django.conf import settings
 from django.db import transaction
 from django.utils.timezone import now as timezone_now
 from django.utils.translation import gettext as _
+from django.utils.translation import override as override_language
 
-from zerver.actions.message_send import internal_send_stream_message
+from confirmation import settings as confirmation_settings
 from zerver.actions.realm_settings import (
     do_add_deactivated_redirect,
     do_change_realm_plan_type,
     do_deactivate_realm,
 )
 from zerver.lib.bulk_create import create_users
+from zerver.lib.push_notifications import sends_notifications_directly
+from zerver.lib.remote_server import maybe_enqueue_audit_log_upload
 from zerver.lib.server_initialization import create_internal_realm, server_initialized
-from zerver.lib.streams import ensure_stream, get_signups_stream
-from zerver.lib.user_groups import create_system_user_groups_for_realm
+from zerver.lib.sessions import delete_realm_user_sessions
+from zerver.lib.streams import ensure_stream
+from zerver.lib.user_groups import (
+    create_system_user_groups_for_realm,
+    get_role_based_system_groups_dict,
+)
+from zerver.lib.zulip_update_announcements import get_latest_zulip_update_announcements_level
 from zerver.models import (
     DefaultStream,
+    PreregistrationRealm,
     Realm,
     RealmAuditLog,
+    RealmAuthenticationMethod,
     RealmUserDefault,
-    Stream,
     UserProfile,
-    get_realm,
-    get_system_bot,
 )
+from zerver.models.groups import SystemGroups
+from zerver.models.presence import PresenceSequence
+from zerver.models.realm_audit_logs import AuditLogEventType
+from zproject.backends import all_default_backend_names
+
+DEFAULT_EMAIL_ADDRESS_VISIBILITY_FOR_REALM = RealmUserDefault.EMAIL_ADDRESS_VISIBILITY_ADMINS
 
 
 def do_change_realm_subdomain(
     realm: Realm,
     new_subdomain: str,
     *,
-    acting_user: Optional[UserProfile],
+    acting_user: UserProfile | None,
     add_deactivated_redirect: bool = True,
 ) -> None:
     """Changing a realm's subdomain is a highly disruptive operation,
@@ -45,26 +58,33 @@ def do_change_realm_subdomain(
     experience for clients.
     """
     old_subdomain = realm.subdomain
-    old_uri = realm.uri
+    old_url = realm.url
+    was_demo_organization = realm.demo_organization_scheduled_deletion_date is not None
     # If the realm had been a demo organization scheduled for
     # deleting, clear that state.
     realm.demo_organization_scheduled_deletion_date = None
     realm.string_id = new_subdomain
-    with transaction.atomic():
+    with transaction.atomic(durable=True):
         realm.save(update_fields=["string_id", "demo_organization_scheduled_deletion_date"])
         RealmAuditLog.objects.create(
             realm=realm,
-            event_type=RealmAuditLog.REALM_SUBDOMAIN_CHANGED,
+            event_type=AuditLogEventType.REALM_SUBDOMAIN_CHANGED,
             event_time=timezone_now(),
             acting_user=acting_user,
-            extra_data=str({"old_subdomain": old_subdomain, "new_subdomain": new_subdomain}),
+            # Old RealmAuditLog entries for this used "old_subdomain" and
+            # "new_subdomain" keys to store this data.
+            extra_data={
+                RealmAuditLog.OLD_VALUE: old_subdomain,
+                RealmAuditLog.NEW_VALUE: new_subdomain,
+                "was_demo_organization": was_demo_organization,
+            },
         )
 
         # If a realm if being renamed multiple times, we should find all the placeholder
-        # realms and reset their deactivated_redirect field to point to the new realm uri
-        placeholder_realms = Realm.objects.filter(deactivated_redirect=old_uri, deactivated=True)
+        # realms and reset their deactivated_redirect field to point to the new realm url
+        placeholder_realms = Realm.objects.filter(deactivated_redirect=old_url, deactivated=True)
         for placeholder_realm in placeholder_realms:
-            do_add_deactivated_redirect(placeholder_realm, realm.uri)
+            do_add_deactivated_redirect(placeholder_realm, realm.url)
 
     # The below block isn't executed in a transaction with the earlier code due to
     # the functions called below being complex and potentially sending events,
@@ -75,37 +95,39 @@ def do_change_realm_subdomain(
     # the realm has been moved to a new subdomain.
     if add_deactivated_redirect:
         placeholder_realm = do_create_realm(old_subdomain, realm.name)
-        do_deactivate_realm(placeholder_realm, acting_user=None)
-        do_add_deactivated_redirect(placeholder_realm, realm.uri)
+        do_deactivate_realm(
+            placeholder_realm,
+            acting_user=None,
+            deactivation_reason="subdomain_change",
+            email_owners=False,
+        )
+        do_add_deactivated_redirect(placeholder_realm, realm.url)
+
+    # Sessions can't be deleted inside a transaction.
+    delete_realm_user_sessions(realm)
 
 
-def set_realm_permissions_based_on_org_type(realm: Realm) -> None:
-    """This function implements overrides for the default configuration
-    for new organizations when the administrator selected specific
-    organization types.
+@transaction.atomic(savepoint=False)
+def set_default_for_realm_permission_group_settings(
+    realm: Realm, group_settings_defaults_for_org_types: dict[str, dict[int, str]] | None = None
+) -> None:
+    system_groups_dict = get_role_based_system_groups_dict(realm)
 
-    This substantially simplifies our /help/ advice for folks setting
-    up new organizations of these types.
-    """
+    for setting_name, permission_configuration in Realm.REALM_PERMISSION_GROUP_SETTINGS.items():
+        group_name = permission_configuration.default_group_name
 
-    # Custom configuration for educational organizations.  The present
-    # defaults are designed for a single class, not a department or
-    # larger institution, since those are more common.
-    if (
-        realm.org_type == Realm.ORG_TYPES["education_nonprofit"]["id"]
-        or realm.org_type == Realm.ORG_TYPES["education"]["id"]
-    ):
-        # Limit user creation to administrators.
-        realm.invite_to_realm_policy = Realm.POLICY_ADMINS_ONLY
-        # Restrict public stream creation to staff, but allow private
-        # streams (useful for study groups, etc.).
-        realm.create_public_stream_policy = Realm.POLICY_ADMINS_ONLY
-        # Don't allow members (students) to manage user groups or
-        # stream subscriptions.
-        realm.user_group_edit_policy = Realm.POLICY_MODERATORS_ONLY
-        realm.invite_to_stream_policy = Realm.POLICY_MODERATORS_ONLY
-        # Allow moderators (TAs?) to move topics between streams.
-        realm.move_messages_between_streams_policy = Realm.POLICY_MODERATORS_ONLY
+        # Below code updates the group_name if the setting default depends on org_type.
+        if (
+            group_settings_defaults_for_org_types is not None
+            and setting_name in group_settings_defaults_for_org_types
+        ):
+            setting_org_type_defaults = group_settings_defaults_for_org_types[setting_name]
+            if realm.org_type in setting_org_type_defaults:
+                group_name = setting_org_type_defaults[realm.org_type]
+
+        setattr(realm, setting_name, system_groups_dict[group_name].usergroup_ptr)
+
+    realm.save(update_fields=list(Realm.REALM_PERMISSION_GROUP_SETTINGS.keys()))
 
 
 def setup_realm_internal_bots(realm: Realm) -> None:
@@ -129,34 +151,56 @@ def setup_realm_internal_bots(realm: Realm) -> None:
         bot.save()
 
 
+def get_email_address_visibility_default(org_type: int | None = None) -> int:
+    # For the majority of organization types, the default email address visibility
+    # setting for new users should initially be admins only.
+    realm_default_email_address_visibility = DEFAULT_EMAIL_ADDRESS_VISIBILITY_FOR_REALM
+    if org_type in (
+        Realm.ORG_TYPES["education_nonprofit"]["id"],
+        Realm.ORG_TYPES["education"]["id"],
+    ):
+        # Email address of users should be initially visible to moderators and admins.
+        realm_default_email_address_visibility = (
+            RealmUserDefault.EMAIL_ADDRESS_VISIBILITY_MODERATORS
+        )
+    elif org_type == Realm.ORG_TYPES["business"]["id"]:
+        # Email address of users can be visible to all users for business organizations.
+        realm_default_email_address_visibility = RealmUserDefault.EMAIL_ADDRESS_VISIBILITY_EVERYONE
+
+    return realm_default_email_address_visibility
+
+
 def do_create_realm(
     string_id: str,
     name: str,
     *,
-    emails_restricted_to_domains: Optional[bool] = None,
-    email_address_visibility: Optional[int] = None,
-    description: Optional[str] = None,
-    invite_required: Optional[bool] = None,
-    plan_type: Optional[int] = None,
-    org_type: Optional[int] = None,
-    date_created: Optional[datetime.datetime] = None,
+    emails_restricted_to_domains: bool | None = None,
+    description: str | None = None,
+    invite_required: bool | None = None,
+    plan_type: int | None = None,
+    org_type: int | None = None,
+    default_language: str | None = None,
+    date_created: datetime | None = None,
     is_demo_organization: bool = False,
-    enable_read_receipts: Optional[bool] = None,
-    enable_spectator_access: Optional[bool] = None,
+    enable_read_receipts: bool | None = None,
+    enable_spectator_access: bool | None = None,
+    prereg_realm: PreregistrationRealm | None = None,
+    how_realm_creator_found_zulip: str | None = None,
+    how_realm_creator_found_zulip_extra_context: str | None = None,
 ) -> Realm:
-    if string_id == settings.SOCIAL_AUTH_SUBDOMAIN:
-        raise AssertionError("Creating a realm on SOCIAL_AUTH_SUBDOMAIN is not allowed!")
+    if string_id in [settings.SOCIAL_AUTH_SUBDOMAIN, settings.SELF_HOSTING_MANAGEMENT_SUBDOMAIN]:
+        raise AssertionError(
+            "Creating a realm on SOCIAL_AUTH_SUBDOMAIN or SELF_HOSTING_MANAGEMENT_SUBDOMAIN is not allowed!"
+        )
     if Realm.objects.filter(string_id=string_id).exists():
         raise AssertionError(f"Realm {string_id} already exists!")
     if not server_initialized():
         logging.info("Server not yet initialized. Creating the internal realm first.")
         create_internal_realm()
 
-    kwargs: Dict[str, Any] = {}
+    kwargs: dict[str, Any] = {}
     if emails_restricted_to_domains is not None:
         kwargs["emails_restricted_to_domains"] = emails_restricted_to_domains
-    if email_address_visibility is not None:
-        kwargs["email_address_visibility"] = email_address_visibility
     if description is not None:
         kwargs["description"] = description
     if invite_required is not None:
@@ -165,6 +209,8 @@ def do_create_realm(
         kwargs["plan_type"] = plan_type
     if org_type is not None:
         kwargs["org_type"] = org_type
+    if default_language is not None:
+        kwargs["default_language"] = default_language
     if enable_spectator_access is not None:
         if enable_spectator_access:
             # Realms with LIMITED plan cannot have spectators enabled.
@@ -178,6 +224,12 @@ def do_create_realm(
         assert not settings.PRODUCTION
         kwargs["date_created"] = date_created
 
+    if is_demo_organization:
+        # To enable creating demo organizations, a deadline of the number
+        # of days after creation that a demo organization should be deleted
+        # needs to be set on the server.
+        assert settings.DEMO_ORG_DEADLINE_DAYS is not None
+
     # Generally, closed organizations like companies want read
     # receipts, whereas it's unclear what an open organization's
     # preferences will be. We enable the setting by default only for
@@ -190,15 +242,23 @@ def do_create_realm(
         kwargs["enable_read_receipts"] = (
             invite_required is None or invite_required is True or emails_restricted_to_domains
         )
+    # Initialize this property correctly in the case that no network activity
+    # is required to do so correctly.
+    kwargs["push_notifications_enabled"] = sends_notifications_directly()
 
-    with transaction.atomic():
+    with transaction.atomic(durable=True):
         realm = Realm(string_id=string_id, name=name, **kwargs)
         if is_demo_organization:
-            realm.demo_organization_scheduled_deletion_date = (
-                realm.date_created + datetime.timedelta(days=settings.DEMO_ORG_DEADLINE_DAYS)
+            assert settings.DEMO_ORG_DEADLINE_DAYS is not None
+            realm.demo_organization_scheduled_deletion_date = realm.date_created + timedelta(
+                days=settings.DEMO_ORG_DEADLINE_DAYS
             )
 
-        set_realm_permissions_based_on_org_type(realm)
+        # For now a dummy value of -1 is given to groups fields which
+        # is changed later before the transaction is committed.
+        for setting_name in Realm.REALM_PERMISSION_GROUP_SETTINGS:
+            setattr(realm, setting_name + "_id", -1)
+
         realm.save()
 
         RealmAuditLog.objects.create(
@@ -206,73 +266,119 @@ def do_create_realm(
             # do_create_user(..., realm_creation=True).
             acting_user=None,
             realm=realm,
-            event_type=RealmAuditLog.REALM_CREATED,
+            event_type=AuditLogEventType.REALM_CREATED,
             event_time=realm.date_created,
+            extra_data={
+                "how_realm_creator_found_zulip": how_realm_creator_found_zulip,
+                "how_realm_creator_found_zulip_extra_context": how_realm_creator_found_zulip_extra_context,
+            },
         )
 
-        realm_default_email_address_visibility = RealmUserDefault.EMAIL_ADDRESS_VISIBILITY_EVERYONE
-        if (
-            realm.org_type == Realm.ORG_TYPES["education_nonprofit"]["id"]
-            or realm.org_type == Realm.ORG_TYPES["education"]["id"]
-        ):
-            # Email address of users should be initially visible to admins only.
-            realm_default_email_address_visibility = (
-                RealmUserDefault.EMAIL_ADDRESS_VISIBILITY_ADMINS
-            )
-
         RealmUserDefault.objects.create(
-            realm=realm, email_address_visibility=realm_default_email_address_visibility
+            realm=realm,
+            email_address_visibility=get_email_address_visibility_default(realm.org_type),
         )
 
         create_system_user_groups_for_realm(realm)
 
-    # Create stream once Realm object has been saved
-    notifications_stream = ensure_stream(
-        realm,
-        Realm.DEFAULT_NOTIFICATION_STREAM_NAME,
-        stream_description="Everyone is added to this stream by default. Welcome! :octopus:",
-        acting_user=None,
+        group_settings_defaults_for_org_types = {
+            "can_add_subscribers_group": {
+                Realm.ORG_TYPES["education_nonprofit"]["id"]: SystemGroups.MODERATORS,
+                Realm.ORG_TYPES["education"]["id"]: SystemGroups.MODERATORS,
+            },
+            "can_create_public_channel_group": {
+                Realm.ORG_TYPES["education_nonprofit"]["id"]: SystemGroups.ADMINISTRATORS,
+                Realm.ORG_TYPES["education"]["id"]: SystemGroups.ADMINISTRATORS,
+            },
+            "can_create_groups": {
+                Realm.ORG_TYPES["education_nonprofit"]["id"]: SystemGroups.MODERATORS,
+                Realm.ORG_TYPES["education"]["id"]: SystemGroups.MODERATORS,
+            },
+            "can_invite_users_group": {
+                Realm.ORG_TYPES["education_nonprofit"]["id"]: SystemGroups.ADMINISTRATORS,
+                Realm.ORG_TYPES["education"]["id"]: SystemGroups.ADMINISTRATORS,
+            },
+            "can_move_messages_between_channels_group": {
+                Realm.ORG_TYPES["education_nonprofit"]["id"]: SystemGroups.MODERATORS,
+                Realm.ORG_TYPES["education"]["id"]: SystemGroups.MODERATORS,
+            },
+        }
+        set_default_for_realm_permission_group_settings(
+            realm, group_settings_defaults_for_org_types
+        )
+
+        RealmAuthenticationMethod.objects.bulk_create(
+            [
+                RealmAuthenticationMethod(name=backend_name, realm=realm)
+                for backend_name in all_default_backend_names()
+            ]
+        )
+
+        PresenceSequence.objects.create(realm=realm, last_update_id=0)
+
+        maybe_enqueue_audit_log_upload(realm)
+
+    # Create channels once Realm object has been saved
+    with override_language(realm.default_language):
+        zulip_discussion_channel = ensure_stream(
+            realm,
+            str(Realm.ZULIP_DISCUSSION_CHANNEL_NAME),
+            stream_description=_("Questions and discussion about using Zulip."),
+            acting_user=None,
+        )
+        zulip_sandbox_channel = ensure_stream(
+            realm,
+            str(Realm.ZULIP_SANDBOX_CHANNEL_NAME),
+            stream_description=_("Experiment with Zulip here. :test_tube:"),
+            acting_user=None,
+        )
+        new_stream_announcements_stream = ensure_stream(
+            realm,
+            str(Realm.DEFAULT_NOTIFICATION_STREAM_NAME),
+            stream_description=_("For team-wide conversations"),
+            acting_user=None,
+        )
+
+    # By default, 'New stream' & 'Zulip update' announcements are sent to the same stream.
+    realm.new_stream_announcements_stream = new_stream_announcements_stream
+    realm.zulip_update_announcements_stream = new_stream_announcements_stream
+
+    # With the current initial streams situation, the public channels are
+    # 'zulip_discussion_channel', 'zulip_sandbox_channel', 'new_stream_announcements_stream'.
+    public_channels = [
+        DefaultStream(stream=zulip_discussion_channel, realm=realm),
+        DefaultStream(stream=zulip_sandbox_channel, realm=realm),
+        DefaultStream(stream=new_stream_announcements_stream, realm=realm),
+    ]
+    DefaultStream.objects.bulk_create(public_channels)
+
+    # New realm is initialized with the latest zulip update announcements
+    # level as it shouldn't receive a bunch of old updates.
+    realm.zulip_update_announcements_level = get_latest_zulip_update_announcements_level()
+
+    realm.save(
+        update_fields=[
+            "new_stream_announcements_stream",
+            "zulip_update_announcements_stream",
+            "zulip_update_announcements_level",
+        ]
     )
-    realm.notifications_stream = notifications_stream
-
-    # With the current initial streams situation, the only public
-    # stream is the notifications_stream.
-    DefaultStream.objects.create(stream=notifications_stream, realm=realm)
-
-    signup_notifications_stream = ensure_stream(
-        realm,
-        Realm.INITIAL_PRIVATE_STREAM_NAME,
-        invite_only=True,
-        stream_description="A private stream for core team members.",
-        acting_user=None,
-    )
-    realm.signup_notifications_stream = signup_notifications_stream
-
-    realm.save(update_fields=["notifications_stream", "signup_notifications_stream"])
 
     if plan_type is None and settings.BILLING_ENABLED:
         # We use acting_user=None for setting the initial plan type.
         do_change_realm_plan_type(realm, Realm.PLAN_TYPE_LIMITED, acting_user=None)
 
-    admin_realm = get_realm(settings.SYSTEM_BOT_REALM)
-    sender = get_system_bot(settings.NOTIFICATION_BOT, admin_realm.id)
-    # Send a notification to the admin realm
-    signup_message = _("Signups enabled")
+    if prereg_realm is not None:
+        prereg_realm.status = confirmation_settings.STATUS_USED
+        prereg_realm.created_realm = realm
+        prereg_realm.save(update_fields=["status", "created_realm"])
 
-    try:
-        signups_stream = get_signups_stream(admin_realm)
-        topic = realm.display_subdomain
+    if settings.CORPORATE_ENABLED:
+        # Send a notification to the admin realm when a new organization registers.
+        from corporate.lib.stripe import RealmBillingSession
 
-        internal_send_stream_message(
-            sender,
-            signups_stream,
-            topic,
-            signup_message,
-        )
-    except Stream.DoesNotExist:  # nocoverage
-        # If the signups stream hasn't been created in the admin
-        # realm, don't auto-create it to send to it; just do nothing.
-        pass
+        billing_session = RealmBillingSession(user=None, realm=realm)
+        billing_session.send_realm_created_internal_admin_message(is_demo_organization)
 
     setup_realm_internal_bots(realm)
     return realm

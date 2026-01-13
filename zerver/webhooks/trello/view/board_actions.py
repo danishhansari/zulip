@@ -1,4 +1,4 @@
-from typing import Mapping, Optional, Tuple
+from collections.abc import Mapping
 
 from zerver.lib.exceptions import UnsupportedWebhookEventTypeError
 from zerver.lib.validator import WildValue, check_string
@@ -25,16 +25,14 @@ ACTIONS_TO_MESSAGE_MAPPER = {
 }
 
 
-def process_board_action(
-    payload: WildValue, action_type: Optional[str]
-) -> Optional[Tuple[str, str]]:
+def process_board_action(payload: WildValue, action_type: str | None) -> tuple[str, str] | None:
     action_type = get_proper_action(payload, action_type)
     if action_type is not None:
-        return get_subject(payload), get_body(payload, action_type)
+        return get_topic(payload), get_body(payload, action_type)
     return None
 
 
-def get_proper_action(payload: WildValue, action_type: Optional[str]) -> Optional[str]:
+def get_proper_action(payload: WildValue, action_type: str | None) -> str | None:
     if action_type == "updateBoard":
         data = get_action_data(payload)
         # we don't support events for when a board's background
@@ -47,7 +45,7 @@ def get_proper_action(payload: WildValue, action_type: Optional[str]) -> Optiona
     return action_type
 
 
-def get_subject(payload: WildValue) -> str:
+def get_topic(payload: WildValue) -> str:
     return get_action_data(payload)["board"]["name"].tame(check_string)
 
 

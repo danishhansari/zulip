@@ -1,13 +1,15 @@
 # Webhooks for external integrations.
-from typing import Optional, Tuple
+
+from datetime import datetime
 
 from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_int, check_string, check_union, to_wild_value
-from zerver.lib.webhooks.common import check_send_webhook_message
+from zerver.lib.timestamp import datetime_to_global_time
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_int, check_string, check_union
+from zerver.lib.webhooks.common import OptionalUserSpecifiedTopicStr, check_send_webhook_message
 from zerver.models import UserProfile
 
 
@@ -40,7 +42,7 @@ def canary_kind(message: WildValue) -> str:
         return "canary"
 
 
-def source_ip_and_reverse_dns(message: WildValue) -> Tuple[Optional[str], Optional[str]]:
+def source_ip_and_reverse_dns(message: WildValue) -> tuple[str | None, str | None]:
     """
     Extract the source IP and reverse DNS information from a canary request.
     """
@@ -74,7 +76,13 @@ def body(message: WildValue) -> str:
         body += f"**Kind:** {message['Description'].tame(check_string)}\n"
 
     if "Timestamp" in message:
-        body += f"**Timestamp:** {message['Timestamp'].tame(check_string)}\n"
+        timestamp = message["Timestamp"].tame(check_string)
+        # Thinkst datetime format: https://help.canary.tools/hc/en-gb/articles/360012727777-How-do-I-configure-notifications-for-a-Generic-Webhook#h_01K71QZ806C5D49RYB6RBXSZ1B
+        # "YYYY-MM-DD HH:MM:SS (UTC)"
+        formatted_timestamp = timestamp.replace(" (UTC)", "Z")
+        dt = datetime.fromisoformat(formatted_timestamp)
+        global_time = datetime_to_global_time(dt)
+        body += f"**Timestamp:** {global_time}\n"
 
     if "CanaryIP" in message:
         body += f"**Canary IP:** `{message['CanaryIP'].tame(check_string)}`\n"
@@ -107,12 +115,13 @@ def body(message: WildValue) -> str:
 
 
 @webhook_view("Thinkst")
-@has_request_variables
+@typed_endpoint
 def api_thinkst_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    message: WildValue = REQ(argument_type="body", converter=to_wild_value),
-    user_specified_topic: Optional[str] = REQ("topic", default=None),
+    *,
+    message: JsonBodyPayload[WildValue],
+    user_specified_topic: OptionalUserSpecifiedTopicStr = None,
 ) -> HttpResponse:
     """
     Construct a response to a webhook event from a Thinkst canary or canarytoken.
@@ -130,14 +139,14 @@ def api_thinkst_webhook(
 
     response = body(message)
 
-    topic = None
+    topic_name = None
     if user_specified_topic:
-        topic = user_specified_topic
+        topic_name = user_specified_topic
     else:
         name = canary_name(message)
         kind = canary_kind(message)
 
-        topic = f"{kind} alert - {name}"
+        topic_name = f"{kind} alert - {name}"
 
-    check_send_webhook_message(request, user_profile, topic, response)
+    check_send_webhook_message(request, user_profile, topic_name, response)
     return json_success(request)

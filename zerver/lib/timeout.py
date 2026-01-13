@@ -3,8 +3,11 @@ import logging
 import sys
 import threading
 import time
+from collections.abc import Callable
 from types import TracebackType
-from typing import Callable, Optional, Tuple, Type, TypeVar
+from typing import TypeVar
+
+from typing_extensions import override
 
 # Based on https://code.activestate.com/recipes/483752/
 
@@ -12,6 +15,7 @@ from typing import Callable, Optional, Tuple, Type, TypeVar
 class TimeoutExpiredError(Exception):
     """Exception raised when a function times out."""
 
+    @override
     def __str__(self) -> str:
         return "Function call timed out."
 
@@ -19,7 +23,7 @@ class TimeoutExpiredError(Exception):
 ResultT = TypeVar("ResultT")
 
 
-def timeout(timeout: float, func: Callable[[], ResultT]) -> ResultT:
+def unsafe_timeout(timeout: float, func: Callable[[], ResultT]) -> ResultT:
     """Call the function in a separate thread.
     Return its return value, or raise an exception,
     within approximately 'timeout' seconds.
@@ -38,17 +42,18 @@ def timeout(timeout: float, func: Callable[[], ResultT]) -> ResultT:
     class TimeoutThread(threading.Thread):
         def __init__(self) -> None:
             threading.Thread.__init__(self)
-            self.result: Optional[ResultT] = None
-            self.exc_info: Tuple[
-                Optional[Type[BaseException]],
-                Optional[BaseException],
-                Optional[TracebackType],
+            self.result: ResultT | None = None
+            self.exc_info: tuple[
+                type[BaseException] | None,
+                BaseException | None,
+                TracebackType | None,
             ] = (None, None, None)
 
             # Don't block the whole program from exiting
             # if this is the only thread left.
             self.daemon = True
 
+        @override
         def run(self) -> None:
             try:
                 self.result = func()
@@ -84,9 +89,9 @@ def timeout(timeout: float, func: Callable[[], ResultT]) -> ResultT:
         # kill it), just raise from here; the thread _may still be
         # running_ because it failed to see any of our exceptions, and
         # we just ignore it.
-        if thread.is_alive():
+        if thread.is_alive():  # nocoverage
             logging.warning("Failed to time out backend thread")
-        raise TimeoutExpiredError
+        raise TimeoutExpiredError  # nocoverage
 
     if thread.exc_info[1] is not None:
         # Died with some other exception; re-raise it

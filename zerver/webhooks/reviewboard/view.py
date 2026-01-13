@@ -2,13 +2,13 @@ from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
 from zerver.lib.exceptions import UnsupportedWebhookEventTypeError
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_int, check_none_or, check_string, to_wild_value
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_int, check_none_or, check_string
 from zerver.lib.webhooks.common import (
     check_send_webhook_message,
-    get_http_headers_from_filename,
-    validate_extract_webhook_http_header,
+    default_fixture_to_headers,
+    get_event_header,
 )
 from zerver.models import UserProfile
 
@@ -53,7 +53,7 @@ REPLY_PUBLISHED = """
 
 BRANCH_TEMPLATE = "**Branch**: {branch_name}"
 
-fixture_to_headers = get_http_headers_from_filename("HTTP_X_REVIEWBOARD_EVENT")
+fixture_to_headers = default_fixture_to_headers("HTTP_X_REVIEWBOARD_EVENT")
 
 
 def get_target_people_string(payload: WildValue) -> str:
@@ -177,22 +177,20 @@ ALL_EVENT_TYPES = list(RB_MESSAGE_FUNCTIONS.keys())
 
 
 @webhook_view("ReviewBoard", all_event_types=ALL_EVENT_TYPES)
-@has_request_variables
+@typed_endpoint
 def api_reviewboard_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
+    *,
+    payload: JsonBodyPayload[WildValue],
 ) -> HttpResponse:
-    event_type = validate_extract_webhook_http_header(
-        request, "X-ReviewBoard-Event", "Review Board"
-    )
-    assert event_type is not None
+    event_type = get_event_header(request, "X-ReviewBoard-Event", "Review Board")
 
     body_function = RB_MESSAGE_FUNCTIONS.get(event_type)
     if body_function is not None:
         body = body_function(payload)
-        topic = get_review_request_repo_title(payload)
-        check_send_webhook_message(request, user_profile, topic, body, event_type)
+        topic_name = get_review_request_repo_title(payload)
+        check_send_webhook_message(request, user_profile, topic_name, body, event_type)
     else:
         raise UnsupportedWebhookEventTypeError(event_type)
 

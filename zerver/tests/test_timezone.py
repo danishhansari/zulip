@@ -1,15 +1,10 @@
-import sys
+import zoneinfo
 from datetime import datetime, timezone
 
 from django.utils.timezone import now as timezone_now
 
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.timezone import canonicalize_timezone, common_timezones
-
-if sys.version_info < (3, 9):  # nocoverage
-    from backports import zoneinfo
-else:  # nocoverage
-    import zoneinfo
 
 
 class TimeZoneTest(ZulipTestCase):
@@ -40,6 +35,7 @@ class TimeZoneTest(ZulipTestCase):
             datetime(now.year, 12, 21, tzinfo=timezone.utc),
         ]
         extra = {*common_timezones.items(), *ambiguous_abbrevs}
+        extra -= {("MET", +3600), ("MEST", +7200)}  # Removed in tzdata 2024b
         for name in zoneinfo.available_timezones():
             tz = zoneinfo.ZoneInfo(name)
             for date in dates:

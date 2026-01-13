@@ -20,8 +20,8 @@ hence the name.
             </div>
         </div>
     </div>
-    <div class="alert-box"></div>
-    {% if not isolated_page %}
+    <div class="blueslip-error-container"></div>
+    {% if not isolated_page and not skip_footer %}
     {% include 'zerver/footer.html' %}
     {% endif %}
 </div>

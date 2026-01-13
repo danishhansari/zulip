@@ -1,35 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version=18.14.0
+version=24.12.0
 arch="$(uname -m)"
 
 case $arch in
     x86_64)
         tarball="node-v$version-linux-x64.tar.xz"
-        sha256=1ccec74b6240fce8754813e31fdbc93ad520df2e814729cea29efe9075e48350
+        sha256=bdebee276e58d0ef5448f3d5ac12c67daa963dd5e0a9bb621a53d1cefbc852fd
         ;;
 
     aarch64)
         tarball="node-v$version-linux-arm64.tar.xz"
-        sha256=30ef375f0b8006759c0e08bee9d4b74915b95abfa924006c289d2d474a8b152e
+        sha256=a06d42807fb500f7459e5f3fa6cb431447352826ee6f07e14adfeec58a1b3210
         ;;
 esac
 
 check_version() {
     out="$(node --version)" && [ "$out" = "v$version" ] \
-        && [ /usr/local/bin/yarn -ef /srv/zulip-node/lib/node_modules/corepack/dist/yarn.js ]
+        && [ /usr/local/bin/pnpm -ef /srv/zulip-node/lib/node_modules/corepack/dist/pnpm.js ]
 }
 
 if ! check_version 2>/dev/null; then
+    set -x
     tmpdir="$(mktemp -d)"
     trap 'rm -r "$tmpdir"' EXIT
     cd "$tmpdir"
-    curl_opts=(-fLO --retry 3)
-    if [ -n "${CUSTOM_CA_CERTIFICATES:-}" ]; then
-        curl_opts+=(--cacert "${CUSTOM_CA_CERTIFICATES}")
-    fi
-    curl "${curl_opts[@]}" "https://nodejs.org/dist/v$version/$tarball"
+    curl -fLO --retry 3 "https://nodejs.org/dist/v$version/$tarball"
     sha256sum -c <<<"$sha256 $tarball"
     rm -rf /srv/zulip-node
     mkdir -p /srv/zulip-node

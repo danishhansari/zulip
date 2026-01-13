@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
 set -euxo pipefail
 
-version="2.3.6"
-sha256=fc68a66a216e304bb0e2ef627f767fff528f4fbf2bbda27e8cd8db1b7ba090b0
+version="4.0.1"
+sha256=e2dfe40f3a0342e9ce4f1212043c46564fda3678e8cfda8587bbc37b103ebd17
 
 tmpdir="$(mktemp -d)"
 trap 'rm -r "$tmpdir"' EXIT
 cd "$tmpdir"
 tarball="pgroonga-$version.tar.gz"
-curl -fLO --retry 3 "https://packages.groonga.org/source/pgroonga/$tarball"
+curl -fLO --retry 3 "https://github.com/pgroonga/pgroonga/releases/download/$version/$tarball"
 sha256sum -c <<<"$sha256 $tarball"
 tar -xzf "$tarball"
 cd "pgroonga-$version"
 
-make -j "$(nproc)" HAVE_MSGPACK=1
+if pkg-config msgpack-c; then
+    msgpack='msgpack-c'
+elif pkg-config msgpack; then
+    msgpack='msgpack'
+else
+    echo 'build-pgroonga: Cannot find msgpack'
+    exit 1
+fi
+
+make -j "$(nproc)" HAVE_MSGPACK=1 MSGPACK_PACKAGE_NAME="$msgpack"
 make install

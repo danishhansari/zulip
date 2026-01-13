@@ -14,9 +14,9 @@ since 2013.
 
 ## Keeping Zulip 100% open source
 
-Many modern “open-source” companies use an intentionally crippled “open-source”
-version as a demo for their non-open-source paid product. In contrast, we are
-committed to keeping Zulip [100% open
+Many modern “open-source” companies use a version of their product with some
+basic functionality intentionally removed as a demo for their non-open-source
+paid product. In contrast, we are committed to keeping Zulip [100% open
 source](https://github.com/zulip/zulip#readme).
 
 When you [self-host Zulip](/self-hosting/), you get all the
@@ -32,7 +32,7 @@ fully committed to helping bring up the next generation of open-source
 contributors from a wide range of backgrounds.
 
 We have invested into making Zulip’s code uniquely readable, well tested, and
-easy to modify. Beyond that, we have written an extraordinary 150K words of
+easy to modify. Beyond that, we have written an extraordinary 185K words of
 documentation on [how to contribute to
 Zulip](https://zulip.readthedocs.io/en/latest/overview/contributing.html), with
 topics ranging from [practical Git
@@ -49,11 +49,12 @@ contributing to Zulip than in their 4-year formal computer science education.
 
 ## Building a sustainable business aligned with our values
 
-Guiding the Zulip community in developing a world-class team chat product with
-apps for every major desktop and mobile platform requires leadership from a
-talented, dedicated team. We believe that the only sustainable model is for our
-core team to be compensated fairly for their time. We have thus **founded a
-company (Kandra Labs) to steward and financially support Zulip’s development**.
+Guiding the Zulip community in developing a world-class organized team chat
+product with apps for every major desktop and mobile platform requires
+leadership from a talented, dedicated team. We believe that the only sustainable
+model is for our core team to be compensated fairly for their time. We have thus
+**founded a company (Kandra Labs) to steward and financially support Zulip’s
+development**.
 
 We are **growing our business sustainably**, without venture capital funding.
 VCs are incentivized to push companies to gamble for explosive growth. Often,
@@ -82,7 +83,7 @@ An important part of Zulip’s mission is ensuring that worthy organizations, fr
 communities](/case-studies/lean/), are able to use Zulip whether or not they
 have funding.
 
-We sponsor [Zulip Cloud Standard](/plans) hosting for [open-source
+We sponsor [Zulip Cloud Standard](/plans/) hosting for [open-source
 projects](/for/open-source/), [research groups](/for/research/),
 [education](/for/education/), [non-profits](/for/communities/) and other
 [communities](/for/communities/). This program has grown exponentially since its

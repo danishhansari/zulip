@@ -1,11 +1,19 @@
 import fnmatch
+import hashlib
+import hmac
 import importlib
-from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Union
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import Enum
+from typing import Annotated, Any, TypeAlias
 from urllib.parse import unquote
 
+from django.conf import settings
 from django.http import HttpRequest
+from django.utils.encoding import force_bytes
 from django.utils.translation import gettext as _
+from pydantic import Json
+from typing_extensions import override
 
 from zerver.actions.message_send import (
     check_send_private_message,
@@ -13,11 +21,16 @@ from zerver.actions.message_send import (
     check_send_stream_message_by_id,
     send_rate_limited_pm_notification_to_bot_owner,
 )
-from zerver.lib.exceptions import ErrorCode, JsonableError, StreamDoesNotExistError
-from zerver.lib.request import REQ, RequestNotes, has_request_variables
+from zerver.lib.exceptions import (
+    AnomalousWebhookPayloadError,
+    ErrorCode,
+    JsonableError,
+    StreamDoesNotExistError,
+)
+from zerver.lib.request import RequestNotes
 from zerver.lib.send_email import FromAddress
-from zerver.lib.timestamp import timestamp_to_datetime
-from zerver.lib.validator import check_list, check_string
+from zerver.lib.typed_endpoint import ApiParamConfig, typed_endpoint
+from zerver.lib.validator import check_bool, check_string
 from zerver.models import UserProfile
 
 MISSING_EVENT_HEADER_MESSAGE = """\
@@ -38,8 +51,61 @@ that this integration expects!
 SETUP_MESSAGE_TEMPLATE = "{integration} webhook has been successfully configured"
 SETUP_MESSAGE_USER_PART = " by {user_name}"
 
+OptionalUserSpecifiedTopicStr: TypeAlias = Annotated[str | None, ApiParamConfig("topic")]
 
-def get_setup_webhook_message(integration: str, user_name: Optional[str] = None) -> str:
+
+class PresetUrlOption(str, Enum):
+    BRANCHES = "branches"
+    IGNORE_PRIVATE_REPOSITORIES = "ignore_private_repositories"
+    CHANNEL_MAPPING = "mapping"
+
+
+@dataclass
+class WebhookConfigOption:
+    name: str
+    label: str
+    validator: Callable[[str, str], str | bool | None]
+
+
+@dataclass
+class WebhookUrlOption:
+    name: str
+    label: str
+    validator: Callable[[str, str], str | bool | None]
+
+    @classmethod
+    def build_preset_config(cls, config: PresetUrlOption) -> "WebhookUrlOption":
+        """
+        This creates a pre-configured WebhookUrlOption object to be used
+        in various incoming webhook integrations.
+
+        See https://zulip.readthedocs.io/en/latest/webhooks/incoming-webhooks-walkthrough.html#webhookurloption-presets
+        for more details on this system and what each option does.
+        """
+        match config:
+            case PresetUrlOption.BRANCHES:
+                return cls(
+                    name=config.value,
+                    label="",
+                    validator=check_string,
+                )
+            case PresetUrlOption.IGNORE_PRIVATE_REPOSITORIES:
+                return cls(
+                    name=config.value,
+                    label="Exclude notifications from private repositories",
+                    validator=check_bool,
+                )
+            case PresetUrlOption.CHANNEL_MAPPING:
+                return cls(
+                    name=config.value,
+                    label="",
+                    validator=check_string,
+                )
+
+        raise AssertionError(_("Unknown 'PresetUrlOption': {config}").format(config=config))
+
+
+def get_setup_webhook_message(integration: str, user_name: str | None = None) -> str:
     content = SETUP_MESSAGE_TEMPLATE.format(integration=integration)
     if user_name:
         content += SETUP_MESSAGE_USER_PART.format(user_name=user_name)
@@ -57,7 +123,7 @@ def notify_bot_owner_about_invalid_json(
     )
 
 
-class MissingHTTPEventHeaderError(JsonableError):
+class MissingHTTPEventHeaderError(AnomalousWebhookPayloadError):
     code = ErrorCode.MISSING_HTTP_EVENT_HEADER
     data_fields = ["header"]
 
@@ -65,25 +131,26 @@ class MissingHTTPEventHeaderError(JsonableError):
         self.header = header
 
     @staticmethod
+    @override
     def msg_format() -> str:
         return _("Missing the HTTP event header '{header}'")
 
 
-@has_request_variables
+@typed_endpoint
 def check_send_webhook_message(
     request: HttpRequest,
     user_profile: UserProfile,
     topic: str,
     body: str,
-    complete_event_type: Optional[str] = None,
-    stream: Optional[str] = REQ(default=None),
-    user_specified_topic: Optional[str] = REQ("topic", default=None),
-    only_events: Optional[List[str]] = REQ(default=None, json_validator=check_list(check_string)),
-    exclude_events: Optional[List[str]] = REQ(
-        default=None, json_validator=check_list(check_string)
-    ),
+    complete_event_type: str | None = None,
+    *,
+    stream: str | None = None,
+    user_specified_topic: OptionalUserSpecifiedTopicStr = None,
+    only_events: Json[list[str]] | None = None,
+    exclude_events: Json[list[str]] | None = None,
     unquote_url_parameters: bool = False,
-) -> None:
+    no_previews: bool = False,
+) -> int | None:
     if complete_event_type is not None and (
         # Here, we implement Zulip's generic support for filtering
         # events sent by the third-party service.
@@ -104,13 +171,15 @@ def check_send_webhook_message(
             and any(fnmatch.fnmatch(complete_event_type, pattern) for pattern in exclude_events)
         )
     ):
-        return
+        return None
 
     client = RequestNotes.get_notes(request).client
     assert client is not None
     if stream is None:
         assert user_profile.bot_owner is not None
-        check_send_private_message(user_profile, client, user_profile.bot_owner, body)
+        return check_send_private_message(
+            user_profile, client, user_profile.bot_owner, body, no_previews=no_previews
+        )
     else:
         # Some third-party websites (such as Atlassian's Jira), tend to
         # double escape their URLs in a manner that escaped space characters
@@ -126,21 +195,25 @@ def check_send_webhook_message(
 
         try:
             if stream.isdecimal():
-                check_send_stream_message_by_id(user_profile, client, int(stream), topic, body)
+                return check_send_stream_message_by_id(
+                    user_profile, client, int(stream), topic, body, no_previews=no_previews
+                )
             else:
-                check_send_stream_message(user_profile, client, stream, topic, body)
+                return check_send_stream_message(
+                    user_profile, client, stream, topic, body, no_previews=no_previews
+                )
         except StreamDoesNotExistError:
-            # A PM will be sent to the bot_owner by check_message, notifying
-            # that the webhook bot just tried to send a message to a non-existent
-            # stream, so we don't need to re-raise it since it clutters up
-            # webhook-errors.log
-            pass
+            # A direct message will be sent to the bot_owner by check_message,
+            # notifying that the webhook bot just tried to send a message to a
+            # non-existent stream, so we don't need to re-raise it since it
+            # clutters up webhook-errors.log
+            return None
 
 
-def standardize_headers(input_headers: Union[None, Dict[str, Any]]) -> Dict[str, str]:
+def standardize_headers(input_headers: None | dict[str, Any]) -> dict[str, str]:
     """This method can be used to standardize a dictionary of headers with
     the standard format that Django expects. For reference, refer to:
-    https://docs.djangoproject.com/en/3.2/ref/request-response/#django.http.HttpRequest.headers
+    https://docs.djangoproject.com/en/5.0/ref/request-response/#django.http.HttpRequest.headers
 
     NOTE: Historically, Django's headers were not case-insensitive. We're still
     capitalizing our headers to make it easier to compare/search later if required.
@@ -162,13 +235,11 @@ def standardize_headers(input_headers: Union[None, Dict[str, Any]]) -> Dict[str,
     return canonical_headers
 
 
-def validate_extract_webhook_http_header(
-    request: HttpRequest, header: str, integration_name: str, fatal: bool = True
-) -> Optional[str]:
+def get_event_header(request: HttpRequest, header: str, integration_name: str) -> str:
     assert request.user.is_authenticated
 
     extracted_header = request.headers.get(header)
-    if extracted_header is None and fatal:
+    if extracted_header is None:
         message_body = MISSING_EVENT_HEADER_MESSAGE.format(
             bot_name=request.user.full_name,
             request_path=request.path,
@@ -185,13 +256,13 @@ def validate_extract_webhook_http_header(
     return extracted_header
 
 
-def get_fixture_http_headers(integration_name: str, fixture_name: str) -> Dict["str", "str"]:
+def call_fixture_to_headers(integration_dir_name: str, fixture_name: str) -> dict["str", "str"]:
     """For integrations that require custom HTTP headers for some (or all)
     of their test fixtures, this method will call a specially named
     function from the target integration module to determine what set
     of HTTP headers goes with the given test fixture.
     """
-    view_module_name = f"zerver.webhooks.{integration_name}.view"
+    view_module_name = f"zerver.webhooks.{integration_dir_name}.view"
     try:
         # TODO: We may want to migrate to a more explicit registration
         # strategy for this behavior rather than a try/except import.
@@ -202,13 +273,13 @@ def get_fixture_http_headers(integration_name: str, fixture_name: str) -> Dict["
     return fixture_to_headers(fixture_name)
 
 
-def get_http_headers_from_filename(http_header_key: str) -> Callable[[str], Dict[str, str]]:
+def default_fixture_to_headers(http_header_key: str) -> Callable[[str], dict[str, str]]:
     """If an integration requires an event type kind of HTTP header which can
     be easily (statically) determined, then name the fixtures in the format
     of "header_value__other_details" or even "header_value" and the use this
     method in the headers.py file for the integration."""
 
-    def fixture_to_headers(filename: str) -> Dict[str, str]:
+    def fixture_to_headers(filename: str) -> dict[str, str]:
         if "__" in filename:
             event_type = filename.split("__")[0]
         else:
@@ -218,14 +289,56 @@ def get_http_headers_from_filename(http_header_key: str) -> Callable[[str], Dict
     return fixture_to_headers
 
 
-def unix_milliseconds_to_timestamp(milliseconds: Any, webhook: str) -> datetime:
-    """If an integration requires time input in unix milliseconds, this helper
-    checks to ensure correct type and will catch any errors related to type or
-    value and raise a JsonableError.
-    Returns a datetime representing the time."""
-    try:
-        # timestamps are in milliseconds so divide by 1000
-        seconds = milliseconds / 1000
-        return timestamp_to_datetime(seconds)
-    except (ValueError, TypeError):
-        raise JsonableError(_("The {} webhook expects time in milliseconds.").format(webhook))
+def parse_multipart_string(body: str) -> dict[str, str]:
+    """
+    Converts multipart/form-data string (fixture) to dict
+    """
+    boundary = body.split("\n")[0][2:]
+    parts = body.split(f"--{boundary}")
+
+    data = {}
+    for part in parts:
+        if part.strip() in ["", "--"]:
+            continue
+
+        headers, body = part.split("\n\n", 1)
+        body = body.removesuffix("\n--")
+
+        content_disposition = next(
+            (line for line in headers.splitlines() if "Content-Disposition" in line), ""
+        )
+        field_name = content_disposition.split('name="')[1].split('"')[0]
+        data[field_name] = body
+
+    return data
+
+
+def validate_webhook_signature(
+    request: HttpRequest, payload: str, signature: str, algorithm: str = "sha256"
+) -> None:
+    if not settings.VERIFY_WEBHOOK_SIGNATURES:  # nocoverage
+        return
+
+    if algorithm not in hashlib.algorithms_available:
+        raise AssertionError(
+            _("The algorithm '{algorithm}' is not supported.").format(algorithm=algorithm)
+        )
+
+    webhook_secret: str | None = request.GET.get("webhook_secret")
+    if webhook_secret is None:
+        raise JsonableError(
+            _(
+                "The webhook secret is missing. Please set the webhook_secret while generating the URL."
+            )
+        )
+    webhook_secret_bytes = force_bytes(webhook_secret)
+    payload_bytes = force_bytes(payload)
+
+    signed_payload = hmac.new(
+        webhook_secret_bytes,
+        payload_bytes,
+        algorithm,
+    ).hexdigest()
+
+    if signed_payload != signature:
+        raise JsonableError(_("Webhook signature verification failed."))

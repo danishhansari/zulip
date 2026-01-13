@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # This tools generates /etc/zulip/zulip-secrets.conf
+import json
 import os
 import sys
 from contextlib import suppress
-from typing import Dict, List
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(BASE_DIR)
@@ -18,6 +18,9 @@ os.environ["DJANGO_SETTINGS_MODULE"] = "zproject.settings"
 import argparse
 import configparser
 import uuid
+
+from nacl.encoding import Base64Encoder
+from nacl.public import PrivateKey
 
 os.chdir(os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -62,7 +65,7 @@ def generate_django_secretkey() -> str:
     return get_random_string(50, chars)
 
 
-def get_old_conf(output_filename: str) -> Dict[str, str]:
+def get_old_conf(output_filename: str) -> dict[str, str]:
     if not os.path.exists(output_filename) or os.path.getsize(output_filename) == 0:
         return {}
 
@@ -79,7 +82,7 @@ def generate_secrets(development: bool = False) -> None:
         OUTPUT_SETTINGS_FILENAME = "/etc/zulip/zulip-secrets.conf"
     current_conf = get_old_conf(OUTPUT_SETTINGS_FILENAME)
 
-    lines: List[str] = []
+    lines: list[str] = []
     if len(current_conf) == 0:
         lines = ["[secrets]\n"]
 
@@ -124,6 +127,10 @@ def generate_secrets(development: bool = False) -> None:
     # Secret key for the Camo HTTPS proxy.
     if need_secret("camo_key"):
         add_secret("camo_key", random_string(64))
+
+    # We enable Altcha in development
+    if development and need_secret("altcha_hmac"):
+        add_secret("altcha_hmac", random_token())
 
     if not development:
         # The memcached_password and redis_password secrets are only
@@ -180,6 +187,17 @@ def generate_secrets(development: bool = False) -> None:
         add_secret("zulip_org_key", random_string(64))
     if need_secret("zulip_org_id"):
         add_secret("zulip_org_id", str(uuid.uuid4()))
+
+    if development and need_secret("push_registration_encryption_keys"):
+        # 'settings.ZILENCER_ENABLED' would be a better check than
+        # 'development' for whether we need push bouncer secrets,
+        # but we're trying to avoid importing settings.
+        private_key = PrivateKey.generate()
+        private_key_str = Base64Encoder.encode(bytes(private_key)).decode("utf-8")
+        public_key_str = Base64Encoder.encode(bytes(private_key.public_key)).decode("utf-8")
+        add_secret(
+            "push_registration_encryption_keys", json.dumps({public_key_str: private_key_str})
+        )
 
     if len(lines) == 0:
         print("generate_secrets: No new secrets to generate.")

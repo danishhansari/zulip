@@ -1,9 +1,9 @@
 from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_int, check_string, to_wild_value
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_int, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import UserProfile
 
@@ -11,18 +11,19 @@ ALL_EVENT_TYPES = ["new", "finished"]
 
 
 @webhook_view("Buildbot", all_event_types=ALL_EVENT_TYPES)
-@has_request_variables
+@typed_endpoint
 def api_buildbot_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
+    *,
+    payload: JsonBodyPayload[WildValue],
 ) -> HttpResponse:
-    topic = payload["project"].tame(check_string)
-    if not topic:
-        topic = "general"
+    topic_name = payload["project"].tame(check_string)
+    if not topic_name:
+        topic_name = "general"
     body = get_message(payload)
     check_send_webhook_message(
-        request, user_profile, topic, body, payload["event"].tame(check_string)
+        request, user_profile, topic_name, body, payload["event"].tame(check_string)
     )
     return json_success(request)
 

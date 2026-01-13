@@ -1,22 +1,15 @@
 # Webhooks for external integrations.
 import time
-from typing import Dict, Optional, Sequence, Tuple
+from collections.abc import Sequence
 
 from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
 from zerver.lib.exceptions import UnsupportedWebhookEventTypeError
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.timestamp import timestamp_to_datetime
-from zerver.lib.validator import (
-    WildValue,
-    check_bool,
-    check_int,
-    check_none_or,
-    check_string,
-    to_wild_value,
-)
+from zerver.lib.timestamp import datetime_to_global_time, timestamp_to_datetime
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_bool, check_int, check_none_or, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import UserProfile
 
@@ -54,24 +47,25 @@ ALL_EVENT_TYPES = [
 
 
 @webhook_view("Stripe", all_event_types=ALL_EVENT_TYPES)
-@has_request_variables
+@typed_endpoint
 def api_stripe_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
-    stream: str = REQ(default="test"),
+    *,
+    payload: JsonBodyPayload[WildValue],
+    stream: str = "test",
 ) -> HttpResponse:
     try:
-        topic, body = topic_and_body(payload)
+        topic_name, body = topic_and_body(payload)
     except SuppressedEventError:  # nocoverage
         return json_success(request)
     check_send_webhook_message(
-        request, user_profile, topic, body, payload["type"].tame(check_string)
+        request, user_profile, topic_name, body, payload["type"].tame(check_string)
     )
     return json_success(request)
 
 
-def topic_and_body(payload: WildValue) -> Tuple[str, str]:
+def topic_and_body(payload: WildValue) -> tuple[str, str]:
     event_type = payload["type"].tame(
         check_string
     )  # invoice.created, customer.subscription.created, etc
@@ -84,12 +78,12 @@ def topic_and_body(payload: WildValue) -> Tuple[str, str]:
     object_ = payload["data"]["object"]  # The full, updated Stripe object
 
     # Set the topic to the customer_id when we can
-    topic = ""
+    topic_name = ""
     customer_id = object_.get("customer").tame(check_none_or(check_string))
     if customer_id is not None:
         # Running into the 60 character topic limit.
         # topic = '[{}](https://dashboard.stripe.com/customers/{})' % (customer_id, customer_id)
-        topic = customer_id
+        topic_name = customer_id
     body = None
 
     def update_string(blacklist: Sequence[str] = []) -> str:
@@ -120,7 +114,7 @@ def topic_and_body(payload: WildValue) -> Tuple[str, str]:
             if event == "updated":
                 if "previous_attributes" not in payload["data"]:
                     raise SuppressedEventError
-                topic = "account updates"
+                topic_name = "account updates"
                 body = update_string()
         else:
             # Part of Stripe Connect
@@ -133,8 +127,8 @@ def topic_and_body(payload: WildValue) -> Tuple[str, str]:
         raise NotImplementedEventTypeError
     if category == "charge":
         if resource == "charge":
-            if not topic:  # only in legacy fixtures
-                topic = "charges"
+            if not topic_name:  # only in legacy fixtures
+                topic_name = "charges"
             body = "{resource} for {amount} {verbed}".format(
                 resource=linkified_id(object_["id"].tame(check_string)),
                 amount=amount_string(
@@ -145,12 +139,12 @@ def topic_and_body(payload: WildValue) -> Tuple[str, str]:
             if object_["failure_code"]:  # nocoverage
                 body += ". Failure code: {}".format(object_["failure_code"].tame(check_string))
         if resource == "dispute":
-            topic = "disputes"
+            topic_name = "disputes"
             body = default_body() + ". Current status: {status}.".format(
                 status=object_["status"].tame(check_string).replace("_", " ")
             )
         if resource == "refund":
-            topic = "refunds"
+            topic_name = "refunds"
             body = "A {resource} for a {charge} of {amount} was updated.".format(
                 resource=linkified_id(object_["id"].tame(check_string), lower=True),
                 charge=linkified_id(object_["charge"].tame(check_string), lower=True),
@@ -168,7 +162,7 @@ def topic_and_body(payload: WildValue) -> Tuple[str, str]:
         if resource == "customer":
             # Running into the 60 character topic limit.
             # topic = '[{}](https://dashboard.stripe.com/customers/{})' % (object_['id'], object_['id'])
-            topic = object_["id"].tame(check_string)
+            topic_name = object_["id"].tame(check_string)
             body = default_body(update_blacklist=["delinquent", "currency", "default_source"])
             if event == "created":
                 if object_["email"]:
@@ -196,10 +190,16 @@ def topic_and_body(payload: WildValue) -> Tuple[str, str]:
                 )
             if event == "created":
                 if object_["plan"]:
-                    body += "\nPlan: [{plan_nickname}](https://dashboard.stripe.com/plans/{plan_id})".format(
-                        plan_nickname=object_["plan"]["nickname"].tame(check_string),
-                        plan_id=object_["plan"]["id"].tame(check_string),
-                    )
+                    nickname = object_["plan"]["nickname"].tame(check_none_or(check_string))
+                    if nickname is not None:
+                        body += "\nPlan: [{plan_nickname}](https://dashboard.stripe.com/plans/{plan_id})".format(
+                            plan_nickname=object_["plan"]["nickname"].tame(check_string),
+                            plan_id=object_["plan"]["id"].tame(check_string),
+                        )
+                    else:
+                        body += "\nPlan: https://dashboard.stripe.com/plans/{plan_id}".format(
+                            plan_id=object_["plan"]["id"].tame(check_string),
+                        )
                 if object_["quantity"]:
                     body += "\nQuantity: {}".format(object_["quantity"].tame(check_int))
                 if "billing" in object_:  # nocoverage
@@ -207,7 +207,7 @@ def topic_and_body(payload: WildValue) -> Tuple[str, str]:
                         object_["billing"].tame(check_string).replace("_", " ")
                     )
     if category == "file":  # nocoverage
-        topic = "files"
+        topic_name = "files"
         body = default_body() + " ({purpose}). \nTitle: {title}".format(
             purpose=object_["purpose"].tame(check_string).replace("_", " "),
             title=object_["title"].tame(check_string),
@@ -286,7 +286,7 @@ def topic_and_body(payload: WildValue) -> Tuple[str, str]:
 
     if body is None:
         raise UnsupportedWebhookEventTypeError(event_type)
-    return (topic, body)
+    return (topic_name, body)
 
 
 def amount_string(amount: int, currency: str) -> str:
@@ -318,7 +318,7 @@ def amount_string(amount: int, currency: str) -> str:
 
 
 def linkified_id(object_id: str, lower: bool = False) -> str:
-    names_and_urls: Dict[str, Tuple[str, Optional[str]]] = {
+    names_and_urls: dict[str, tuple[str, str | None]] = {
         # Core resources
         "ch": ("Charge", "charges"),
         "cus": ("Customer", "customers"),
@@ -363,5 +363,5 @@ def linkified_id(object_id: str, lower: bool = False) -> str:
 
 def stringify(value: object) -> str:
     if isinstance(value, int) and value > 1500000000 and value < 2000000000:
-        return timestamp_to_datetime(value).strftime("%b %d, %Y, %H:%M:%S %Z")
+        return datetime_to_global_time(timestamp_to_datetime(value))
     return str(value)

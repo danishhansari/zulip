@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any
 from unittest import mock
 
 import orjson
@@ -17,16 +17,11 @@ from zerver.lib.outgoing_webhook import (
 )
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.topic import TOPIC_NAME
-from zerver.lib.url_encoding import near_message_url
+from zerver.lib.url_encoding import message_link_url
 from zerver.lib.users import add_service
-from zerver.models import (
-    Recipient,
-    Service,
-    UserProfile,
-    get_display_recipient,
-    get_realm,
-    get_stream,
-)
+from zerver.models import Recipient, Service, UserProfile
+from zerver.models.realms import get_realm
+from zerver.models.streams import get_stream
 
 
 class ResponseMock:
@@ -49,7 +44,7 @@ def connection_error(final_url: Any, **request_kwargs: Any) -> Any:
 
 
 class DoRestCallTests(ZulipTestCase):
-    def mock_event(self, bot_user: UserProfile) -> Dict[str, Any]:
+    def mock_event(self, bot_user: UserProfile) -> dict[str, Any]:
         return {
             # In the tests there is no active queue processor, so retries don't get processed.
             # Therefore, we need to emulate `retry_event` in the last stage when the maximum
@@ -58,7 +53,9 @@ class DoRestCallTests(ZulipTestCase):
             "message": {
                 "display_recipient": "Verona",
                 "stream_id": 999,
+                "recipient_id": 1111,
                 "sender_id": bot_user.id,
+                "sender_recipient_id": bot_user.recipient_id,
                 "sender_email": bot_user.email,
                 "sender_realm_id": bot_user.realm.id,
                 "sender_realm_str": bot_user.realm.string_id,
@@ -86,11 +83,12 @@ class DoRestCallTests(ZulipTestCase):
         mock_event = self.mock_event(bot_user)
         service_handler = GenericOutgoingWebhookService("token", bot_user, "service")
 
-        def _helper(content: Optional[str]) -> None:
+        def _helper(content: str | None) -> None:
             expect_send_response = mock.patch("zerver.lib.outgoing_webhook.send_response_message")
-            with mock.patch.object(
-                service_handler, "session"
-            ) as session, expect_send_response as mock_send:
+            with (
+                mock.patch.object(service_handler, "session") as session,
+                expect_send_response as mock_send,
+            ):
                 session.post.return_value = ResponseMock(200, orjson.dumps(dict(content=content)))
                 with self.assertLogs(level="INFO") as logs:
                     do_rest_call("", mock_event, service_handler)
@@ -125,9 +123,10 @@ class DoRestCallTests(ZulipTestCase):
         mock_event = self.mock_event(bot_user)
         service_handler = GenericOutgoingWebhookService("token", bot_user, "service")
 
-        with mock.patch.object(service_handler, "session") as session, self.assertLogs(
-            level="WARNING"
-        ) as m:
+        with (
+            mock.patch.object(service_handler, "session") as session,
+            self.assertLogs(level="WARNING") as m,
+        ):
             session.post.return_value = ResponseMock(500)
             final_response = do_rest_call("", mock_event, service_handler)
             assert final_response is not None
@@ -135,13 +134,13 @@ class DoRestCallTests(ZulipTestCase):
             self.assertEqual(
                 m.output,
                 [
-                    f'WARNING:root:Message http://zulip.testserver/#narrow/stream/999-Verona/topic/Foo/near/ triggered an outgoing webhook, returning status code 500.\n Content of response (in quotes): "{final_response.text}"'
+                    f'WARNING:root:Message http://zulip.testserver/#narrow/channel/999-Verona/topic/Foo/near/ triggered an outgoing webhook, returning status code 500.\n Content of response (in quotes): "{final_response.text}"'
                 ],
             )
         bot_owner_notification = self.get_last_message()
         self.assertEqual(
             bot_owner_notification.content,
-            """[A message](http://zulip.testserver/#narrow/stream/999-Verona/topic/Foo/near/) to your bot @_**Outgoing Webhook** triggered an outgoing webhook.
+            """[A message](http://zulip.testserver/#narrow/channel/999-Verona/topic/Foo/near/) to your bot @_**Outgoing Webhook** triggered an outgoing webhook.
 The webhook got a response with status code *500*.""",
         )
 
@@ -154,9 +153,11 @@ The webhook got a response with status code *500*.""",
         service_handler = GenericOutgoingWebhookService("token", bot_user, "service")
 
         mock_event["message"]["type"] = "unknown"
-        with mock.patch.object(service_handler, "session") as session, self.assertRaises(
-            JsonableError
-        ), self.assertLogs(level="INFO"):
+        with (
+            mock.patch.object(service_handler, "session") as session,
+            self.assertRaises(JsonableError),
+            self.assertLogs(level="INFO"),
+        ):
             session.post.return_value = ResponseMock(200)
             url = "http://somewhere.com/api/call"
             with mock.patch("zerver.lib.outgoing_webhook.get_message_url", return_value=url):
@@ -167,10 +168,13 @@ The webhook got a response with status code *500*.""",
         mock_event = self.mock_event(bot_user)
         service_handler = GenericOutgoingWebhookService("token", bot_user, "service")
 
-        with mock.patch(
-            "zerver.lib.outgoing_webhook.GenericOutgoingWebhookService.make_request",
-            return_value=None,
-        ), self.assertLogs(level="INFO") as logs:
+        with (
+            mock.patch(
+                "zerver.lib.outgoing_webhook.GenericOutgoingWebhookService.make_request",
+                return_value=None,
+            ),
+            self.assertLogs(level="INFO") as logs,
+        ):
             resp = do_rest_call("", mock_event, service_handler)
             self.assertEqual(resp, None)
         self.assert_length(logs.output, 1)
@@ -182,9 +186,11 @@ The webhook got a response with status code *500*.""",
 
         expect_fail = mock.patch("zerver.lib.outgoing_webhook.fail_with_message")
 
-        with mock.patch.object(
-            service_handler, "session"
-        ) as session, expect_fail as mock_fail, self.assertLogs(level="WARNING") as m:
+        with (
+            mock.patch.object(service_handler, "session") as session,
+            expect_fail as mock_fail,
+            self.assertLogs(level="WARNING") as m,
+        ):
             session.post.return_value = ResponseMock(400)
             final_response = do_rest_call("", mock_event, service_handler)
             assert final_response is not None
@@ -192,7 +198,7 @@ The webhook got a response with status code *500*.""",
             self.assertEqual(
                 m.output,
                 [
-                    f'WARNING:root:Message http://zulip.testserver/#narrow/stream/999-Verona/topic/Foo/near/ triggered an outgoing webhook, returning status code 400.\n Content of response (in quotes): "{final_response.text}"'
+                    f'WARNING:root:Message http://zulip.testserver/#narrow/channel/999-Verona/topic/Foo/near/ triggered an outgoing webhook, returning status code 400.\n Content of response (in quotes): "{final_response.text}"'
                 ],
             )
 
@@ -201,7 +207,7 @@ The webhook got a response with status code *500*.""",
         bot_owner_notification = self.get_last_message()
         self.assertEqual(
             bot_owner_notification.content,
-            """[A message](http://zulip.testserver/#narrow/stream/999-Verona/topic/Foo/near/) to your bot @_**Outgoing Webhook** triggered an outgoing webhook.
+            """[A message](http://zulip.testserver/#narrow/channel/999-Verona/topic/Foo/near/) to your bot @_**Outgoing Webhook** triggered an outgoing webhook.
 The webhook got a response with status code *400*.""",
         )
 
@@ -274,9 +280,11 @@ The webhook got a response with status code *400*.""",
 
         # Don't think that we should catch and assert whole log output(which is actually a very big error traceback).
         # We are already asserting bot_owner_notification.content which verifies exception did occur.
-        with mock.patch.object(
-            service_handler, "session"
-        ) as session, expect_logging_exception, expect_fail as mock_fail:
+        with (
+            mock.patch.object(service_handler, "session") as session,
+            expect_logging_exception,
+            expect_fail as mock_fail,
+        ):
             session.post.side_effect = request_exception_error
             do_rest_call("", mock_event, service_handler)
 
@@ -285,7 +293,7 @@ The webhook got a response with status code *400*.""",
         bot_owner_notification = self.get_last_message()
         self.assertEqual(
             bot_owner_notification.content,
-            """[A message](http://zulip.testserver/#narrow/stream/999-Verona/topic/Foo/near/) to your bot @_**Outgoing Webhook** triggered an outgoing webhook.
+            """[A message](http://zulip.testserver/#narrow/channel/999-Verona/topic/Foo/near/) to your bot @_**Outgoing Webhook** triggered an outgoing webhook.
 When trying to send a request to the webhook service, an exception of type RequestException occurred:
 ```
 I'm a generic exception :(
@@ -316,7 +324,7 @@ I'm a generic exception :(
             bot_owner_notification = self.get_last_message()
             self.assertEqual(
                 bot_owner_notification.content,
-                """[A message](http://zulip.testserver/#narrow/stream/999-Verona/topic/Foo/near/) to your bot @_**Outgoing Webhook** triggered an outgoing webhook.
+                """[A message](http://zulip.testserver/#narrow/channel/999-Verona/topic/Foo/near/) to your bot @_**Outgoing Webhook** triggered an outgoing webhook.
 The outgoing webhook server attempted to send a message in Zulip, but that request resulted in the following error:
 > Widgets: API programmer sent invalid JSON content\nThe response contains the following payload:\n```\n'{"content": "whatever", "widget_content": "test"}'\n```""",
             )
@@ -343,7 +351,7 @@ The outgoing webhook server attempted to send a message in Zulip, but that reque
             bot_owner_notification = self.get_last_message()
             self.assertEqual(
                 bot_owner_notification.content,
-                """[A message](http://zulip.testserver/#narrow/stream/999-Verona/topic/Foo/near/) to your bot @_**Outgoing Webhook** triggered an outgoing webhook.
+                """[A message](http://zulip.testserver/#narrow/channel/999-Verona/topic/Foo/near/) to your bot @_**Outgoing Webhook** triggered an outgoing webhook.
 The outgoing webhook server attempted to send a message in Zulip, but that request resulted in the following error:
 > Invalid response format\nThe response contains the following payload:\n```\n'true'\n```""",
             )
@@ -372,7 +380,7 @@ The outgoing webhook server attempted to send a message in Zulip, but that reque
             bot_owner_notification = self.get_last_message()
             self.assertEqual(
                 bot_owner_notification.content,
-                """[A message](http://zulip.testserver/#narrow/stream/999-Verona/topic/Foo/near/) to your bot @_**Outgoing Webhook** triggered an outgoing webhook.
+                """[A message](http://zulip.testserver/#narrow/channel/999-Verona/topic/Foo/near/) to your bot @_**Outgoing Webhook** triggered an outgoing webhook.
 The outgoing webhook server attempted to send a message in Zulip, but that request resulted in the following error:
 > Invalid JSON in response\nThe response contains the following payload:\n```\n"this isn't valid json"\n```""",
             )
@@ -510,7 +518,7 @@ class TestOutgoingWebhookMessaging(ZulipTestCase):
                 "id": message_id,
                 "type": "",
             }
-            message_url = near_message_url(realm, message)
+            message_url = message_link_url(realm, message)
 
             last_message = self.get_last_message()
             self.assertEqual(
@@ -554,8 +562,7 @@ class TestOutgoingWebhookMessaging(ZulipTestCase):
         self.assertEqual(last_message.content, "Hidley ho, I'm a webhook responding!")
         self.assertEqual(last_message.sender_id, bot.id)
         self.assertEqual(last_message.topic_name(), "bar")
-        display_recipient = get_display_recipient(last_message.recipient)
-        self.assertEqual(display_recipient, "Denmark")
+        self.assert_message_stream_name(last_message, "Denmark")
 
     @responses.activate
     def test_stream_message_failure_to_outgoing_webhook_bot(self) -> None:
@@ -595,7 +602,7 @@ class TestOutgoingWebhookMessaging(ZulipTestCase):
             "id": sent_message_id,
             "type": "stream",
         }
-        message_url = near_message_url(realm, message_dict)
+        message_url = message_link_url(realm, message_dict)
         self.assertEqual(
             last_message.content,
             f"[A message]({message_url}) to your bot @_**{bot.full_name}** triggered an outgoing webhook.\n"
@@ -609,15 +616,14 @@ class TestOutgoingWebhookMessaging(ZulipTestCase):
         self.assertEqual(stream_message.content, "Failure! Bot is unavailable")
         self.assertEqual(stream_message.sender_id, bot.id)
         self.assertEqual(stream_message.topic_name(), "bar")
-        display_recipient = get_display_recipient(stream_message.recipient)
-        self.assertEqual(display_recipient, "Denmark")
+        self.assert_message_stream_name(stream_message, "Denmark")
 
     @responses.activate
     def test_stream_message_failure_deactivated_to_outgoing_webhook_bot(self) -> None:
         bot_owner = self.example_user("othello")
         bot = self.create_outgoing_bot(bot_owner)
 
-        def wrapped(event: Dict[str, Any], failure_message: str) -> None:
+        def wrapped(event: dict[str, Any], failure_message: str) -> None:
             do_deactivate_stream(get_stream("Denmark", get_realm("zulip")), acting_user=None)
             fail_with_message(event, failure_message)
 
@@ -626,13 +632,15 @@ class TestOutgoingWebhookMessaging(ZulipTestCase):
             "https://bot.example.com/",
             body=requests.exceptions.Timeout("Time is up!"),
         )
-        with mock.patch(
-            "zerver.lib.outgoing_webhook.fail_with_message", side_effect=wrapped
-        ) as fail:
-            with self.assertLogs(level="INFO") as logs:
-                self.send_stream_message(
-                    bot_owner, "Denmark", content=f"@**{bot.full_name}** foo", topic_name="bar"
-                )
+        with (
+            mock.patch(
+                "zerver.lib.outgoing_webhook.fail_with_message", side_effect=wrapped
+            ) as fail,
+            self.assertLogs(level="INFO") as logs,
+        ):
+            self.send_stream_message(
+                bot_owner, "Denmark", content=f"@**{bot.full_name}** foo", topic_name="bar"
+            )
 
         self.assert_length(logs.output, 5)
         fail.assert_called_once()
@@ -642,7 +650,7 @@ class TestOutgoingWebhookMessaging(ZulipTestCase):
 
         prev_message = self.get_second_to_last_message()
         self.assertIn(
-            "tried to send a message to stream #**Denmark**, but that stream does not exist",
+            "Failure! Bot is unavailable",
             prev_message.content,
         )
 

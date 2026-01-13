@@ -3,9 +3,10 @@ from argparse import ArgumentParser
 from typing import IO, Any
 
 import orjson
-from django.core.management.base import BaseCommand
+from typing_extensions import override
 
-from zerver.lib.queue import queue_json_publish
+from zerver.lib.management import ZulipBaseCommand
+from zerver.lib.queue import queue_json_publish_rollback_unsafe
 
 
 def error(*args: Any) -> None:
@@ -27,10 +28,10 @@ def enqueue_file(queue_name: str, f: IO[str]) -> None:
 
         # This is designed to use the `error` method rather than
         # the call_consume_in_tests flow.
-        queue_json_publish(queue_name, data, error)
+        queue_json_publish_rollback_unsafe(queue_name, data, error)
 
 
-class Command(BaseCommand):
+class Command(ZulipBaseCommand):
     help = """Read JSON lines from a file and enqueue them to a worker queue.
 
 Each line in the file should either be a JSON payload or two tab-separated
@@ -41,6 +42,7 @@ first field is a timestamp that we ignore.)
 You can use "-" to represent stdin.
 """
 
+    @override
     def add_arguments(self, parser: ArgumentParser) -> None:
         parser.add_argument(
             "queue_name", metavar="<queue>", help="name of worker queue to enqueue to"
@@ -49,6 +51,7 @@ You can use "-" to represent stdin.
             "file_name", metavar="<file>", help="name of file containing JSON lines"
         )
 
+    @override
     def handle(self, *args: Any, **options: str) -> None:
         queue_name = options["queue_name"]
         file_name = options["file_name"]

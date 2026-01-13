@@ -1,22 +1,23 @@
 from django.http.request import HttpRequest
 from django.http.response import HttpResponse
 from django.utils.translation import gettext as _
+from pydantic import NonNegativeInt
 
 from zerver.lib.exceptions import JsonableError
 from zerver.lib.message import access_message
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import to_non_negative_int
+from zerver.lib.typed_endpoint import PathOnly, typed_endpoint
 from zerver.models import UserMessage, UserProfile
 
 
-@has_request_variables
+@typed_endpoint
 def read_receipts(
     request: HttpRequest,
     user_profile: UserProfile,
-    message_id: int = REQ(converter=to_non_negative_int, path_only=True),
+    *,
+    message_id: PathOnly[NonNegativeInt],
 ) -> HttpResponse:
-    message = access_message(user_profile, message_id)[0]
+    message = access_message(user_profile, message_id, is_modifying_message=False)
 
     if not user_profile.realm.enable_read_receipts:
         raise JsonableError(_("Read receipts are disabled in this organization."))
@@ -77,7 +78,7 @@ def read_receipts(
         .exclude(user_profile_id=message.sender_id)
         .exclude(user_profile__muter__muted_user_id=user_profile.id)
         .exclude(user_profile__muted__user_profile_id=user_profile.id)
-        .extra(
+        .extra(  # noqa: S610
             where=[UserMessage.where_read()],
         )
         .values_list("user_profile_id", flat=True)

@@ -1,4 +1,4 @@
-FROM ubuntu:20.04
+FROM ubuntu:22.04
 
 ARG UBUNTU_MIRROR
 
@@ -31,14 +31,14 @@ RUN \
     # managed by systemd start within Docker, which breaks normal
     # operation of systemd.
     dpkg-divert --add --rename /bin/systemctl \
-    && curl -fLsS --retry 3 -o /bin/systemctl 'https://raw.githubusercontent.com/gdraheim/docker-systemctl-replacement/v1.5.4505/files/docker/systemctl3.py' \
-    && echo '93006382a98aadfd2490e521824fc870759732ff80cd012ce0dfc70d4225c803  /bin/systemctl' | sha256sum -c \
+    && curl -fLsS --retry 3 -o /bin/systemctl 'https://raw.githubusercontent.com/gdraheim/docker-systemctl-replacement/v1.5.9063/files/docker/systemctl3.py' \
+    && echo '1744aa7281159668d51fc97e57d834b6f116da10796f7f3352de48ad0cbba5b2  /bin/systemctl' | sha256sum -c \
     && chmod +x /bin/systemctl \
     && ln -nsf /bin/true /usr/sbin/policy-rc.d \
     && mkdir -p /run/sshd \
     # docker-systemctl-replacement doesn’t work with template units yet:
     # https://github.com/gdraheim/docker-systemctl-replacement/issues/62
-    && ln -ns /lib/systemd/system/postgresql@.service /etc/systemd/system/multi-user.target.wants/postgresql@12-main.service \
+    && ln -ns /lib/systemd/system/postgresql@.service /etc/systemd/system/multi-user.target.wants/postgresql@14-main.service \
     # Set up the vagrant user and its SSH key (globally public)
     && useradd -ms /bin/bash -u "$VAGRANT_UID" vagrant \
     && mkdir -m 700 ~vagrant/.ssh \

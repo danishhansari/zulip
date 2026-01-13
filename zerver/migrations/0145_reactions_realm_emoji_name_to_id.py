@@ -1,16 +1,16 @@
 from collections import defaultdict
-from typing import Any, Dict
+from typing import Any
 
 from django.db import migrations
-from django.db.backends.postgresql.schema import BaseDatabaseSchemaEditor
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 from django.db.migrations.state import StateApps
 
 
 def realm_emoji_name_to_id(apps: StateApps, schema_editor: BaseDatabaseSchemaEditor) -> None:
     Reaction = apps.get_model("zerver", "Reaction")
     RealmEmoji = apps.get_model("zerver", "RealmEmoji")
-    realm_emoji_by_realm_id: Dict[int, Dict[str, Any]] = defaultdict(dict)
-    for realm_emoji in RealmEmoji.objects.all():
+    realm_emoji_by_realm_id: dict[int, dict[str, Any]] = defaultdict(dict)
+    for realm_emoji in RealmEmoji.objects.all().iterator():
         realm_emoji_by_realm_id[realm_emoji.realm_id][realm_emoji.name] = {
             "id": str(realm_emoji.id),
             "name": realm_emoji.name,

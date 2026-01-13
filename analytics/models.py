@@ -1,7 +1,8 @@
-import datetime
+from datetime import datetime
 
 from django.db import models
 from django.db.models import Q, UniqueConstraint
+from typing_extensions import override
 
 from zerver.lib.timestamp import floor_to_day
 from zerver.models import Realm, Stream, UserProfile
@@ -16,13 +17,14 @@ class FillState(models.Model):
     STARTED = 2
     state = models.PositiveSmallIntegerField()
 
+    @override
     def __str__(self) -> str:
-        return f"<FillState: {self.property} {self.end_time} {self.state}>"
+        return f"{self.property} {self.end_time} {self.state}"
 
 
 # The earliest/starting end_time in FillState
 # We assume there is at least one realm
-def installation_epoch() -> datetime.datetime:
+def installation_epoch() -> datetime:
     earliest_realm_creation = Realm.objects.aggregate(models.Min("date_created"))[
         "date_created__min"
     ]
@@ -58,8 +60,9 @@ class InstallationCount(BaseCount):
             ),
         ]
 
+    @override
     def __str__(self) -> str:
-        return f"<InstallationCount: {self.property} {self.subgroup} {self.value}>"
+        return f"{self.property} {self.subgroup} {self.value}"
 
 
 class RealmCount(BaseCount):
@@ -79,10 +82,16 @@ class RealmCount(BaseCount):
                 name="unique_realm_count_null_subgroup",
             ),
         ]
-        index_together = ["property", "end_time"]
+        indexes = [
+            models.Index(
+                fields=["property", "end_time"],
+                name="analytics_realmcount_property_end_time_3b60396b_idx",
+            )
+        ]
 
+    @override
     def __str__(self) -> str:
-        return f"<RealmCount: {self.realm} {self.property} {self.subgroup} {self.value}>"
+        return f"{self.realm!r} {self.property} {self.subgroup} {self.value}"
 
 
 class UserCount(BaseCount):
@@ -105,10 +114,16 @@ class UserCount(BaseCount):
         ]
         # This index dramatically improves the performance of
         # aggregating from users to realms
-        index_together = ["property", "realm", "end_time"]
+        indexes = [
+            models.Index(
+                fields=["property", "realm", "end_time"],
+                name="analytics_usercount_property_realm_id_end_time_591dbec1_idx",
+            )
+        ]
 
+    @override
     def __str__(self) -> str:
-        return f"<UserCount: {self.user} {self.property} {self.subgroup} {self.value}>"
+        return f"{self.user!r} {self.property} {self.subgroup} {self.value}"
 
 
 class StreamCount(BaseCount):
@@ -131,9 +146,13 @@ class StreamCount(BaseCount):
         ]
         # This index dramatically improves the performance of
         # aggregating from streams to realms
-        index_together = ["property", "realm", "end_time"]
+        indexes = [
+            models.Index(
+                fields=["property", "realm", "end_time"],
+                name="analytics_streamcount_property_realm_id_end_time_155ae930_idx",
+            )
+        ]
 
+    @override
     def __str__(self) -> str:
-        return (
-            f"<StreamCount: {self.stream} {self.property} {self.subgroup} {self.value} {self.id}>"
-        )
+        return f"{self.stream!r} {self.property} {self.subgroup} {self.value} {self.id}"

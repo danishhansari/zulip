@@ -1,5 +1,4 @@
-{% extends "zerver/portico.html" %}
-{% set entrypoint = "landing-page" %}
+{% extends "zerver/marketing_page.html" %}
 
 {% set PAGE_TITLE = "Self-host Zulip" %}
 
@@ -7,13 +6,8 @@
   reliability and security. Take charge of your mission-critical communication
   platform." %}
 
-{% block customhead %}
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-{% endblock %}
 
-{% block portico_content %}
-
-{% include 'zerver/landing_nav.html' %}
+{% block marketing_content %}
 
 <div class="portico-landing why-page solutions-page self-hosting-page">
     <div class="hero bg-pycon security">
@@ -23,10 +17,12 @@
             <p>Open-source team chat with enterprise-grade reliability and security.</p>
         </div>
         <div class="hero-buttons center">
-            <a href="#feature-pricing-self-hosting" class="button">
-                {{ _('Features & pricing') }}
+            <a href="/request-demo/" class="button">
+                {{ _('Get a demo') }}
             </a>
-            <a href="https://zulip.readthedocs.io/en/stable/production/install.html" class="button">Install Zulip {{ latest_release_version }}</a>
+            <a href="https://zulip.readthedocs.io/en/stable/production/install.html" class="button">
+                Install Zulip Server {{ latest_release_version }}
+            </a>
             <a href="/for/business/" class="button">
                 {{ _('Zulip for business') }}
             </a>
@@ -38,25 +34,24 @@
             <div class="feature-half">
                 <div class="feature-text">
                     <h1>
-                        100% free and open-source software.
+                        100% open-source software.
                     </h1>
                     <p>
                         When you self-host Zulip, you get <a href="https://github.com/zulip/zulip#readme">
-                        the same software</a> as our <a href="/plans/">Zulip
-                        Cloud Standard</a> customers.
+                        the same software</a> as our <a href="/plans/">Zulip Cloud</a> customers.
                     </p>
                     <p>
                         Unlike the competition, you don't pay for
                         <a href="https://zulip.readthedocs.io/en/stable/production/authentication-methods.html">SAML
                             authentication</a>, <a href="https://zulip.readthedocs.io/en/stable/production/authentication-methods.html#synchronizing-data">LDAP
-                        sync</a>, or advanced <a href="/help/roles-and-permissions">roles</a> and <a href="/help/stream-permissions">permissions</a>. There
+                        sync</a>, or advanced <a href="/help/user-roles">roles</a> and <a href="/help/manage-permissions">permissions</a>. There
                         is no “open core” catch — just freely available world-class software.
                     </p>
                 </div>
             </div>
             <div class="feature-half">
                 <div class="feature-icon">
-                    <img alt="" src="/static/images/landing-page/open_source/build_inclusive_communities.svg" />
+                    <img alt="" src="{{ static('images/landing-page/open_source/build_inclusive_communities.svg') }}" />
                 </div>
             </div>
         </div>
@@ -64,7 +59,7 @@
         <div class="feature-container alternate-grid">
             <div class="feature-half md-hide">
                 <div class="feature-icon">
-                    <img class="mirror-image" alt="" src="/static/images/landing-page/education/privacy.svg" />
+                    <img class="mirror-image" alt="" src="{{ static('images/landing-page/education/privacy.svg') }}" />
                 </div>
             </div>
             <div class="feature-half">
@@ -81,7 +76,7 @@
                         Zulip's <a
                         href="/help/configure-authentication-methods">authentication</a>
                         and <a
-                        href="/help/roles-and-permissions">permissions</a>
+                        href="/help/manage-permissions">permissions</a>
                         systems are designed to flexibly support every
                         organization's security tools and policies.
                     </p>
@@ -90,7 +85,7 @@
             </div>
             <div class="feature-half md-display">
                 <div class="feature-icon">
-                    <img class="mirror-image" alt="" src="/static/images/landing-page/education/privacy.svg" />
+                    <img class="mirror-image" alt="" src="{{ static('images/landing-page/education/privacy.svg') }}" />
                 </div>
             </div>
         </div>
@@ -124,7 +119,7 @@
             </div>
             <div class="feature-half">
                 <div class="feature-icon">
-                    <img class="mirror-image" alt="" src="/static/images/landing-page/education/mobile.svg" />
+                    <img class="mirror-image" alt="" src="{{ static('images/landing-page/education/mobile.svg') }}" />
                 </div>
             </div>
         </div>
@@ -132,7 +127,7 @@
         <div class="feature-container alternate-grid">
             <div class="feature-half md-hide">
                 <div class="feature-icon">
-                    <img alt="" src="/static/images/landing-page/education/flexible-administration.svg" />
+                    <img alt="" src="{{ static('images/landing-page/education/flexible-administration.svg') }}" />
                 </div>
             </div>
             <div class="feature-half">
@@ -144,10 +139,10 @@
                         Our well-documented scripts help you
                         <a href="https://zulip.readthedocs.io/en/stable/production/install.html">setup</a>,
                         <a href="https://zulip.readthedocs.io/en/stable/production/export-and-import.html#backups">backup</a>, and
-                        <a href="https://zulip.readthedocs.io/en/stable/production/upgrade-or-modify.html">upgrade</a>
+                        <a href="https://zulip.readthedocs.io/en/stable/production/upgrade.html">upgrade</a>
                         your self-hosted Zulip installation. Migrate your
                         <a href="/help/migrating-from-other-chat-tools">data</a>
-                        and <a href="/integrations/doc/slack_incoming">integrations</a>
+                        and <a href="/integrations/slack_incoming">integrations</a>
                         from other chat tools for a smooth transition.
                     </p>
                     <p>
@@ -156,11 +151,19 @@
                         or with prebuilt images for <a href="https://marketplace.digitalocean.com/apps/zulip">Digital Ocean</a>
                         and <a href="https://render.com/docs/deploy-zulip">Render</a>.
                     </p>
+                    <div class="intro_quote quote-in-feature-text">
+                        <blockquote>
+                            Zulip was quite easy to set up, and worked instantly. 1000 people — no problem.
+                            <div class="author">
+                                &mdash;  Erik Dittert, Head of IT at <a href="/case-studies/gut-contact/">GUT contact</a>
+                            </div>
+                        </blockquote>
+                    </div>
                 </div>
             </div>
             <div class="feature-half md-display">
                 <div class="feature-icon">
-                    <img alt="" src="/static/images/landing-page/education/flexible-administration.svg" />
+                    <img alt="" src="{{ static('images/landing-page/education/flexible-administration.svg') }}" />
                 </div>
             </div>
         </div>
@@ -180,7 +183,7 @@
         <div class="feature-row">
             <div class="feature-box">
                 <div class="feature-icon">
-                    <img alt="" src="/static/images/landing-page/self-hosting/growth.png" />
+                    <img alt="" src="{{ static('images/landing-page/self-hosting/growth.png') }}" />
                 </div>
                 <div class="feature-text">
                     <h1>
@@ -204,7 +207,7 @@
             </div>
             <div class="feature-box">
                 <div class="feature-icon">
-                    <img alt="" src="/static/images/landing-page/self-hosting/database.png" />
+                    <img alt="" src="{{ static('images/landing-page/self-hosting/database.png') }}" />
                 </div>
                 <div class="feature-text">
                     <h1>
@@ -230,117 +233,54 @@
         <div class="feature-row">
             <div class="feature-box">
                 <div class="feature-icon">
-                    <img alt="" src="/static/images/landing-page/self-hosting/fork.png" />
+                    <img alt="" src="{{ static('images/landing-page/self-hosting/fork.png') }}" />
                 </div>
                 <div class="feature-text">
                     <h1>
                         Yours to customize.
                     </h1>
                     <p>
-                        <a href="/api/incoming-webhooks-overview">Creating custom integrations</a> is a breeze with
-                        our well-documented <a href="/api">REST API</a>.
+                        <a href="https://zulip.readthedocs.io/en/latest/webhooks/incoming-webhooks-overview.html">Creating custom integrations</a>
+                        is a breeze with our well-documented <a href="/api/">REST API</a>.
                     </p>
                     <p>
                         Zulip makes it easy to
-                        <a href="https://zulip.readthedocs.io/en/stable/production/upgrade-or-modify.html#modifying-zulip">
-                        maintain a fork</a> with customized features, with 175,000 words of documentation for
+                        <a href="https://zulip.readthedocs.io/en/stable/production/modify.html">
+                        maintain a fork</a> with customized features, with 225,000 words of documentation for
                         system administrators and developers.
                     </p>
                 </div>
             </div>
             <div class="feature-box">
                 <div class="feature-icon">
-                    <img alt="" src="/static/images/landing-page/self-hosting/help.png" />
+                    <img alt="" src="{{ static('images/landing-page/self-hosting/help.png') }}" />
                 </div>
                 <div class="feature-text">
                     <h1>
                         Amazing support experience.
                     </h1>
                     <p>
-                        <a href="mailto:sales@zulip.com">Contact Sales</a> to
-                        discuss Enterprise support offerings.
+                        We love getting feedback! Stop by <a href="/development-community/">our friendly
+                        development community</a> to ask for help or suggest
+                        improvements.
                     </p>
                     <p>
-                        We provide free, interactive support for the vast
-                        majority of questions about running a Zulip server. Stop by <a href="/developer-community/">our friendly
-                        development community</a> to ask for help or suggest
-                        improvements!
+                        A variety of support services are available for Zulip
+                        Business and Zulip Enterprise customers. Contact <a
+                        href="mailto:sales@zulip.com">sales@zulip.com</a> with
+                        any questions.
                     </p>
                 </div>
             </div>
         </div>
     </div>
 
-
-    <div class="feature-end">
-        <div class="feature-pricing" id="feature-pricing-self-hosting">
-            <h1 class="center"> Self-hosting plans </h1>
-            <div class="pricing-model">
-                <div class="padded-content">
-                    <div class="pricing-container">
-                        <div class="price-box" tabindex="-1">
-                            <div class="text-content">
-                                <h2>Free</h2>
-                                <div class="description">
-                                    Retain full control over your data.
-                                </div>
-                                <hr />
-                                <ul class="feature-list">
-                                    <li>All Zulip Cloud features included</li>
-                                    <li>Friendly community support</li>
-                                    <li><a href="https://zulip.readthedocs.io/en/stable/production/authentication-methods.html">SAML, OIDC, Google, social SSO</a></li>
-                                    <li><a href="https://zulip.readthedocs.io/en/stable/production/authentication-methods.html#synchronizing-data">LDAP/Active Directory sync</a></li>
-                                    <li>Advanced <a href="/help/roles-and-permissions">roles</a> and <a href="/help/stream-permissions">permissions</a></li>
-                                    <li>Easy <a href="https://zulip.readthedocs.io/en/stable/production/install.html">installation</a>
-                                        and <a href="https://zulip.readthedocs.io/en/stable/production/upgrade-or-modify.html">maintenance</a></li>
-                                </ul>
-                            </div>
-                            <div class="bottom">
-                                <div class="text-content">
-                                    <div class="pricing-details multi-line">
-                                        Zulip is 100% free and open
-                                        source, with no proprietary version. <br />
-                                    </div>
-                                    <a href="https://zulip.readthedocs.io/en/stable/production/install.html" class="button green">
-                                        Install a Zulip server
-                                    </a>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="price-box" tabindex="-1">
-                            <div class="text-content">
-                                <h2>Enterprise</h2>
-                                <div class="description">
-                                    For mission-critical installations.
-                                </div>
-                                <hr />
-                                <ul class="feature-list">
-                                    <li>All self service features included</li>
-                                    <li>Professional support with SLAs</li>
-                                    <li>High availability</li>
-                                    <li>Incident collaboration</li>
-                                    <li>Advanced compliance</li>
-                                    <li>Funds the Zulip open source project</li>
-                                </ul>
-                            </div>
-                            <div class="bottom">
-                                <div class="text-content">
-                                    <div class="pricing-details multi-line">
-                                        Affordable pricing depends on support required.
-                                    </div>
-                                    <a href="mailto:sales@zulip.com" target="_blank" rel="noopener noreferrer" class="no-action button green">
-                                        Contact sales
-                                    </a>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
+    <div class="portico-pricing showing-self-hosted">
+        {% with %}
+        {% set rendering_page="self_hosting" %}
+        {% include "corporate/pricing_model.html" %}
+        {% endwith %}
     </div>
-
 
 </div>
 

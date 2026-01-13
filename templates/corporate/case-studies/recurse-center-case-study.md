@@ -17,9 +17,9 @@ Center is the community, and the core of our online community is Zulip,”
 and it’s impossible to imagine RC today without it.”
 
 
-> “The core of the Recurse Center is the community, and the core of our online
+> The core of the Recurse Center is the community, and the core of our online
 > community is Zulip… Switching to Zulip has turned out to be one of the best
-> decisions we’ve made, and it’s impossible to imagine RC today without it.”
+> decisions we’ve made, and it’s impossible to imagine RC today without it.
 >
 > — [Nick Bergson-Shilcock](https://github.com/nicholasbs), Recurse Center
 > [co-founder and CEO](https://www.recurse.com/team)
@@ -49,9 +49,9 @@ in 2015, Recurse Center alumni [flew out to San
 Francisco](https://www.recurse.com/blog/90-zulip-supporting-oss-at-the-recurse-center)
 for a week to help make it happen. Since then, Zulip has built the most active
 open-source development community of any team chat software, with [75
-people](https://zulip.com/team) who’ve contributed 100+ commits.
+people](https://zulip.com/team/) who’ve contributed 100+ commits.
 
-> “It’s not an exaggeration to say Zulip has made RC a stronger community.”
+> It’s not an exaggeration to say Zulip has made RC a stronger community.
 >
 > — [Nick Bergson-Shilcock](https://github.com/nicholasbs), Recurse Center
 > [co-founder and CEO](https://www.recurse.com/team)
@@ -98,7 +98,7 @@ for a conversation, which makes the community feel welcoming,” Head of Retreat
 Rachel Petacat says.
 
 
-> “Zulip is more friendly to new users than Discord or Slack.”
+> Zulip is more friendly to new users than Discord or Slack.
 >
 > — Rachel Petacat, Recurse Center [Head of Retreat](https://www.recurse.com/team)
 
@@ -162,7 +162,7 @@ a lasting record for the community. “We even used a Zulip topic to coordinate
 for lunch, to let people have their uninterrupted focus time,” John says.
 
 Since 2015, John has stayed connected with the RC alumni community on Zulip. “We
-have a stream for alumni checkins, where each alum uses a dedicated topic to
+have a channel for alumni check-ins, where each alum uses a dedicated topic to
 post updates,” John explains. Some alums drop by weekly, while others might come
 around once a year.  “You can leave a note, and it’s OK if your friend reads it
 a few months later,” John says. “Compare that with Slack, where if someone
@@ -175,7 +175,7 @@ email notifications for private messages,” John explains. The experience of
 keeping up on Zulip is in sharp contrast with Slack, which John uses at work:
 “It’s so hard to keep up with the Slack firehose.”
 
-> “Zulip allows people who are engaging with the community at different paces to connect.”
+> Zulip allows people who are engaging with the community at different paces to connect.
 >
 > — John Hergenroeder, Recurse Center alum
 
@@ -238,6 +238,6 @@ path 6 years ago!”
 
 ---
 
-Check out our guides on using Zulip for [education](/for/education) and
-[events](/for/events), and learn how Zulip [helps communities
-grow](/for/communities)!
+Check out our guides on using Zulip for [education](/for/education/) and
+[events](/for/events/), and learn how Zulip [helps communities
+grow](/for/communities/)!

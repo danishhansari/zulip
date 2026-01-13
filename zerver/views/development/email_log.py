@@ -1,8 +1,6 @@
 import os
-import subprocess
-import urllib
 from contextlib import suppress
-from typing import Optional
+from urllib.parse import urlencode
 
 import orjson
 from django.conf import settings
@@ -10,24 +8,25 @@ from django.http import HttpRequest, HttpResponse
 from django.shortcuts import redirect, render
 from django.views.decorators.http import require_safe
 
-from confirmation.models import Confirmation, confirmation_url
+from confirmation.models import Confirmation
 from zerver.actions.realm_settings import do_send_realm_reactivation_email
 from zerver.actions.user_settings import do_change_user_delivery_email
 from zerver.actions.users import change_user_is_active
-from zerver.lib.email_notifications import enqueue_welcome_emails
-from zerver.lib.request import REQ, has_request_variables
+from zerver.lib.email_notifications import enqueue_welcome_emails, send_account_registered_email
 from zerver.lib.response import json_success
-from zerver.models import Realm, get_realm, get_realm_stream, get_user_by_delivery_email
+from zerver.lib.typed_endpoint import typed_endpoint
+from zerver.models import Realm
+from zerver.models.realms import get_realm
+from zerver.models.streams import get_realm_stream
+from zerver.models.users import get_user_by_delivery_email
 from zerver.views.invite import INVITATION_LINK_VALIDITY_MINUTES
 from zproject.email_backends import get_forward_address, set_forward_address
 
 ZULIP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../")
 
 
-@has_request_variables
-def email_page(
-    request: HttpRequest, forward_address: Optional[str] = REQ(default=None)
-) -> HttpResponse:
+@typed_endpoint
+def email_page(request: HttpRequest, *, forward_address: str | None = None) -> HttpResponse:
     if request.method == "POST":
         assert forward_address is not None
         set_forward_address(forward_address)
@@ -52,13 +51,6 @@ def clear_emails(request: HttpRequest) -> HttpResponse:
 
 @require_safe
 def generate_all_emails(request: HttpRequest) -> HttpResponse:
-    if not settings.TEST_SUITE:  # nocoverage
-        # It's really convenient to automatically inline the email CSS
-        # here, since that saves a step when testing out changes to
-        # the email CSS.  But we don't run this inside the test suite,
-        # because by role, the tests shouldn't be doing a provision-like thing.
-        subprocess.check_call(["./scripts/setup/inline_email_css.py"])
-
     # We import the Django test client inside the view function,
     # because it isn't needed in production elsewhere, and not
     # importing it saves ~50ms of unnecessary manage.py startup time.
@@ -107,7 +99,7 @@ def generate_all_emails(request: HttpRequest) -> HttpResponse:
 
     # Find account email
     result = client.post("/accounts/find/", {"emails": registered_email}, HTTP_HOST=realm.host)
-    assert result.status_code == 302
+    assert result.status_code == 200
 
     # New login email
     logged_in = client.login(dev_auth_username=registered_email, realm=realm)
@@ -129,7 +121,7 @@ def generate_all_emails(request: HttpRequest) -> HttpResponse:
     # Verification for new email
     result = client.patch(
         "/json/settings",
-        urllib.parse.urlencode({"email": "hamlets-new@zulip.com"}),
+        urlencode({"email": "hamlets-new@zulip.com"}),
         content_type="application/x-www-form-urlencoded",
         HTTP_HOST=realm.host,
     )
@@ -137,18 +129,23 @@ def generate_all_emails(request: HttpRequest) -> HttpResponse:
 
     # Email change successful
     key = Confirmation.objects.filter(type=Confirmation.EMAIL_CHANGE).latest("id").confirmation_key
-    url = confirmation_url(key, realm, Confirmation.EMAIL_CHANGE)
     user_profile = get_user_by_delivery_email(registered_email, realm)
-    result = client.get(url)
+    result = client.post("/accounts/confirm_new_email/", {"key": key})
     assert result.status_code == 200
 
     # Reset the email value so we can run this again
-    do_change_user_delivery_email(user_profile, registered_email)
+    do_change_user_delivery_email(user_profile, registered_email, acting_user=None)
 
-    # Follow up day1 day2 emails for normal user
+    # Initial email with new account information for normal user
+    send_account_registered_email(user_profile)
+
+    # Onboarding emails for normal user
     enqueue_welcome_emails(user_profile)
 
-    # Follow up day1 day2 emails for admin user
+    # Initial email with new account information for admin user
+    send_account_registered_email(get_user_by_delivery_email("iago@zulip.com", realm))
+
+    # Onboarding emails for admin user
     enqueue_welcome_emails(get_user_by_delivery_email("iago@zulip.com", realm), realm_creation=True)
 
     # Realm reactivation email

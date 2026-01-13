@@ -27,11 +27,12 @@ class ZcommandTest(ZulipTestCase):
         user.color_scheme = UserProfile.COLOR_SCHEME_LIGHT
         user.save()
 
-        payload = dict(command="/night")
+        payload = dict(command="/dark")
         result = self.client_post("/json/zcommand", payload)
         response_dict = self.assert_json_success(result)
         self.assertIn("Changed to dark theme", response_dict["msg"])
 
+        self.login("hamlet")
         result = self.client_post("/json/zcommand", payload)
         response_dict = self.assert_json_success(result)
         self.assertIn("still in dark theme", response_dict["msg"])
@@ -39,14 +40,15 @@ class ZcommandTest(ZulipTestCase):
     def test_day_zcommand(self) -> None:
         self.login("hamlet")
         user = self.example_user("hamlet")
-        user.color_scheme = UserProfile.COLOR_SCHEME_NIGHT
+        user.color_scheme = UserProfile.COLOR_SCHEME_DARK
         user.save()
 
-        payload = dict(command="/day")
+        payload = dict(command="/light")
         result = self.client_post("/json/zcommand", payload)
         response_dict = self.assert_json_success(result)
         self.assertIn("Changed to light theme", response_dict["msg"])
 
+        self.login("hamlet")
         result = self.client_post("/json/zcommand", payload)
         response_dict = self.assert_json_success(result)
         self.assertIn("still in light theme", response_dict["msg"])
@@ -62,6 +64,7 @@ class ZcommandTest(ZulipTestCase):
         self.assert_json_success(result)
         self.assert_in_response("Changed to fluid-width mode!", result)
 
+        self.login("hamlet")
         result = self.client_post("/json/zcommand", payload)
         self.assert_json_success(result)
         self.assert_in_response("You are still in fluid width mode", result)
@@ -77,6 +80,7 @@ class ZcommandTest(ZulipTestCase):
         self.assert_json_success(result)
         self.assert_in_response("Changed to fixed-width mode!", result)
 
+        self.login("hamlet")
         result = self.client_post("/json/zcommand", payload)
         self.assert_json_success(result)
         self.assert_in_response("You are still in fixed width mode", result)

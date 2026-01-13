@@ -2,11 +2,12 @@
 from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_string, to_wild_value
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
-from zerver.models import MAX_TOPIC_NAME_LENGTH, UserProfile
+from zerver.models import UserProfile
+from zerver.models.constants import MAX_TOPIC_NAME_LENGTH
 
 MESSAGE_TEMPLATE = """
 Splunk alert from saved search:
@@ -18,11 +19,12 @@ Splunk alert from saved search:
 
 
 @webhook_view("Splunk")
-@has_request_variables
+@typed_endpoint
 def api_splunk_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
+    *,
+    payload: JsonBodyPayload[WildValue],
 ) -> HttpResponse:
     # use default values if expected data is not provided
     search_name = payload.get("search_name", "Missing search_name").tame(check_string)
@@ -33,9 +35,9 @@ def api_splunk_webhook(
 
     # for the default topic, use search name but truncate if too long
     if len(search_name) >= MAX_TOPIC_NAME_LENGTH:
-        topic = f"{search_name[:(MAX_TOPIC_NAME_LENGTH - 3)]}..."
+        topic_name = f"{search_name[: (MAX_TOPIC_NAME_LENGTH - 3)]}..."
     else:
-        topic = search_name
+        topic_name = search_name
 
     # construct the message body
     body = MESSAGE_TEMPLATE.format(
@@ -47,6 +49,6 @@ def api_splunk_webhook(
     )
 
     # send the message
-    check_send_webhook_message(request, user_profile, topic, body)
+    check_send_webhook_message(request, user_profile, topic_name, body)
 
     return json_success(request)

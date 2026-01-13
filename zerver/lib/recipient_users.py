@@ -1,16 +1,24 @@
-from typing import Dict, Optional, Sequence
+from collections.abc import Sequence
 
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext as _
 
-from zerver.models import Recipient, UserProfile, get_huddle_recipient, is_cross_realm_bot_email
+from zerver.models import DirectMessageGroup, Recipient, UserProfile
+from zerver.models.recipients import (
+    get_direct_message_group,
+    get_direct_message_group_hash,
+    get_or_create_direct_message_group,
+)
+from zerver.models.users import is_cross_realm_bot_email
 
 
 def get_recipient_from_user_profiles(
     recipient_profiles: Sequence[UserProfile],
     forwarded_mirror_message: bool,
-    forwarder_user_profile: Optional[UserProfile],
+    forwarder_user_profile: UserProfile | None,
     sender: UserProfile,
+    create: bool = True,
 ) -> Recipient:
     # Avoid mutating the passed in list of recipient_profiles.
     recipient_profiles_map = {user_profile.id: user_profile for user_profile in recipient_profiles}
@@ -28,31 +36,65 @@ def get_recipient_from_user_profiles(
         if forwarder_user_profile.id not in recipient_profiles_map:
             raise ValidationError(_("User not authorized for this query"))
 
-    # If the private message is just between the sender and
-    # another person, force it to be a personal internally
-    if len(recipient_profiles_map) == 2 and sender.id in recipient_profiles_map:
-        del recipient_profiles_map[sender.id]
-
-    assert recipient_profiles_map
-    if len(recipient_profiles_map) == 1:
-        [user_profile] = recipient_profiles_map.values()
-        return Recipient(
-            id=user_profile.recipient_id,
-            type=Recipient.PERSONAL,
-            type_id=user_profile.id,
-        )
-
-    # Otherwise, we need a huddle.  Make sure the sender is included in huddle messages
+    # Make sure the sender is included in the group direct messages.
     recipient_profiles_map[sender.id] = sender
+    user_ids = list(recipient_profiles_map)
 
-    user_ids = set(recipient_profiles_map)
-    return get_huddle_recipient(user_ids)
+    # Important note: We are transitioning 1:1 DMs and self DMs to use
+    # DirectMessageGroup as the Recipient type. If PREFER_DIRECT_MESSAGE_GROUP
+    # is enabled and a DirectMessageGroup exists for the collection of user IDs,
+    # it is guaranteed to contain that entire DM conversation. If none
+    # exists, we use the legacy personal recipient (which may or may
+    # not exist). Once the migration completes, this code path should
+    # just call get_or_create_direct_message_group.
+    if len(recipient_profiles_map) <= 2:
+        if settings.PREFER_DIRECT_MESSAGE_GROUP:
+            direct_message_group = get_direct_message_group(user_ids)
+            if direct_message_group:
+                # Use the existing direct message group as the preferred recipient.
+                return Recipient(
+                    id=direct_message_group.recipient_id,
+                    type=Recipient.DIRECT_MESSAGE_GROUP,
+                    type_id=direct_message_group.id,
+                )
+
+        # Making sure we have personal recipients for all users,
+        # otherwise, fall back to the direct message group.
+        has_personal_recipient = all(
+            user_profile.recipient_id is not None
+            for user_profile in recipient_profiles_map.values()
+        )
+        if has_personal_recipient:
+            del recipient_profiles_map[sender.id]
+            if len(recipient_profiles_map) == 1:
+                [recipient_user_profile] = recipient_profiles_map.values()
+            else:
+                recipient_user_profile = sender
+            return Recipient(
+                id=recipient_user_profile.recipient_id,
+                type=Recipient.PERSONAL,
+                type_id=recipient_user_profile.id,
+            )
+    if create:
+        direct_message_group = get_or_create_direct_message_group(user_ids)
+    else:
+        # We intentionally let the DirectMessageGroup.DoesNotExist escape,
+        # in the case that there is no such direct message group, and the
+        # user passed create=False
+        direct_message_group = DirectMessageGroup.objects.get(
+            huddle_hash=get_direct_message_group_hash(user_ids)
+        )
+    return Recipient(
+        id=direct_message_group.recipient_id,
+        type=Recipient.DIRECT_MESSAGE_GROUP,
+        type_id=direct_message_group.id,
+    )
 
 
 def validate_recipient_user_profiles(
     user_profiles: Sequence[UserProfile], sender: UserProfile, allow_deactivated: bool = False
 ) -> Sequence[UserProfile]:
-    recipient_profiles_map: Dict[int, UserProfile] = {}
+    recipient_profiles_map: dict[int, UserProfile] = {}
 
     # We exempt cross-realm bots from the check that all the recipients
     # are in the same realm.
@@ -74,7 +116,7 @@ def validate_recipient_user_profiles(
             realms.add(user_profile.realm_id)
 
     if len(realms) > 1:
-        raise ValidationError(_("You can't send private messages outside of your organization."))
+        raise ValidationError(_("You can't send direct messages outside of your organization."))
 
     return list(recipient_profiles_map.values())
 
@@ -82,14 +124,16 @@ def validate_recipient_user_profiles(
 def recipient_for_user_profiles(
     user_profiles: Sequence[UserProfile],
     forwarded_mirror_message: bool,
-    forwarder_user_profile: Optional[UserProfile],
+    forwarder_user_profile: UserProfile | None,
     sender: UserProfile,
+    *,
     allow_deactivated: bool = False,
+    create: bool = True,
 ) -> Recipient:
     recipient_profiles = validate_recipient_user_profiles(
         user_profiles, sender, allow_deactivated=allow_deactivated
     )
 
     return get_recipient_from_user_profiles(
-        recipient_profiles, forwarded_mirror_message, forwarder_user_profile, sender
+        recipient_profiles, forwarded_mirror_message, forwarder_user_profile, sender, create=create
     )

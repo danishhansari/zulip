@@ -1,11 +1,15 @@
+from datetime import datetime
+
 from django.http import HttpRequest, HttpResponse
 from django.utils.translation import gettext as _
+from pydantic import Json
 
 from zerver.decorator import webhook_view
 from zerver.lib.exceptions import JsonableError
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_string, to_wild_value
+from zerver.lib.timestamp import datetime_to_global_time
+from zerver.lib.typed_endpoint import typed_endpoint
+from zerver.lib.validator import WildValue, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import UserProfile
 
@@ -19,11 +23,12 @@ SEARCH_TEMPLATE = """
 
 
 @webhook_view("Papertrail")
-@has_request_variables
+@typed_endpoint
 def api_papertrail_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(converter=to_wild_value),
+    *,
+    payload: Json[WildValue],
 ) -> HttpResponse:
     if "events" not in payload:
         raise JsonableError(_("Events key is missing from payload"))
@@ -37,7 +42,9 @@ def api_papertrail_webhook(
 
     for i, event in enumerate(payload["events"]):
         event_text = SEARCH_TEMPLATE.format(
-            timestamp=event["display_received_at"].tame(check_string),
+            timestamp=datetime_to_global_time(
+                datetime.fromisoformat(event["received_at"].tame(check_string))
+            ),
             source=event["source_name"].tame(check_string),
             query=payload["saved_search"]["query"].tame(check_string),
             message=event["message"].tame(check_string),
@@ -54,7 +61,7 @@ def api_papertrail_webhook(
             break
 
     post = "\n".join(message)
-    topic = "logs"
+    topic_name = "logs"
 
-    check_send_webhook_message(request, user_profile, topic, post)
+    check_send_webhook_message(request, user_profile, topic_name, post)
     return json_success(request)

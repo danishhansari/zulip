@@ -1,7 +1,9 @@
 # Reviewing Zulip code
 
-Code review is a key part of how Zulip does development. It's an essential aspect
-of our process to build a high-quality product with a maintainable code base.
+Code review is a key part of how Zulip does development. It's an essential
+aspect of our process to build a high-quality product with a maintainable
+codebase. See the [pull request review process](../contributing/review-process.md)
+guide for a detailed overview of Zulip's PR review process.
 
 ## Principles of code review
 
@@ -134,8 +136,8 @@ The following review steps apply to the majority of PRs.
    All the 7 jobs run in GitHub Actions. You can see what caused
    the job to fail by clicking on the failed job. This will open
    up a page in the CI that has more details on why the job failed.
-   For example [this](https://github.com/zulip/zulip/runs/2092955762)
-   is the page of the "Ubuntu 20.04 (Python 3.8, backend + frontend)" job.
+   For example [this](https://github.com/zulip/zulip/actions/runs/15362225042/job/43230810881)
+   is the page of an "Ubuntu 22.04 (Python 3.10, backend + frontend)" job.
    See our docs on [continuous integration](../testing/continuous-integration.md)
    to learn more.
 
@@ -211,13 +213,13 @@ down the line!
 - Open up the parts of the UI that were changed, and make sure they look as
   you were expecting.
 - Is the new UI consistent with similar UI elements? Think about fonts, colors,
-  sizes, etc. If a new or modified element has multiple states (e.g. "on" and
+  sizes, etc. If a new or modified element has multiple states (e.g., "on" and
   "off"), consider all of them.
 - Is the new UI aligned correctly with the elements around it, both vertically and
   horizontally?
 - If the PR adds or modifies a clickable element, does it have a hover behavior
   that's consistent with similar UI elements?
-- If the PR adds or modifies an element (e.g. a button or checkbox) that is
+- If the PR adds or modifies an element (e.g., a button or checkbox) that is
   sometimes disabled, is the disabled version of the UI consistent with similar
   UI elements?
 - Did the PR accidentally affect any other parts of the UI? E.g., if the PR
@@ -264,10 +266,10 @@ Some scenarios to consider:
 
 - Try clicking on any interactive elements, multiple times, in a variety of orders.
 - If the feature affects the **message view**, try it out in different types of
-  narrows: topic, stream, All messages, PMs.
+  narrows: topic, channel, Combined feed, direct messages.
 - If the feature affects the **compose box** in the web app, try both ways of
   [resizing the compose box](https://zulip.com/help/resize-the-compose-box).
-  Test both stream messages and PMs.
+  Test both channel messages and direct messages.
 - If the feature might require **elevated permissions**, check it out as a user who has
   permissions to use it and one who does not.
 - Think about how the feature might **interact with other features**, and try out
@@ -277,38 +279,33 @@ Some scenarios to consider:
   - If the feature has to do with topic editing, do you need to think
     about what happens when a topic is resolved/unresolved?
   - If it's a message view feature, would anything go wrong if the message was
-    collapsed or muted? If it was colored like an `@`-mention or a PM?
+    collapsed or muted? If it was colored like an `@`-mention or a direct message?
 
 ## Review process and communication
 
 ### Asking for a code review
 
-There are a few good ways to ask for a code review:
+The [pull request review process](../contributing/review-process.md) guide
+provides a detailed overview of Zulip's PR review process. Your reviewers and
+Zulip's maintainers will help shepherd your PR through the process. There are
+also some additional ways to ask for a code review:
 
 - Are there folks who have been working on similar things, or a loosely related
   area? If so, they might be a good person to review your PR. `@`-mention them
   with something like "`@person`, would you be up for reviewing this?" If
-  you're not sure whether they are familiar with the code review process, you
+  you're not sure whether they are familiar with how Zulip code reviews work, you
   can also include a link to this guide.
 
 - If you're not sure who to ask, you can post a message in
-  [#code-review](https://chat.zulip.org/#narrow/stream/91-code-review) on [the Zulip
+  [#code-review](https://chat.zulip.org/#narrow/channel/91-code-review) on [the Zulip
   development community server](https://zulip.com/development-community/) to reach
   out to a wider group of potential reviewers.
 
-- If you would like feedback on user-facing changes, you can `@`-mention `@alya`
-  on your PR. She can also help find someone to review the code once the PR is
-  ready from a product perspective.
-
-- Finally, if you are not sure who should review the PR, just indicate clearly
-  that it is ready for review, and the project maintainers will take a look and
-  follow up with next steps.
-
-With any of these approaches, please be patient and mindful of the fact that it
-isn't always possible to provide a quick reply. Going though the [review
-process](#how-to-review-code) described above for your own PR will make your
-code easier and faster to review, which makes it much more likely that it will
-be reviewed quickly and require fewer review cycles.
+Please be patient and mindful of the fact that it isn't always possible to
+provide a quick reply. Going though the [review process](#how-to-review-code)
+described above for your own PR will make your code easier and faster to review,
+which makes it much more likely that it will be reviewed quickly and require
+fewer review cycles.
 
 ### Reviewing someone else's code
 

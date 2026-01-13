@@ -1,18 +1,21 @@
 from argparse import ArgumentParser
-from typing import Any, Optional
+from typing import Any
 
-from django.core.management.base import BaseCommand
+from typing_extensions import override
 
 from zerver.lib.cache_helpers import cache_fillers, fill_remote_cache
+from zerver.lib.management import ZulipBaseCommand
 
 
-class Command(BaseCommand):
+class Command(ZulipBaseCommand):
+    @override
     def add_arguments(self, parser: ArgumentParser) -> None:
         parser.add_argument(
             "--cache", help="Populate one specific cache", choices=cache_fillers.keys()
         )
 
-    def handle(self, *args: Any, **options: Optional[str]) -> None:
+    @override
+    def handle(self, *args: Any, **options: str | None) -> None:
         if options["cache"] is not None:
             fill_remote_cache(options["cache"])
             return

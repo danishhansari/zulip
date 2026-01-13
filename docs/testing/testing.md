@@ -32,15 +32,15 @@ because it takes a long time. Instead, your edit/refresh cycle will
 typically involve running subsets of the tests with commands like these:
 
 ```bash
-./tools/lint zerver/models.py # Lint the file you just changed
-./tools/test-backend zerver.tests.test_markdown.MarkdownTest.test_inline_youtube
-./tools/test-backend MarkdownTest # Run `test-backend --help` for more options
+./tools/lint zerver/models/__init__.py # Lint the file you just changed
+./tools/test-backend zerver.tests.test_markdown.MarkdownEmbedsTest.test_inline_youtube
+./tools/test-backend MarkdownEmbedsTest # Run `test-backend --help` for more options
 ./tools/test-js-with-node util
 # etc.
 ```
 
 The commands above will all run in just a few seconds. Many more
-useful options are discussed in each tool's documentation (e.g.
+useful options are discussed in each tool's documentation (e.g.,
 `./tools/test-backend --help`).
 
 ## Major test suites
@@ -60,7 +60,7 @@ eventually work with, each with its own page detailing how it works:
 Additionally, Zulip also has about a dozen smaller tests suites:
 
 - `tools/test-migrations`: Checks whether the `zerver/migrations`
-  migration content the models defined in `zerver/models.py`. See our
+  migration content the models defined in `zerver/models/*.py`. See our
   [schema migration documentation](../subsystems/schema-migrations.md)
   for details on how to do database migrations correctly.
 - `tools/test-documentation`: Checks for broken links in this
@@ -70,11 +70,6 @@ Additionally, Zulip also has about a dozen smaller tests suites:
 - `tools/test-api`: Tests that the API documentation at `/api`
   actually works; the actual code for this is defined in
   `zerver/openapi/python_examples.py`.
-- `test-locked-requirements`: Verifies that developers didn't forget
-  to run `tools/update-locked-requirements` after modifying
-  `requirements/*.in`. See
-  [our dependency documentation](../subsystems/dependencies.md) for
-  details on the system this is verifying.
 - `tools/check-capitalization`: Checks whether translated strings (aka
   user-facing strings) correctly follow Zulip's capitalization
   conventions. This requires some maintenance of an exclude list
@@ -84,7 +79,7 @@ Additionally, Zulip also has about a dozen smaller tests suites:
 - `tools/check-frontend-i18n`: Checks for a common bug in Handlebars
   templates, of using the wrong syntax for translating blocks
   containing variables.
-- `./tools/test-run-dev`: Checks that `run-dev.py` starts properly;
+- `./tools/test-run-dev`: Checks that `run-dev` starts properly;
   this helps prevent bugs that break the development environment.
 - `./tools/test-queue-worker-reload`: Verifies that Zulip's queue
   processors properly reload themselves after code changes.
@@ -117,7 +112,7 @@ reasons:
 
 As a result, Zulip's major test suites should never access the
 Internet directly. Since code in Zulip does need to access the
-Internet (e.g. to access various third-party APIs), this means that
+Internet (e.g., to access various third-party APIs), this means that
 the Zulip tests use mocking to basically hardcode (for the purposes of
 the test) what responses should be used for any outgoing Internet
 requests that Zulip would make in the code path being tested.

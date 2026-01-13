@@ -2,6 +2,8 @@
 
 Fixes: <!-- Issue link, or clear description.-->
 
+**How changes were tested:**
+
 <!-- If the PR makes UI changes, always include one or more still screenshots to demonstrate your changes. If it seems helpful, add a screen capture of the new functionality as well.
 
 Tooling tips: https://zulip.readthedocs.io/en/latest/tutorials/screenshot-and-gif-software.html
@@ -20,6 +22,7 @@ If any of these steps are not relevant or you have not completed, leave them unc
 
 - [ ] [Self-reviewed](https://zulip.readthedocs.io/en/latest/contributing/code-reviewing.html#how-to-review-code) the changes for clarity and maintainability
       (variable names, code reuse, readability, etc.).
+- [ ] Followed the [AI use policy](https://zulip.readthedocs.io/en/latest/contributing/contributing.html#ai-use-policy-and-guidelines).
 
 Communicate decisions, questions, and potential concerns.
 

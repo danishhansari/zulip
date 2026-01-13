@@ -1,6 +1,8 @@
-from typing import Mapping, Optional, Tuple
+from collections.abc import Mapping
+from datetime import datetime
 
 from zerver.lib.exceptions import UnsupportedWebhookEventTypeError
+from zerver.lib.timestamp import datetime_to_global_time
 from zerver.lib.validator import WildValue, check_bool, check_none_or, check_string
 
 SUPPORTED_CARD_ACTIONS = [
@@ -72,17 +74,18 @@ ACTIONS_TO_MESSAGE_MAPPER = {
 
 
 def prettify_date(date_string: str) -> str:
-    return date_string.replace("T", " ").replace(".000", "").replace("Z", " UTC")
+    dt = datetime.fromisoformat(date_string)
+    return datetime_to_global_time(dt)
 
 
-def process_card_action(payload: WildValue, action_type: str) -> Optional[Tuple[str, str]]:
+def process_card_action(payload: WildValue, action_type: str) -> tuple[str, str] | None:
     proper_action = get_proper_action(payload, action_type)
     if proper_action is not None:
-        return get_subject(payload), get_body(payload, proper_action)
+        return get_topic(payload), get_body(payload, proper_action)
     return None
 
 
-def get_proper_action(payload: WildValue, action_type: str) -> Optional[str]:
+def get_proper_action(payload: WildValue, action_type: str) -> str | None:
     if action_type == "updateCard":
         data = get_action_data(payload)
         old_data = data["old"]
@@ -131,7 +134,7 @@ def get_proper_action(payload: WildValue, action_type: str) -> Optional[str]:
     return action_type
 
 
-def get_subject(payload: WildValue) -> str:
+def get_topic(payload: WildValue) -> str:
     return get_action_data(payload)["board"]["name"].tame(check_string)
 
 

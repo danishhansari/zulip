@@ -3,9 +3,9 @@ from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
 from zerver.lib.exceptions import UnsupportedWebhookEventTypeError
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_string, to_wild_value
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import UserProfile
 
@@ -39,25 +39,26 @@ ALL_EVENT_TYPES = list(SUPPORTED_CHECK_TYPES)
 
 
 @webhook_view("Pingdom", all_event_types=ALL_EVENT_TYPES)
-@has_request_variables
+@typed_endpoint
 def api_pingdom_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
+    *,
+    payload: JsonBodyPayload[WildValue],
 ) -> HttpResponse:
     check_type = get_check_type(payload)
 
     if check_type in SUPPORTED_CHECK_TYPES:
-        subject = get_subject_for_http_request(payload)
+        topic_name = get_topic_for_http_request(payload)
         body = get_body_for_http_request(payload)
     else:
         raise UnsupportedWebhookEventTypeError(check_type)
 
-    check_send_webhook_message(request, user_profile, subject, body, check_type)
+    check_send_webhook_message(request, user_profile, topic_name, body, check_type)
     return json_success(request)
 
 
-def get_subject_for_http_request(payload: WildValue) -> str:
+def get_topic_for_http_request(payload: WildValue) -> str:
     return PINGDOM_TOPIC_TEMPLATE.format(name=payload["check_name"].tame(check_string))
 
 

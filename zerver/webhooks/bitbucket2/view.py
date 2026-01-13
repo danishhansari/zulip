@@ -1,19 +1,20 @@
 # Webhooks for external integrations.
 import re
 import string
-from functools import partial
-from typing import Dict, List, Optional, Protocol
+from typing import Protocol
 
 from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import log_unsupported_webhook_event, webhook_view
 from zerver.lib.exceptions import UnsupportedWebhookEventTypeError
-from zerver.lib.request import REQ, has_request_variables
+from zerver.lib.partial import partial
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_bool, check_int, check_string, to_wild_value
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_bool, check_int, check_string
 from zerver.lib.webhooks.common import (
+    OptionalUserSpecifiedTopicStr,
     check_send_webhook_message,
-    validate_extract_webhook_http_header,
+    get_event_header,
 )
 from zerver.lib.webhooks.git import (
     TOPIC_WITH_BRANCH_TEMPLATE,
@@ -26,6 +27,7 @@ from zerver.lib.webhooks.git import (
     get_push_tag_event_message,
     get_remove_branch_event_message,
     get_short_sha,
+    is_branch_name_notifiable,
 )
 from zerver.models import UserProfile
 
@@ -76,13 +78,14 @@ ALL_EVENT_TYPES = [
 
 
 @webhook_view("Bitbucket2", all_event_types=ALL_EVENT_TYPES)
-@has_request_variables
+@typed_endpoint
 def api_bitbucket2_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
-    branches: Optional[str] = REQ(default=None),
-    user_specified_topic: Optional[str] = REQ("topic", default=None),
+    *,
+    payload: JsonBodyPayload[WildValue],
+    branches: str | None = None,
+    user_specified_topic: OptionalUserSpecifiedTopicStr = None,
 ) -> HttpResponse:
     type = get_type(request, payload)
     if type == "push":
@@ -90,33 +93,34 @@ def api_bitbucket2_webhook(
         if not payload["push"]["changes"]:
             return json_success(request)
         branch = get_branch_name_for_push_event(payload)
-        if branch and branches and branches.find(branch) == -1:
+        if branch and not is_branch_name_notifiable(branch, branches):
             return json_success(request)
 
-        subjects = get_push_subjects(payload)
-        bodies = get_push_bodies(payload)
+        topic_names = get_push_topics(payload)
+        bodies = get_push_bodies(request, payload)
 
-        for b, s in zip(bodies, subjects):
+        for b, t in zip(bodies, topic_names, strict=False):
             check_send_webhook_message(
-                request, user_profile, s, b, type, unquote_url_parameters=True
+                request, user_profile, t, b, type, unquote_url_parameters=True
             )
     else:
-        subject = get_subject_based_on_type(payload, type)
+        topic_name = get_topic_based_on_type(payload, type)
         body_function = get_body_based_on_type(type)
         body = body_function(
+            request,
             payload,
             include_title=user_specified_topic is not None,
         )
 
         check_send_webhook_message(
-            request, user_profile, subject, body, type, unquote_url_parameters=True
+            request, user_profile, topic_name, body, type, unquote_url_parameters=True
         )
 
     return json_success(request)
 
 
-def get_subject_for_branch_specified_events(
-    payload: WildValue, branch_name: Optional[str] = None
+def get_topic_for_branch_specified_events(
+    payload: WildValue, branch_name: str | None = None
 ) -> str:
     return TOPIC_WITH_BRANCH_TEMPLATE.format(
         repo=get_repository_name(payload["repository"]),
@@ -124,28 +128,28 @@ def get_subject_for_branch_specified_events(
     )
 
 
-def get_push_subjects(payload: WildValue) -> List[str]:
-    subjects_list = []
+def get_push_topics(payload: WildValue) -> list[str]:
+    topics_list = []
     for change in payload["push"]["changes"]:
         potential_tag = (change["new"] or change["old"])["type"].tame(check_string)
         if potential_tag == "tag":
-            subjects_list.append(get_subject(payload))
+            topics_list.append(get_topic(payload))
         else:
             if change.get("new"):
                 branch_name = change["new"]["name"].tame(check_string)
             else:
                 branch_name = change["old"]["name"].tame(check_string)
-            subjects_list.append(get_subject_for_branch_specified_events(payload, branch_name))
-    return subjects_list
+            topics_list.append(get_topic_for_branch_specified_events(payload, branch_name))
+    return topics_list
 
 
-def get_subject(payload: WildValue) -> str:
+def get_topic(payload: WildValue) -> str:
     return BITBUCKET_TOPIC_TEMPLATE.format(
         repository_name=get_repository_name(payload["repository"])
     )
 
 
-def get_subject_based_on_type(payload: WildValue, type: str) -> str:
+def get_topic_based_on_type(payload: WildValue, type: str) -> str:
     if type.startswith("pull_request"):
         return TOPIC_WITH_PR_OR_ISSUE_INFO_TEMPLATE.format(
             repo=get_repository_name(payload["repository"]),
@@ -161,7 +165,7 @@ def get_subject_based_on_type(payload: WildValue, type: str) -> str:
             title=payload["issue"]["title"].tame(check_string),
         )
     assert type != "push"
-    return get_subject(payload)
+    return get_topic(payload)
 
 
 def get_type(request: HttpRequest, payload: WildValue) -> str:
@@ -183,15 +187,14 @@ def get_type(request: HttpRequest, payload: WildValue) -> str:
         pull_request_template = "pull_request_{}"
         # Note that we only need the HTTP header to determine pullrequest events.
         # We rely on the payload itself to determine the other ones.
-        event_key = validate_extract_webhook_http_header(request, "X-Event-Key", "BitBucket")
-        assert event_key is not None
-        action = re.match("pullrequest:(?P<action>.*)$", event_key)
+        event_key = get_event_header(request, "X-Event-Key", "BitBucket")
+        action = re.match(r"pullrequest:(?P<action>.*)$", event_key)
         if action:
             action_group = action.group("action")
             if action_group in PULL_REQUEST_SUPPORTED_ACTIONS:
                 return pull_request_template.format(action_group)
     else:
-        event_key = validate_extract_webhook_http_header(request, "X-Event-Key", "BitBucket")
+        event_key = get_event_header(request, "X-Event-Key", "BitBucket")
         if event_key == "repo:updated":
             return event_key
 
@@ -199,8 +202,7 @@ def get_type(request: HttpRequest, payload: WildValue) -> str:
 
 
 class BodyGetter(Protocol):
-    def __call__(self, payload: WildValue, include_title: bool) -> str:
-        ...
+    def __call__(self, request: HttpRequest, payload: WildValue, include_title: bool) -> str: ...
 
 
 def get_body_based_on_type(
@@ -209,48 +211,48 @@ def get_body_based_on_type(
     return GET_SINGLE_MESSAGE_BODY_DEPENDING_ON_TYPE_MAPPER[type]
 
 
-def get_push_bodies(payload: WildValue) -> List[str]:
+def get_push_bodies(request: HttpRequest, payload: WildValue) -> list[str]:
     messages_list = []
     for change in payload["push"]["changes"]:
         potential_tag = (change["new"] or change["old"])["type"].tame(check_string)
         if potential_tag == "tag":
-            messages_list.append(get_push_tag_body(payload, change))
+            messages_list.append(get_push_tag_body(request, payload, change))
         # if change['new'] is None, that means a branch was deleted
         elif change["new"].value is None:
-            messages_list.append(get_remove_branch_push_body(payload, change))
+            messages_list.append(get_remove_branch_push_body(request, payload, change))
         elif change["forced"].tame(check_bool):
-            messages_list.append(get_force_push_body(payload, change))
+            messages_list.append(get_force_push_body(request, payload, change))
         else:
-            messages_list.append(get_normal_push_body(payload, change))
+            messages_list.append(get_normal_push_body(request, payload, change))
     return messages_list
 
 
-def get_remove_branch_push_body(payload: WildValue, change: WildValue) -> str:
+def get_remove_branch_push_body(request: HttpRequest, payload: WildValue, change: WildValue) -> str:
     return get_remove_branch_event_message(
-        get_actor_info(payload),
+        get_actor_info(request, payload),
         change["old"]["name"].tame(check_string),
     )
 
 
-def get_force_push_body(payload: WildValue, change: WildValue) -> str:
+def get_force_push_body(request: HttpRequest, payload: WildValue, change: WildValue) -> str:
     return get_force_push_commits_event_message(
-        get_actor_info(payload),
+        get_actor_info(request, payload),
         change["links"]["html"]["href"].tame(check_string),
         change["new"]["name"].tame(check_string),
         change["new"]["target"]["hash"].tame(check_string),
     )
 
 
-def get_commit_author_name(commit: WildValue) -> str:
+def get_commit_author_name(request: HttpRequest, commit: WildValue) -> str:
     if "user" in commit["author"]:
-        return get_user_info(commit["author"]["user"])
+        return get_user_info(request, commit["author"]["user"])
     return commit["author"]["raw"].tame(check_string).split()[0]
 
 
-def get_normal_push_body(payload: WildValue, change: WildValue) -> str:
+def get_normal_push_body(request: HttpRequest, payload: WildValue, change: WildValue) -> str:
     commits_data = [
         {
-            "name": get_commit_author_name(commit),
+            "name": get_commit_author_name(request, commit),
             "sha": commit["hash"].tame(check_string),
             "url": commit["links"]["html"]["href"].tame(check_string),
             "message": commit["message"].tame(check_string),
@@ -259,7 +261,7 @@ def get_normal_push_body(payload: WildValue, change: WildValue) -> str:
     ]
 
     return get_push_commits_event_message(
-        get_actor_info(payload),
+        get_actor_info(request, payload),
         change["links"]["html"]["href"].tame(check_string),
         change["new"]["name"].tame(check_string),
         commits_data,
@@ -267,19 +269,19 @@ def get_normal_push_body(payload: WildValue, change: WildValue) -> str:
     )
 
 
-def get_fork_body(payload: WildValue, include_title: bool) -> str:
+def get_fork_body(request: HttpRequest, payload: WildValue, include_title: bool) -> str:
     return BITBUCKET_FORK_BODY.format(
-        actor=get_user_info(payload["actor"]),
+        actor=get_user_info(request, payload["actor"]),
         fork_name=get_repository_full_name(payload["fork"]),
         fork_url=get_repository_url(payload["fork"]),
     )
 
 
-def get_commit_comment_body(payload: WildValue, include_title: bool) -> str:
+def get_commit_comment_body(request: HttpRequest, payload: WildValue, include_title: bool) -> str:
     comment = payload["comment"]
     action = "[commented]({})".format(comment["links"]["html"]["href"].tame(check_string))
     return get_commits_comment_action_message(
-        get_actor_info(payload),
+        get_actor_info(request, payload),
         action,
         comment["commit"]["links"]["html"]["href"].tame(check_string),
         comment["commit"]["hash"].tame(check_string),
@@ -287,7 +289,9 @@ def get_commit_comment_body(payload: WildValue, include_title: bool) -> str:
     )
 
 
-def get_commit_status_changed_body(payload: WildValue, include_title: bool) -> str:
+def get_commit_status_changed_body(
+    request: HttpRequest, payload: WildValue, include_title: bool
+) -> str:
     commit_api_url = payload["commit_status"]["links"]["commit"]["href"].tame(check_string)
     commit_id = commit_api_url.split("/")[-1]
 
@@ -305,59 +309,79 @@ def get_commit_status_changed_body(payload: WildValue, include_title: bool) -> s
     )
 
 
-def get_issue_commented_body(payload: WildValue, include_title: bool) -> str:
+def get_issue_commented_body(request: HttpRequest, payload: WildValue, include_title: bool) -> str:
     action = "[commented]({}) on".format(
         payload["comment"]["links"]["html"]["href"].tame(check_string)
     )
-    return get_issue_action_body(payload, action, include_title)
+    return get_issue_action_body(action, request, payload, include_title)
 
 
-def get_issue_action_body(payload: WildValue, action: str, include_title: bool) -> str:
+def get_issue_action_body(
+    action: str, request: HttpRequest, payload: WildValue, include_title: bool
+) -> str:
     issue = payload["issue"]
     assignee = None
     message = None
     if action == "created":
         if issue["assignee"]:
-            assignee = get_user_info(issue["assignee"])
+            assignee = get_user_info(request, issue["assignee"])
         message = issue["content"]["raw"].tame(check_string)
 
     return get_issue_event_message(
-        get_actor_info(payload),
-        action,
-        issue["links"]["html"]["href"].tame(check_string),
-        issue["id"].tame(check_int),
-        message,
-        assignee,
+        user_name=get_actor_info(request, payload),
+        action=action,
+        url=issue["links"]["html"]["href"].tame(check_string),
+        number=issue["id"].tame(check_int),
+        message=message,
+        assignee=assignee,
         title=issue["title"].tame(check_string) if include_title else None,
     )
 
 
-def get_pull_request_action_body(payload: WildValue, action: str, include_title: bool) -> str:
+def get_pull_request_action_body(
+    action: str, request: HttpRequest, payload: WildValue, include_title: bool
+) -> str:
     pull_request = payload["pullrequest"]
+    target_branch = None
+    base_branch = None
+    if action == "merged":
+        target_branch = pull_request["source"]["branch"]["name"].tame(check_string)
+        base_branch = pull_request["destination"]["branch"]["name"].tame(check_string)
+
     return get_pull_request_event_message(
-        get_actor_info(payload),
-        action,
-        get_pull_request_url(pull_request),
-        pull_request["id"].tame(check_int),
+        user_name=get_actor_info(request, payload),
+        action=action,
+        url=get_pull_request_url(pull_request),
+        number=pull_request["id"].tame(check_int),
+        target_branch=target_branch,
+        base_branch=base_branch,
         title=pull_request["title"].tame(check_string) if include_title else None,
     )
 
 
 def get_pull_request_created_or_updated_body(
-    payload: WildValue, action: str, include_title: bool
+    action: str, request: HttpRequest, payload: WildValue, include_title: bool
 ) -> str:
     pull_request = payload["pullrequest"]
     assignee = None
     if pull_request["reviewers"]:
-        assignee = get_user_info(pull_request["reviewers"][0])
+        assignee = get_user_info(request, pull_request["reviewers"][0])
 
     return get_pull_request_event_message(
-        get_actor_info(payload),
-        action,
-        get_pull_request_url(pull_request),
-        pull_request["id"].tame(check_int),
-        target_branch=pull_request["source"]["branch"]["name"].tame(check_string),
-        base_branch=pull_request["destination"]["branch"]["name"].tame(check_string),
+        user_name=get_actor_info(request, payload),
+        action=action,
+        url=get_pull_request_url(pull_request),
+        number=pull_request["id"].tame(check_int),
+        target_branch=(
+            pull_request["source"]["branch"]["name"].tame(check_string)
+            if action == "created"
+            else None
+        ),
+        base_branch=(
+            pull_request["destination"]["branch"]["name"].tame(check_string)
+            if action == "created"
+            else None
+        ),
         message=pull_request["description"].tame(check_string),
         assignee=assignee,
         title=pull_request["title"].tame(check_string) if include_title else None,
@@ -365,43 +389,46 @@ def get_pull_request_created_or_updated_body(
 
 
 def get_pull_request_comment_created_action_body(
+    request: HttpRequest,
     payload: WildValue,
     include_title: bool,
 ) -> str:
     action = "[commented]({})".format(
         payload["comment"]["links"]["html"]["href"].tame(check_string)
     )
-    return get_pull_request_comment_action_body(payload, action, include_title)
+    return get_pull_request_comment_action_body(request, payload, action, include_title)
 
 
 def get_pull_request_deleted_or_updated_comment_action_body(
-    payload: WildValue,
     action: str,
+    request: HttpRequest,
+    payload: WildValue,
     include_title: bool,
 ) -> str:
     action = "{} a [comment]({})".format(
         action, payload["comment"]["links"]["html"]["href"].tame(check_string)
     )
-    return get_pull_request_comment_action_body(payload, action, include_title)
+    return get_pull_request_comment_action_body(request, payload, action, include_title)
 
 
 def get_pull_request_comment_action_body(
+    request: HttpRequest,
     payload: WildValue,
     action: str,
     include_title: bool,
 ) -> str:
     action += " on"
     return get_pull_request_event_message(
-        get_actor_info(payload),
-        action,
-        payload["pullrequest"]["links"]["html"]["href"].tame(check_string),
-        payload["pullrequest"]["id"].tame(check_int),
+        user_name=get_actor_info(request, payload),
+        action=action,
+        url=payload["pullrequest"]["links"]["html"]["href"].tame(check_string),
+        number=payload["pullrequest"]["id"].tame(check_int),
         message=payload["comment"]["content"]["raw"].tame(check_string),
         title=payload["pullrequest"]["title"].tame(check_string) if include_title else None,
     )
 
 
-def get_push_tag_body(payload: WildValue, change: WildValue) -> str:
+def get_push_tag_body(request: HttpRequest, payload: WildValue, change: WildValue) -> str:
     if change.get("new"):
         tag = change["new"]
         action = "pushed"
@@ -410,7 +437,7 @@ def get_push_tag_body(payload: WildValue, change: WildValue) -> str:
         action = "removed"
 
     return get_push_tag_event_message(
-        get_actor_info(payload),
+        get_actor_info(request, payload),
         tag["name"].tame(check_string),
         tag_url=tag["links"]["html"]["href"].tame(check_string),
         action=action,
@@ -424,11 +451,11 @@ def append_punctuation(title: str, message: str) -> str:
     return message
 
 
-def get_repo_updated_body(payload: WildValue, include_title: bool) -> str:
+def get_repo_updated_body(request: HttpRequest, payload: WildValue, include_title: bool) -> str:
     changes = ["website", "name", "links", "language", "full_name", "description"]
     body = ""
     repo_name = payload["repository"]["name"].tame(check_string)
-    actor = get_actor_info(payload)
+    actor = get_actor_info(request, payload)
 
     for change in changes:
         new = payload["changes"][change]["new"]
@@ -474,7 +501,7 @@ def get_repository_full_name(repository_payload: WildValue) -> str:
     return repository_payload["full_name"].tame(check_string)
 
 
-def get_user_info(dct: WildValue) -> str:
+def get_user_info(request: HttpRequest, dct: WildValue) -> str:
     # See https://developer.atlassian.com/cloud/bitbucket/bitbucket-api-changes-gdpr/
     # Since GDPR, we don't get username; instead, we either get display_name
     # or nickname.
@@ -487,18 +514,19 @@ def get_user_info(dct: WildValue) -> str:
     # We call this an unsupported_event, even though we
     # are technically still sending a message.
     log_unsupported_webhook_event(
+        request=request,
         summary="Could not find display_name/nickname field",
     )
 
     return "Unknown user"
 
 
-def get_actor_info(payload: WildValue) -> str:
+def get_actor_info(request: HttpRequest, payload: WildValue) -> str:
     actor = payload["actor"]
-    return get_user_info(actor)
+    return get_user_info(request, actor)
 
 
-def get_branch_name_for_push_event(payload: WildValue) -> Optional[str]:
+def get_branch_name_for_push_event(payload: WildValue) -> str | None:
     change = payload["push"]["changes"][-1]
     potential_tag = (change["new"] or change["old"])["type"].tame(check_string)
     if potential_tag == "tag":
@@ -507,25 +535,25 @@ def get_branch_name_for_push_event(payload: WildValue) -> Optional[str]:
         return (change["new"] or change["old"])["name"].tame(check_string)
 
 
-GET_SINGLE_MESSAGE_BODY_DEPENDING_ON_TYPE_MAPPER: Dict[str, BodyGetter] = {
+GET_SINGLE_MESSAGE_BODY_DEPENDING_ON_TYPE_MAPPER: dict[str, BodyGetter] = {
     "fork": get_fork_body,
     "commit_comment": get_commit_comment_body,
     "change_commit_status": get_commit_status_changed_body,
-    "issue_updated": partial(get_issue_action_body, action="updated"),
-    "issue_created": partial(get_issue_action_body, action="created"),
+    "issue_updated": partial(get_issue_action_body, "updated"),
+    "issue_created": partial(get_issue_action_body, "created"),
     "issue_commented": get_issue_commented_body,
-    "pull_request_created": partial(get_pull_request_created_or_updated_body, action="created"),
-    "pull_request_updated": partial(get_pull_request_created_or_updated_body, action="updated"),
-    "pull_request_approved": partial(get_pull_request_action_body, action="approved"),
-    "pull_request_unapproved": partial(get_pull_request_action_body, action="unapproved"),
-    "pull_request_fulfilled": partial(get_pull_request_action_body, action="merged"),
-    "pull_request_rejected": partial(get_pull_request_action_body, action="rejected"),
+    "pull_request_created": partial(get_pull_request_created_or_updated_body, "created"),
+    "pull_request_updated": partial(get_pull_request_created_or_updated_body, "updated"),
+    "pull_request_approved": partial(get_pull_request_action_body, "approved"),
+    "pull_request_unapproved": partial(get_pull_request_action_body, "unapproved"),
+    "pull_request_fulfilled": partial(get_pull_request_action_body, "merged"),
+    "pull_request_rejected": partial(get_pull_request_action_body, "rejected"),
     "pull_request_comment_created": get_pull_request_comment_created_action_body,
     "pull_request_comment_updated": partial(
-        get_pull_request_deleted_or_updated_comment_action_body, action="updated"
+        get_pull_request_deleted_or_updated_comment_action_body, "updated"
     ),
     "pull_request_comment_deleted": partial(
-        get_pull_request_deleted_or_updated_comment_action_body, action="deleted"
+        get_pull_request_deleted_or_updated_comment_action_body, "deleted"
     ),
     "repo:updated": get_repo_updated_body,
 }

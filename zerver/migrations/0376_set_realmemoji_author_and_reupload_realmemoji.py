@@ -1,5 +1,5 @@
 from django.db import migrations
-from django.db.backends.postgresql.schema import BaseDatabaseSchemaEditor
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 from django.db.migrations.state import StateApps
 from django.db.models import OuterRef, Subquery
 
@@ -38,5 +38,7 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RunPython(set_emoji_author, reverse_code=migrations.RunPython.noop),
+        migrations.RunPython(
+            set_emoji_author, reverse_code=migrations.RunPython.noop, elidable=True
+        ),
     ]

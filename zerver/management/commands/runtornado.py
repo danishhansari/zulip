@@ -5,14 +5,13 @@ from contextlib import AsyncExitStack
 from typing import Any
 from urllib.parse import SplitResult
 
-import __main__
 from asgiref.sync import async_to_sync, sync_to_async
 from django.conf import settings
-from django.core.management.base import BaseCommand, CommandError, CommandParser
-from tornado import autoreload
-from tornado.platform.asyncio import AsyncIOMainLoop
+from django.core.management.base import CommandError, CommandParser
+from typing_extensions import override
 
-settings.RUNNING_INSIDE_TORNADO = True
+from zerver.lib.management import ZulipBaseCommand
+
 if settings.PRODUCTION:
     settings.SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
@@ -35,15 +34,23 @@ if settings.USING_RABBITMQ:
 asyncio.set_event_loop_policy(NoAutoCreateEventLoopPolicy())
 
 
-class Command(BaseCommand):
+class Command(ZulipBaseCommand):
     help = "Starts a Tornado Web server wrapping Django."
 
+    @override
     def add_arguments(self, parser: CommandParser) -> None:
+        parser.add_argument("--autoreload", action="store_true", help="Enable Tornado autoreload")
+        parser.add_argument(
+            "--immediate-reloads",
+            action="store_true",
+            help="Tell web app clients to immediately reload after Tornado starts",
+        )
         parser.add_argument(
             "addrport",
             help="[port number or ipaddr:port]",
         )
 
+    @override
     def handle(self, *args: Any, **options: Any) -> None:
         interactive_debug_listen()
         addrport = options["addrport"]
@@ -70,7 +77,6 @@ class Command(BaseCommand):
         async def inner_run() -> None:
             from django.utils import translation
 
-            AsyncIOMainLoop().install()
             loop = asyncio.get_running_loop()
             stop_fut = loop.create_future()
 
@@ -79,12 +85,12 @@ class Command(BaseCommand):
                     stop_fut.set_result(None)
 
             def add_signal_handlers() -> None:
-                loop.add_signal_handler(signal.SIGINT, stop),
-                loop.add_signal_handler(signal.SIGTERM, stop),
+                loop.add_signal_handler(signal.SIGINT, stop)
+                loop.add_signal_handler(signal.SIGTERM, stop)
 
             def remove_signal_handlers() -> None:
-                loop.remove_signal_handler(signal.SIGINT),
-                loop.remove_signal_handler(signal.SIGTERM),
+                loop.remove_signal_handler(signal.SIGINT)
+                loop.remove_signal_handler(signal.SIGTERM)
 
             async with AsyncExitStack() as stack:
                 stack.push_async_callback(
@@ -95,9 +101,13 @@ class Command(BaseCommand):
                 set_current_port(port)
                 translation.activate(settings.LANGUAGE_CODE)
 
+                if settings.CUSTOM_DEVELOPMENT_SETTINGS:
+                    print("Using custom settings from zproject/custom_dev_settings.py.")
+
                 # We pass display_num_errors=False, since Django will
                 # likely display similar output anyway.
-                self.check(display_num_errors=False)
+                if not options["skip_checks"]:
+                    self.check(display_num_errors=False)
                 print(f"Tornado server (re)started on port {port}")
 
                 if settings.USING_RABBITMQ:
@@ -111,7 +121,7 @@ class Command(BaseCommand):
                     )
 
                 # Application is an instance of Django's standard wsgi handler.
-                application = create_tornado_application()
+                application = create_tornado_application(autoreload=options["autoreload"])
 
                 # start tornado web server in single-threaded mode
                 http_server = httpserver.HTTPServer(application, xheaders=True)
@@ -122,20 +132,13 @@ class Command(BaseCommand):
                 from zerver.tornado.ioloop_logging import logging_data
 
                 logging_data["port"] = str(port)
-                await setup_event_queue(http_server, port)
+                send_reloads = options.get("immediate_reloads", False)
+                await setup_event_queue(http_server, port, send_reloads)
                 stack.callback(dump_event_queues, port)
                 add_client_gc_hook(missedmessage_hook)
                 if settings.USING_RABBITMQ:
                     setup_tornado_rabbitmq(queue_client)
 
-                if hasattr(__main__, "add_reload_hook"):
-                    autoreload.start()
-
                 await stop_fut
-
-                # Monkey patch tornado.autoreload to prevent it from continuing
-                # to watch for changes after catching our SystemExit. Otherwise
-                # the user needs to press Ctrl+C twice.
-                __main__.wait = lambda: None
 
         async_to_sync(inner_run, force_new_loop=True)()

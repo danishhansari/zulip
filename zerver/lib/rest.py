@@ -1,12 +1,14 @@
+import logging
+from collections.abc import Callable
 from functools import wraps
-from typing import Callable, Dict, Set, Tuple, Union
+from typing import Concatenate
 
 from django.http import HttpRequest, HttpResponse, HttpResponseBase
 from django.urls import path
 from django.urls.resolvers import URLPattern
 from django.utils.cache import add_never_cache_headers
 from django.views.decorators.csrf import csrf_exempt, csrf_protect
-from typing_extensions import Concatenate, ParamSpec
+from typing_extensions import ParamSpec
 
 from zerver.decorator import (
     authenticated_json_view,
@@ -18,13 +20,14 @@ from zerver.decorator import (
 from zerver.lib.exceptions import MissingAuthenticationError
 from zerver.lib.request import RequestNotes
 from zerver.lib.response import json_method_not_allowed
+from zerver.lib.sessions import narrow_request_user
 
 ParamT = ParamSpec("ParamT")
 METHODS = ("GET", "HEAD", "POST", "PUT", "DELETE", "PATCH")
 
 
 def default_never_cache_responses(
-    view_func: Callable[Concatenate[HttpRequest, ParamT], HttpResponse]
+    view_func: Callable[Concatenate[HttpRequest, ParamT], HttpResponse],
 ) -> Callable[Concatenate[HttpRequest, ParamT], HttpResponse]:
     """Patched version of the standard Django never_cache_responses
     decorator that adds headers to a response so that it will never be
@@ -47,8 +50,8 @@ def default_never_cache_responses(
 
 
 def get_target_view_function_or_response(
-    request: HttpRequest, rest_dispatch_kwargs: Dict[str, object]
-) -> Union[Tuple[Callable[..., HttpResponse], Set[str]], HttpResponse]:
+    request: HttpRequest, rest_dispatch_kwargs: dict[str, object]
+) -> tuple[Callable[..., HttpResponse], set[str]] | HttpResponse:
     """Helper for REST API request dispatch. The rest_dispatch_kwargs
     parameter is expected to be a dictionary mapping HTTP methods to
     a mix of view functions and (view_function, {view_flags}) tuples.
@@ -65,7 +68,7 @@ def get_target_view_function_or_response(
     this feature; it's not clear it's actually used.
 
     """
-    supported_methods: Dict[str, object] = {}
+    supported_methods: dict[str, object] = {}
     request_notes = RequestNotes.get_notes(request)
     if request_notes.saved_response is not None:
         # For completing long-polled Tornado requests, we skip the
@@ -90,6 +93,12 @@ def get_target_view_function_or_response(
     # Override requested method if magic method=??? parameter exists
     method_to_use = request.method
     if request.POST and "method" in request.POST:
+        logging.warning(
+            "Overriding HTTP method via 'method' parameter: original=%s, override=%s, client=%s",
+            request.method,
+            request.POST["method"],
+            request_notes.client_name,
+        )
         method_to_use = request.POST["method"]
 
     if method_to_use in supported_methods:
@@ -151,6 +160,11 @@ def rest_dispatch(request: HttpRequest, /, **kwargs: object) -> HttpResponse:
     # Security implications of this portion of the code are minimal,
     # as we should worst-case fail closed if we miscategorize a request.
 
+    def check_is_authenticated(request: HttpRequest) -> bool:
+        if "narrow_user_session_cache" not in view_flags:
+            return request.user.is_authenticated
+        return narrow_request_user(request).is_authenticated
+
     # for some special views (e.g. serving a file that has been
     # uploaded), we support using the same URL for web and API clients.
     if "override_api_url_scheme" in view_flags and "Authorization" in request.headers:
@@ -167,7 +181,7 @@ def rest_dispatch(request: HttpRequest, /, **kwargs: object) -> HttpResponse:
         # React Native.  See last block for rate limiting notes.
         target_function = authenticated_uploads_api_view(skip_rate_limiting=True)(target_function)
     # /json views (web client) validate with a session token (cookie)
-    elif not request.path.startswith("/api") and request.user.is_authenticated:
+    elif not request.path.startswith("/api") and check_is_authenticated(request):
         # Authenticated via sessions framework, only CSRF check needed
         auth_kwargs = {}
         if "override_api_url_scheme" in view_flags:
@@ -205,9 +219,6 @@ def rest_dispatch(request: HttpRequest, /, **kwargs: object) -> HttpResponse:
 
 def rest_path(
     route: str,
-    **handlers: Union[
-        Callable[..., HttpResponseBase],
-        Tuple[Callable[..., HttpResponseBase], Set[str]],
-    ],
+    **handlers: Callable[..., HttpResponseBase] | tuple[Callable[..., HttpResponseBase], set[str]],
 ) -> URLPattern:
     return path(route, rest_dispatch, handlers)

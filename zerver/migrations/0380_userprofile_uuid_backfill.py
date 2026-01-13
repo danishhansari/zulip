@@ -1,7 +1,7 @@
 import uuid
 
 from django.db import migrations, models
-from django.db.backends.postgresql.schema import BaseDatabaseSchemaEditor
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 from django.db.migrations.state import StateApps
 
 
@@ -36,5 +36,7 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RunPython(backfill_user_profile_uuid, reverse_code=migrations.RunPython.noop),
+        migrations.RunPython(
+            backfill_user_profile_uuid, reverse_code=migrations.RunPython.noop, elidable=True
+        ),
     ]

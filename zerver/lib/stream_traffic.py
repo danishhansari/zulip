@@ -1,24 +1,32 @@
-import datetime
-from typing import Dict, Optional, Set
+from datetime import datetime, timedelta
 
 from django.db.models import Sum
 from django.utils.timezone import now as timezone_now
 
 from analytics.lib.counts import COUNT_STATS
 from analytics.models import StreamCount
+from zerver.models import Realm
 
 
-def get_streams_traffic(stream_ids: Set[int]) -> Dict[int, int]:
+def get_streams_traffic(realm: Realm, stream_ids: set[int] | None = None) -> dict[int, int] | None:
     stat = COUNT_STATS["messages_in_stream:is_bot:day"]
-    traffic_from = timezone_now() - datetime.timedelta(days=28)
+    traffic_from = timezone_now() - timedelta(days=28)
 
-    query = StreamCount.objects.filter(property=stat.property, end_time__gt=traffic_from)
-    query = query.filter(stream_id__in=stream_ids)
+    filter_kwargs = dict(
+        # The realm_id is important, as it makes this significantly better-indexed
+        realm_id=realm.id,
+        property=stat.property,
+        end_time__gt=traffic_from,
+    )
+    if stream_ids is not None:
+        filter_kwargs["stream_id__in"] = stream_ids
 
-    traffic_list = query.values("stream_id").annotate(value=Sum("value"))
+    query = StreamCount.objects.filter(**filter_kwargs)
+
+    traffic_list = query.values("stream_id").annotate(sum_value=Sum("value"))
     traffic_dict = {}
     for traffic in traffic_list:
-        traffic_dict[traffic["stream_id"]] = traffic["value"]
+        traffic_dict[traffic["stream_id"]] = traffic["sum_value"]
 
     return traffic_dict
 
@@ -31,8 +39,8 @@ STREAM_TRAFFIC_CALCULATION_MIN_AGE_DAYS = 7
 
 
 def get_average_weekly_stream_traffic(
-    stream_id: int, stream_date_created: datetime.datetime, recent_traffic: Dict[int, int]
-) -> Optional[int]:
+    stream_id: int, stream_date_created: datetime, recent_traffic: dict[int, int]
+) -> int | None:
     try:
         stream_traffic = recent_traffic[stream_id]
     except KeyError:

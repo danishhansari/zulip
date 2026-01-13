@@ -9,16 +9,16 @@ because it enables:
   into Zulip.
 - Integrating third-party services that can send email notifications
   into Zulip. See the [integration
-  documentation](https://zulip.com/integrations/doc/email) for
+  documentation](https://zulip.com/integrations/email) for
   details.
 
-Once this integration is configured, each stream will have a special
-email address displayed on the stream settings page. Emails sent to
-that address will be delivered into the stream.
+Once this integration is configured, each channel will have a special
+email address displayed on the channel settings page. Emails sent to
+that address will be delivered into the channel.
 
 There are two ways to configure Zulip's email gateway:
 
-1. Local delivery (recommended): A postfix server runs on the Zulip
+1. Local delivery (recommended): A server runs on the Zulip
    server and passes the emails directly to Zulip.
 1. Polling: A cron job running on the Zulip server checks an IMAP
    inbox (`username@example.com`) every minute for new emails.
@@ -26,8 +26,8 @@ There are two ways to configure Zulip's email gateway:
 The local delivery configuration is preferred for production because
 it supports nicer looking email addresses and has no cron delay. The
 polling option is convenient for testing/developing this feature
-because it doesn't require a public IP address or setting up MX
-records in DNS.
+because it doesn't require a public IP address, setting up MX
+records in DNS, or adjusting firewalls.
 
 :::{note}
 Incoming emails are rate-limited, with the following limits:
@@ -62,28 +62,18 @@ using an [HTTP reverse proxy][reverse-proxy]).
    1 hostname.example.com
    ```
 
+1. If you have a network firewall enabled, configure it to allow incoming access
+   to port 25 on the Zulip server from the public internet. Other mail servers
+   will need to use it to deliver emails to Zulip.
+
 1. Log in to your Zulip server; the remaining steps all happen there.
 
-1. Add `, zulip::postfix_localmail` to `puppet_classes` in
+1. Add `, zulip::local_mailserver` to `puppet_classes` in
    `/etc/zulip/zulip.conf`. A typical value after this change is:
 
    ```ini
-   puppet_classes = zulip::profile::standalone, zulip::postfix_localmail
+   puppet_classes = zulip::profile::standalone, zulip::local_mailserver
    ```
-
-1. If `hostname.example.com` is different from
-   `emaildomain.example.com`, add a section to `/etc/zulip/zulip.conf`
-   on your Zulip server like this:
-
-   ```ini
-   [postfix]
-   mailname = emaildomain.example.com
-   ```
-
-   This tells postfix to expect to receive emails at addresses ending with
-   `@emaildomain.example.com`, overriding the default of
-   `@hostname.example.com`. It will also identify itself as
-   `emaildomain.example.com` on any outgoing emails it sends.
 
 1. Run `/home/zulip/deployments/current/scripts/zulip-puppet-apply`
    (and answer `y`) to apply your new `/etc/zulip/zulip.conf`
@@ -97,7 +87,7 @@ using an [HTTP reverse proxy][reverse-proxy]).
 
 Congratulations! The integration should be fully operational.
 
-[reverse-proxy]: deployment.md#putting-the-zulip-application-behind-a-reverse-proxy
+[reverse-proxy]: reverse-proxies.md
 
 ## Polling setup
 
@@ -122,7 +112,7 @@ Congratulations! The integration should be fully operational.
 1. Test your configuration by sending emails to the target email
    account and then running the Zulip tool to poll that inbox:
 
-   ```
+   ```bash
    su zulip -c '/home/zulip/deployments/current/manage.py email_mirror'
    ```
 

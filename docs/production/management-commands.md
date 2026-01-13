@@ -5,6 +5,9 @@ line. To help with this, Zulip ships with over 100 command-line tools
 implemented using the [Django management commands
 framework][django-management].
 
+Because management commands require server shell access, Zulip Cloud
+users will need to contact support for situations requiring them.
+
 ## Running management commands
 
 Start by logging in as the `zulip` user on the Zulip server. Then run
@@ -54,14 +57,14 @@ unlikely to ever need to interact with that realm.)
 Unless you are
 [hosting multiple organizations on your Zulip server](multiple-organizations.md),
 your single Zulip organization on the root domain will have the empty
-string (`''`) as its `string_id`. So you can run e.g.:
+string (`''`) as its `string_id`. So you can run, for example:
 
 ```console
 zulip@zulip:~$ /home/zulip/deployments/current/manage.py show_admins -r ''
 ```
 
 Otherwise, the `string_id` will correspond to the organization's
-subdomain. E.g. on `it.zulip.example.com`, use
+subdomain. E.g., on `it.zulip.example.com`, use
 `/home/zulip/deployments/current/manage.py show_admins -r it`.
 
 ## manage.py shell
@@ -95,7 +98,7 @@ is already a function in `zerver.actions` with a name like
 `do_change_full_name` that updates that field and notifies clients
 correctly.
 
-For convenience, Zulip automatically imports `zerver/models.py`
+For convenience, Zulip automatically imports `zerver.models`
 into every management shell; if you need to
 access other functions, you'll need to import them yourself.
 
@@ -118,13 +121,16 @@ There are dozens of useful management commands under
   to one or more users.
 - `./manage.py change_realm_subdomain`: Change subdomain of a realm.
 - `./manage.py change_user_email`: Change a user's email address.
-- `./manage.py change_user_role`: Can change are user's role
+- `./manage.py change_user_role`: Can change a user's role
   (easier done [via the
-  UI](https://zulip.com/help/change-a-users-role)) or give bots the
+  UI](https://zulip.com/help/user-roles)) or give bots the
   `can_forge_sender` permission, which is needed for certain special API features.
 - `./manage.py export_single_user`: does a limited version of the [main
   export tools](export-and-import.md) containing just
   the messages accessible by a single user.
+- `./manage.py unarchive_channel`:
+  [Reactivates](https://zulip.com/help/archive-a-channel#unarchiving-archived-channels)
+  an archived channel.
 - `./manage.py reactivate_realm`: Reactivates a realm.
 - `./manage.py deactivate_user`: Deactivates a user. This can be done
   more easily in Zulip's organization administrator UI.
@@ -132,7 +138,7 @@ There are dozens of useful management commands under
   For most purposes, deactivating users is preferred, since that does not
   alter message history for other users.
   See the `./manage.py delete_user --help` documentation for details.
-- `./manage.py clear_auth_rate_limit_history`: If a user failed authentication
+- `./manage.py reset_authentication_attempt_count`: If a user failed authentication
   attempts too many times and further attempts are disallowed by the rate limiter,
   this can be used to reset the limit.
 
@@ -180,6 +186,6 @@ upgrade.
 [writing-bots]: https://zulip.com/api/writing-bots
 [integrations]: https://zulip.com/integrations
 [zulip-api]: https://zulip.com/api/rest
-[webhook-integrations]: https://zulip.com/api/incoming-webhooks-overview
+[webhook-integrations]: ../webhooks/incoming-webhooks-overview.md
 [management-commands-dev]: ../subsystems/management-commands.md
-[django-management]: https://docs.djangoproject.com/en/3.2/ref/django-admin/#django-admin-and-manage-py
+[django-management]: https://docs.djangoproject.com/en/5.0/ref/django-admin/#django-admin-and-manage-py

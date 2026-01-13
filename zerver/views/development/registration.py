@@ -1,5 +1,3 @@
-import random
-import string
 from typing import TYPE_CHECKING, Any, cast
 
 from django.conf import settings
@@ -10,8 +8,13 @@ from confirmation.models import Confirmation, create_confirmation_link
 from zerver.context_processors import get_realm_from_request
 from zerver.lib.response import json_success
 from zerver.models import Realm, UserProfile
-from zerver.views.auth import create_preregistration_user
-from zerver.views.registration import accounts_register
+from zerver.views.auth import (
+    create_preregistration_realm,
+    create_preregistration_user,
+    redirect_and_log_into_subdomain,
+)
+from zerver.views.registration import accounts_register, create_demo_helper
+from zproject.backends import ExternalAuthResult
 
 if TYPE_CHECKING:
     from django.http.request import _ImmutableQueryDict
@@ -30,17 +33,10 @@ def modify_postdata(request: HttpRequest, **kwargs: Any) -> None:
     request.POST = cast("_ImmutableQueryDict", new_post)
 
 
-def generate_demo_realm_name() -> str:
-    letters = "".join(random.SystemRandom().choice(string.ascii_lowercase) for _ in range(4))
-    digits = "".join(random.SystemRandom().choice(string.digits) for _ in range(4))
-    demo_realm_name = f"demo-{letters}{digits}"
-    return demo_realm_name
-
-
 @csrf_exempt
 def register_development_user(request: HttpRequest) -> HttpResponse:
     realm = get_realm_from_request(request)
-    if realm is None:
+    if realm is None:  # nocoverage
         return HttpResponseRedirect(
             f"{settings.EXTERNAL_URI_SCHEME}{settings.REALM_HOSTS['zulip']}/devtools/register_user/",
             status=307,
@@ -49,9 +45,7 @@ def register_development_user(request: HttpRequest) -> HttpResponse:
     count = UserProfile.objects.count()
     name = f"user-{count}"
     email = f"{name}@zulip.com"
-    prereg = create_preregistration_user(
-        email, realm, realm_creation=False, password_required=False
-    )
+    prereg = create_preregistration_user(email, realm, password_required=False)
     activation_url = create_confirmation_link(prereg, Confirmation.USER_REGISTRATION)
     key = activation_url.split("/")[-1]
     # Need to add test data to POST request as it doesn't originally contain the required parameters
@@ -67,8 +61,14 @@ def register_development_realm(request: HttpRequest) -> HttpResponse:
     email = f"{name}@zulip.com"
     realm_name = f"realm-{count}"
     realm_type = Realm.ORG_TYPES["business"]["id"]
-    prereg = create_preregistration_user(email, None, realm_creation=True, password_required=False)
-    activation_url = create_confirmation_link(prereg, Confirmation.REALM_CREATION)
+    realm_default_language = "en"
+    realm_subdomain = realm_name
+    prereg_realm = create_preregistration_realm(
+        email, realm_name, realm_subdomain, realm_type, realm_default_language
+    )
+    activation_url = create_confirmation_link(
+        prereg_realm, Confirmation.NEW_REALM_USER_REGISTRATION, no_associated_realm_object=True
+    )
     key = activation_url.split("/")[-1]
     # Need to add test data to POST request as it doesn't originally contain the required parameters
     modify_postdata(
@@ -76,10 +76,13 @@ def register_development_realm(request: HttpRequest) -> HttpResponse:
         key=key,
         realm_name=realm_name,
         realm_type=realm_type,
+        realm_default_language=realm_default_language,
         full_name=name,
         password="test",
-        realm_subdomain=realm_name,
+        realm_subdomain=realm_subdomain,
         terms="true",
+        how_realm_creator_found_zulip="ad",
+        how_realm_creator_found_zulip_extra_context="test",
     )
 
     return accounts_register(request)
@@ -87,25 +90,19 @@ def register_development_realm(request: HttpRequest) -> HttpResponse:
 
 @csrf_exempt
 def register_demo_development_realm(request: HttpRequest) -> HttpResponse:
-    count = UserProfile.objects.count()
-    name = f"user-{count}"
-    email = f"{name}@zulip.com"
-    realm_name = generate_demo_realm_name()
-    realm_type = Realm.ORG_TYPES["business"]["id"]
-    prereg = create_preregistration_user(email, None, realm_creation=True, password_required=False)
-    activation_url = create_confirmation_link(prereg, Confirmation.REALM_CREATION)
-    key = activation_url.split("/")[-1]
-    # Need to add test data to POST request as it doesn't originally contain the required parameters
-    modify_postdata(
+    count = (
+        Realm.objects.filter(demo_organization_scheduled_deletion_date__isnull=False).count() + 1
+    )
+    user_profile = create_demo_helper(
         request,
-        key=key,
-        realm_name=realm_name,
-        realm_type=realm_type,
-        full_name=name,
-        password="test",
-        realm_subdomain=realm_name,
-        terms="true",
-        is_demo_organization="true",
+        realm_name=f"Demo organization {count}",
+        realm_type=Realm.ORG_TYPES["education"]["id"],
+        realm_default_language="en",
+        how_realm_creator_found_zulip="existing_user",
+        how_realm_creator_found_zulip_extra_context="test",
+        timezone="US/Pacific",
     )
 
-    return accounts_register(request)
+    return redirect_and_log_into_subdomain(
+        ExternalAuthResult(user_profile=user_profile, data_dict={"is_realm_creation": True})
+    )

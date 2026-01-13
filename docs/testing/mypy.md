@@ -120,7 +120,7 @@ We use the `mypy_django_plugin` plugin from the
 [django-stubs](https://github.com/typeddjango/django-stubs) project,
 which supports accurate type inference for classes like
 `QuerySet`. For example, `Stream.objects.filter(realm=realm)` is
-simple Django code to fetch all the streams in a realm. With this
+simple Django code to fetch all the channels in a realm. With this
 plugin, mypy will correctly determine its type is `QuerySet[Stream]`,
 aka a standard, lazily evaluated Django query object that can be
 iterated through to access `Stream` objects, without the developer
@@ -128,24 +128,18 @@ needing to do an explicit annotation.
 
 When declaring the types for functions that accept a `QuerySet`
 object, you should always supply the model type that it accepts as the
-type parameter.
+first type parameter.
 
 ```python
 def foo(user: QuerySet[UserProfile]) -> None:
     ...
 ```
 
-In cases where you need to type the return value from `.values_list`
-or `.values` on a `QuerySet`, you can use the special
-`django_stubs_ext.ValuesQuerySet` type.
-
-For `.values_list`, the second type parameter will be the type of the
-column.
+For `.values_list`, supply the type of the column as the second type
+parameter.
 
 ```python
-from django_stubs_ext import ValuesQuerySet
-
-def get_book_page_counts() -> ValuesQuerySet[Book, int]:
+def get_book_page_counts() -> QuerySet[Book, int]:
     return Book.objects.filter().values_list("page_count", flat=True)
 ```
 
@@ -153,15 +147,13 @@ For `.values`, we prefer to define a `TypedDict` containing the
 key-value pairs for the columns.
 
 ```python
-from django_stubs_ext import ValuesQuerySet
-
 class BookMetadata(TypedDict):
     id: int
     name: str
 
 def get_book_meta_data(
     book_ids: List[int],
-) -> ValuesQuerySet[Book, BookMetadata]:
+) -> QuerySet[Book, BookMetadata]:
     return Book.objects.filter(id__in=book_ids).values("name", "id")
 ```
 
@@ -184,7 +176,7 @@ class FooTestCase(ZulipTestCase):
         return self.client_get("/bar")
 ```
 
-We sometimes encounter innaccurate type annotations in the Django
+We sometimes encounter inaccurate type annotations in the Django
 stubs project. We prefer to address these by [submitting a pull
 request](https://github.com/typeddjango/django-stubs/pulls) to fix the
 issue in the upstream project, just like we do with `typeshed` bugs.
@@ -201,7 +193,7 @@ if it isn't.
 It supports being passed a `sub_validator`, which will verify that
 each element in the list has a given type as well. One can express
 the idea "If `sub_validator` validates that something is a `ResultT`,
-`check_list(sub_validator)` validators that something is a
+`check_list(sub_validator)` validates that something is a
 `List[ResultT]` as follows:
 
 ```python

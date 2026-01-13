@@ -3,7 +3,7 @@
 import json
 
 from django.db import migrations
-from django.db.backends.postgresql.schema import BaseDatabaseSchemaEditor
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 from django.db.migrations.state import StateApps
 
 
@@ -31,7 +31,7 @@ def update_realmauditlog_values(apps: StateApps, schema_editor: BaseDatabaseSche
       }
     """
     RealmAuditLog = apps.get_model("zerver", "RealmAuditLog")
-    # Constants from models.py
+    # Constants from models/realm_audit_logs.py
     USER_DEFAULT_SENDING_STREAM_CHANGED = 129
     USER_DEFAULT_REGISTER_STREAM_CHANGED = 130
     USER_DEFAULT_ALL_PUBLIC_STREAMS_CHANGED = 131

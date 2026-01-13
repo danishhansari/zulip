@@ -1,12 +1,11 @@
 import subprocess
-from typing import List, Optional
 
 from zulint.printer import BOLDRED, CYAN, ENDC, GREEN
 
 from .template_parser import Token
 
 
-def shift_indents_to_the_next_tokens(tokens: List[Token]) -> None:
+def shift_indents_to_the_next_tokens(tokens: list[Token]) -> None:
     """
     During the parsing/validation phase, it's useful to have separate
     tokens for "indent" chunks, but during pretty printing, we like
@@ -39,8 +38,8 @@ def token_allows_children_to_skip_indents(token: Token) -> bool:
     return token.kind in ("django_start", "handlebars_start") or token.tag == "a"
 
 
-def adjust_block_indentation(tokens: List[Token], fn: str) -> None:
-    start_token: Optional[Token] = None
+def adjust_block_indentation(tokens: list[Token], fn: str) -> None:
+    start_token: Token | None = None
 
     for token in tokens:
         if token.kind in ("indent", "whitespace", "newline"):
@@ -106,7 +105,11 @@ def adjust_block_indentation(tokens: List[Token], fn: str) -> None:
             token.indent = start_token.child_indent
 
 
-def fix_indents_for_multi_line_tags(tokens: List[Token]) -> None:
+def fix_indents_for_multi_line_tags(tokens: list[Token]) -> None:
+    def fix(frag: str) -> str:
+        frag = frag.strip()
+        return continue_indent + frag if frag else ""
+
     for token in tokens:
         if token.kind == "code":
             continue
@@ -121,20 +124,16 @@ def fix_indents_for_multi_line_tags(tokens: List[Token]) -> None:
 
         frags = token.new_s.split("\n")
 
-        def fix(frag: str) -> str:
-            frag = frag.strip()
-            return continue_indent + frag if frag else ""
-
         token.new_s = frags[0] + "\n" + "\n".join(fix(frag) for frag in frags[1:])
 
 
-def apply_token_indents(tokens: List[Token]) -> None:
+def apply_token_indents(tokens: list[Token]) -> None:
     for token in tokens:
         if token.indent:
             token.new_s = token.indent + token.new_s
 
 
-def pretty_print_html(tokens: List[Token], fn: str) -> str:
+def pretty_print_html(tokens: list[Token], fn: str) -> str:
     for token in tokens:
         token.new_s = token.s
 
@@ -150,7 +149,7 @@ def numbered_lines(s: str) -> str:
     return "".join(f"{i + 1: >5} {line}\n" for i, line in enumerate(s.split("\n")))
 
 
-def validate_indent_html(fn: str, tokens: List[Token], fix: bool) -> bool:
+def validate_indent_html(fn: str, tokens: list[Token], fix: bool) -> bool:
     with open(fn) as f:
         html = f.read()
     phtml = pretty_print_html(tokens, fn)
@@ -180,7 +179,7 @@ Proposed {BOLDRED}diff{ENDC} for {CYAN}{fn}{ENDC}:
             """,
             flush=True,
         )
-        subprocess.run(["diff", fn, "-"], input=phtml, text=True)
+        subprocess.run(["diff", fn, "-"], input=phtml, text=True, check=False)
         print(
             f"""
 ---

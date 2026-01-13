@@ -1,5 +1,4 @@
 import unicodedata
-from typing import Optional
 
 from django.utils.translation import gettext as _
 
@@ -10,9 +9,12 @@ from zerver.models import Stream
 # https://www.unicode.org/faq/private_use.html#nonchar4
 unicode_non_chars = {
     chr(x)
-    for x in list(range(0xFDD0, 0xFDF0))  # FDD0 through FDEF, inclusive
-    + list(range(0xFFFE, 0x110000, 0x10000))  # 0xFFFE, 0x1FFFE, ... 0x10FFFE inclusive
-    + list(range(0xFFFF, 0x110000, 0x10000))  # 0xFFFF, 0x1FFFF, ... 0x10FFFF inclusive
+    for r in [
+        range(0xFDD0, 0xFDF0),  # FDD0 through FDEF, inclusive
+        range(0xFFFE, 0x110000, 0x10000),  # 0xFFFE, 0x1FFFE, ... 0x10FFFE inclusive
+        range(0xFFFF, 0x110000, 0x10000),  # 0xFFFF, 0x1FFFF, ... 0x10FFFF inclusive
+    ]
+    for x in r
 }
 
 
@@ -24,7 +26,7 @@ def is_character_printable(char: str) -> bool:
     return True
 
 
-def check_string_is_printable(var: str) -> Optional[int]:
+def check_string_is_printable(var: str) -> int | None:
     # Return position (1-indexed!) of the character which is not
     # printable, None if no such character is present.
     for i, char in enumerate(var):
@@ -35,26 +37,29 @@ def check_string_is_printable(var: str) -> Optional[int]:
 
 def check_stream_name(stream_name: str) -> None:
     if stream_name.strip() == "":
-        raise JsonableError(_("Stream name can't be empty!"))
+        raise JsonableError(_("Channel name can't be empty."))
 
     if len(stream_name) > Stream.MAX_NAME_LENGTH:
         raise JsonableError(
-            _("Stream name too long (limit: {} characters).").format(Stream.MAX_NAME_LENGTH)
+            _("Channel name too long (limit: {max_length} characters).").format(
+                max_length=Stream.MAX_NAME_LENGTH
+            )
         )
 
     invalid_character_pos = check_string_is_printable(stream_name)
     if invalid_character_pos is not None:
         raise JsonableError(
-            _("Invalid character in stream name, at position {}!").format(invalid_character_pos)
+            _("Invalid character in channel name, at position {position}.").format(
+                position=invalid_character_pos
+            )
         )
 
 
-def check_stream_topic(topic: str) -> None:
-    if topic.strip() == "":
-        raise JsonableError(_("Topic can't be empty!"))
-
-    invalid_character_pos = check_string_is_printable(topic)
+def check_stream_topic(topic_name: str) -> None:
+    invalid_character_pos = check_string_is_printable(topic_name)
     if invalid_character_pos is not None:
         raise JsonableError(
-            _("Invalid character in topic, at position {}!").format(invalid_character_pos)
+            _("Invalid character in topic, at position {position}!").format(
+                position=invalid_character_pos
+            )
         )

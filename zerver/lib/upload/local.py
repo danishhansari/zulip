@@ -1,22 +1,19 @@
-import logging
 import os
 import random
 import secrets
 import shutil
-from typing import IO, Any, Callable, Literal, Optional
+from collections.abc import Callable, Iterator
+from datetime import datetime
+from typing import IO, Any, Literal
 
+import pyvips
 from django.conf import settings
+from typing_extensions import override
 
-from zerver.lib.avatar_hash import user_avatar_path
-from zerver.lib.upload.base import (
-    MEDIUM_AVATAR_SIZE,
-    ZulipUploadBackend,
-    create_attachment,
-    resize_avatar,
-    resize_emoji,
-    resize_logo,
-    sanitize_name,
-)
+from zerver.lib.mime_types import guess_type
+from zerver.lib.thumbnail import resize_logo, resize_realm_icon
+from zerver.lib.timestamp import timestamp_to_datetime
+from zerver.lib.upload.base import StreamingSourceWithSize, ZulipUploadBackend
 from zerver.lib.utils import assert_is_not_none
 from zerver.models import Realm, RealmEmoji, UserProfile
 
@@ -29,7 +26,8 @@ def assert_is_local_storage_path(type: Literal["avatars", "files"], full_path: s
     defense in depth.
     """
     assert settings.LOCAL_UPLOADS_DIR is not None
-    type_path = os.path.join(settings.LOCAL_UPLOADS_DIR, type)
+    type_path = os.path.normpath(os.path.join(settings.LOCAL_UPLOADS_DIR, type))
+    full_path = os.path.normpath(full_path)
     assert os.path.commonpath([type_path, full_path]) == type_path
 
 
@@ -42,115 +40,164 @@ def write_local_file(type: Literal["avatars", "files"], path: str, file_data: by
         f.write(file_data)
 
 
-def read_local_file(type: Literal["avatars", "files"], path: str) -> bytes:
+def read_local_file(type: Literal["avatars", "files"], path: str) -> Iterator[bytes]:
     file_path = os.path.join(assert_is_not_none(settings.LOCAL_UPLOADS_DIR), type, path)
     assert_is_local_storage_path(type, file_path)
 
     with open(file_path, "rb") as f:
-        return f.read()
+        yield from iter(lambda: f.read(4 * 1024 * 1024), b"")
 
 
-def delete_local_file(type: Literal["avatars", "files"], path: str) -> bool:
+def delete_local_file(
+    type: Literal["avatars", "files"], path: str, *, directory: bool = False
+) -> None:
     file_path = os.path.join(assert_is_not_none(settings.LOCAL_UPLOADS_DIR), type, path)
     assert_is_local_storage_path(type, file_path)
 
-    if os.path.isfile(file_path):
-        # This removes the file but the empty folders still remain.
+    def prune_empty_dirs(file_path: str) -> None:
+        # Remove as many directories up the tree as are now empty
+        directory = os.path.dirname(file_path)
+        while directory != settings.LOCAL_UPLOADS_DIR:
+            try:
+                os.rmdir(directory)
+                directory = os.path.dirname(directory)
+            except OSError:
+                break
+
+    if directory and os.path.isdir(file_path):
+        shutil.rmtree(file_path)
+        prune_empty_dirs(os.path.dirname(file_path))
+    elif os.path.isfile(file_path):
         os.remove(file_path)
-        return True
-    file_name = path.split("/")[-1]
-    logging.warning("%s does not exist. Its entry in the database will be removed.", file_name)
-    return False
+        prune_empty_dirs(file_path)
 
 
 class LocalUploadBackend(ZulipUploadBackend):
+    @override
     def get_public_upload_root_url(self) -> str:
         return "/user_avatars/"
 
-    def generate_message_upload_path(self, realm_id: str, uploaded_file_name: str) -> str:
+    @override
+    def generate_message_upload_path(self, realm_id: str, sanitized_file_name: str) -> str:
         # Split into 256 subdirectories to prevent directories from getting too big
         return "/".join(
             [
                 realm_id,
                 format(random.randint(0, 255), "x"),
                 secrets.token_urlsafe(18),
-                sanitize_name(uploaded_file_name),
+                sanitized_file_name,
             ]
         )
 
-    def upload_message_file(
+    @override
+    def upload_message_attachment(
         self,
-        uploaded_file_name: str,
-        uploaded_file_size: int,
-        content_type: Optional[str],
+        path_id: str,
+        filename: str,
+        content_type: str,
         file_data: bytes,
-        user_profile: UserProfile,
-        target_realm: Optional[Realm] = None,
-    ) -> str:
-        if target_realm is None:
-            target_realm = user_profile.realm
-
-        path = self.generate_message_upload_path(str(target_realm.id), uploaded_file_name)
-
-        write_local_file("files", path, file_data)
-        create_attachment(uploaded_file_name, path, user_profile, target_realm, uploaded_file_size)
-        return "/user_uploads/" + path
-
-    def delete_message_image(self, path_id: str) -> bool:
-        return delete_local_file("files", path_id)
-
-    def write_avatar_images(self, file_path: str, image_data: bytes) -> None:
-        write_local_file("avatars", file_path + ".original", image_data)
-
-        resized_data = resize_avatar(image_data)
-        write_local_file("avatars", file_path + ".png", resized_data)
-
-        resized_medium = resize_avatar(image_data, MEDIUM_AVATAR_SIZE)
-        write_local_file("avatars", file_path + "-medium.png", resized_medium)
-
-    def upload_avatar_image(
-        self,
-        user_file: IO[bytes],
-        acting_user_profile: UserProfile,
-        target_user_profile: UserProfile,
-        content_type: Optional[str] = None,
+        user_profile: UserProfile | None,
+        target_realm: Realm | None,
     ) -> None:
-        file_path = user_avatar_path(target_user_profile)
+        write_local_file("files", path_id, file_data)
 
-        image_data = user_file.read()
-        self.write_avatar_images(file_path, image_data)
+    @override
+    def save_attachment_contents(self, path_id: str, filehandle: IO[bytes]) -> None:
+        for chunk in read_local_file("files", path_id):
+            filehandle.write(chunk)
 
-    def delete_avatar_image(self, user: UserProfile) -> None:
-        path_id = user_avatar_path(user)
+    @override
+    def attachment_source(self, path_id: str) -> StreamingSourceWithSize:
+        file_path = os.path.join(assert_is_not_none(settings.LOCAL_UPLOADS_DIR), "files", path_id)
+        assert_is_local_storage_path("files", file_path)
+        vips_source = pyvips.Source.new_from_file(file_path)
+        return StreamingSourceWithSize(
+            size=os.path.getsize(file_path),
+            vips_source=vips_source,
+            reader=lambda: open(file_path, "rb"),
+        )
 
-        delete_local_file("avatars", path_id + ".original")
-        delete_local_file("avatars", path_id + ".png")
-        delete_local_file("avatars", path_id + "-medium.png")
+    @override
+    def delete_message_attachment(self, path_id: str) -> None:
+        delete_local_file("files", path_id)
+        delete_local_file("files", f"{path_id}.info")
+        delete_local_file("files", f"thumbnail/{path_id}/", directory=True)
 
+    @override
+    def all_message_attachments(
+        self,
+        include_thumbnails: bool = False,
+        prefix: str = "",
+    ) -> Iterator[tuple[str, datetime]]:
+        assert settings.LOCAL_UPLOADS_DIR is not None
+        top = settings.LOCAL_UPLOADS_DIR + "/files"
+        start = top
+        if prefix != "":
+            start += f"/{prefix}"
+        for dirname, subdirnames, files in os.walk(start):
+            if not include_thumbnails and dirname == top and "thumbnail" in subdirnames:
+                subdirnames.remove("thumbnail")
+            for f in files:
+                fullpath = os.path.join(dirname, f)
+                yield (
+                    os.path.relpath(fullpath, top),
+                    timestamp_to_datetime(os.path.getmtime(fullpath)),
+                )
+
+    @override
     def get_avatar_url(self, hash_key: str, medium: bool = False) -> str:
-        medium_suffix = "-medium" if medium else ""
-        return f"/user_avatars/{hash_key}{medium_suffix}.png"
+        return "/user_avatars/" + self.get_avatar_path(hash_key, medium)
 
-    def copy_avatar(self, source_profile: UserProfile, target_profile: UserProfile) -> None:
-        source_file_path = user_avatar_path(source_profile)
-        target_file_path = user_avatar_path(target_profile)
+    @override
+    def get_avatar_contents(self, file_path: str) -> tuple[bytes, str]:
+        image_data = b"".join(read_local_file("avatars", file_path + ".original"))
+        content_type = guess_type(file_path)[0]
+        return image_data, content_type or "application/octet-stream"
 
-        image_data = read_local_file("avatars", source_file_path + ".original")
-        self.write_avatar_images(target_file_path, image_data)
+    @override
+    def upload_single_avatar_image(
+        self,
+        file_path: str,
+        *,
+        user_profile: UserProfile,
+        image_data: bytes,
+        content_type: str | None,
+        future: bool = True,
+    ) -> None:
+        write_local_file("avatars", file_path, image_data)
 
-    def upload_realm_icon_image(self, icon_file: IO[bytes], user_profile: UserProfile) -> None:
+    @override
+    def delete_avatar_image(self, path_id: str) -> None:
+        delete_local_file("avatars", path_id + ".original")
+        delete_local_file("avatars", self.get_avatar_path(path_id, True))
+        delete_local_file("avatars", self.get_avatar_path(path_id, False))
+
+    @override
+    def get_realm_icon_url(self, realm_id: int, version: int) -> str:
+        return f"/user_avatars/{realm_id}/realm/icon.png?version={version}"
+
+    @override
+    def upload_realm_icon_image(
+        self, icon_file: IO[bytes], user_profile: UserProfile, content_type: str
+    ) -> None:
         upload_path = self.realm_avatar_and_logo_path(user_profile.realm)
         image_data = icon_file.read()
         write_local_file("avatars", os.path.join(upload_path, "icon.original"), image_data)
 
-        resized_data = resize_avatar(image_data)
+        resized_data = resize_realm_icon(image_data)
         write_local_file("avatars", os.path.join(upload_path, "icon.png"), resized_data)
 
-    def get_realm_icon_url(self, realm_id: int, version: int) -> str:
-        return f"/user_avatars/{realm_id}/realm/icon.png?version={version}"
+    @override
+    def get_realm_logo_url(self, realm_id: int, version: int, night: bool) -> str:
+        if night:
+            file_name = "night_logo.png"
+        else:
+            file_name = "logo.png"
+        return f"/user_avatars/{realm_id}/realm/{file_name}?version={version}"
 
+    @override
     def upload_realm_logo_image(
-        self, logo_file: IO[bytes], user_profile: UserProfile, night: bool
+        self, logo_file: IO[bytes], user_profile: UserProfile, night: bool, content_type: str
     ) -> None:
         upload_path = self.realm_avatar_and_logo_path(user_profile.realm)
         if night:
@@ -165,57 +212,7 @@ class LocalUploadBackend(ZulipUploadBackend):
         resized_data = resize_logo(image_data)
         write_local_file("avatars", os.path.join(upload_path, resized_file), resized_data)
 
-    def get_realm_logo_url(self, realm_id: int, version: int, night: bool) -> str:
-        if night:
-            file_name = "night_logo.png"
-        else:
-            file_name = "logo.png"
-        return f"/user_avatars/{realm_id}/realm/{file_name}?version={version}"
-
-    def ensure_avatar_image(self, user_profile: UserProfile, is_medium: bool = False) -> None:
-        file_extension = "-medium.png" if is_medium else ".png"
-        file_path = user_avatar_path(user_profile)
-
-        output_path = os.path.join(
-            assert_is_not_none(settings.LOCAL_AVATARS_DIR),
-            file_path + file_extension,
-        )
-        if os.path.isfile(output_path):
-            return
-
-        image_path = os.path.join(
-            assert_is_not_none(settings.LOCAL_AVATARS_DIR),
-            file_path + ".original",
-        )
-        with open(image_path, "rb") as f:
-            image_data = f.read()
-        if is_medium:
-            resized_avatar = resize_avatar(image_data, MEDIUM_AVATAR_SIZE)
-        else:
-            resized_avatar = resize_avatar(image_data)
-        write_local_file("avatars", file_path + file_extension, resized_avatar)
-
-    def upload_emoji_image(
-        self, emoji_file: IO[bytes], emoji_file_name: str, user_profile: UserProfile
-    ) -> bool:
-        emoji_path = RealmEmoji.PATH_ID_TEMPLATE.format(
-            realm_id=user_profile.realm_id,
-            emoji_file_name=emoji_file_name,
-        )
-
-        image_data = emoji_file.read()
-        write_local_file("avatars", ".".join((emoji_path, "original")), image_data)
-        resized_image_data, is_animated, still_image_data = resize_emoji(image_data)
-        write_local_file("avatars", emoji_path, resized_image_data)
-        if is_animated:
-            assert still_image_data is not None
-            still_path = RealmEmoji.STILL_PATH_ID_TEMPLATE.format(
-                realm_id=user_profile.realm_id,
-                emoji_filename_without_extension=os.path.splitext(emoji_file_name)[0],
-            )
-            write_local_file("avatars", still_path, still_image_data)
-        return is_animated
-
+    @override
     def get_emoji_url(self, emoji_file_name: str, realm_id: int, still: bool = False) -> str:
         if still:
             return os.path.join(
@@ -233,11 +230,23 @@ class LocalUploadBackend(ZulipUploadBackend):
                 ),
             )
 
+    @override
+    def upload_single_emoji_image(
+        self, path: str, content_type: str | None, user_profile: UserProfile, image_data: bytes
+    ) -> None:
+        write_local_file("avatars", path, image_data)
+
+    @override
+    def get_export_tarball_url(self, realm: Realm, export_path: str) -> str:
+        # export_path has a leading `/`
+        return realm.url + export_path
+
+    @override
     def upload_export_tarball(
         self,
         realm: Realm,
         tarball_path: str,
-        percent_callback: Optional[Callable[[Any], None]] = None,
+        percent_callback: Callable[[Any], None] | None = None,
     ) -> str:
         path = os.path.join(
             "exports",
@@ -248,17 +257,10 @@ class LocalUploadBackend(ZulipUploadBackend):
         abs_path = os.path.join(assert_is_not_none(settings.LOCAL_AVATARS_DIR), path)
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
         shutil.copy(tarball_path, abs_path)
-        public_url = realm.uri + "/user_avatars/" + path
-        return public_url
+        return self.get_export_tarball_url(realm, "/user_avatars/" + path)
 
-    def delete_export_tarball(self, export_path: str) -> Optional[str]:
-        # Get the last element of a list in the form ['user_avatars', '<file_path>']
+    @override
+    def delete_export_tarball(self, export_path: str) -> None:
         assert export_path.startswith("/")
-        file_path = export_path[1:].split("/", 1)[-1]
-        if delete_local_file("avatars", file_path):
-            return export_path
-        return None
-
-    def get_export_tarball_url(self, realm: Realm, export_path: str) -> str:
-        # export_path has a leading `/`
-        return realm.uri + export_path
+        file_path = export_path.removeprefix("/").split("/", 1)[-1]
+        delete_local_file("avatars", file_path)

@@ -1,13 +1,12 @@
 """Webhooks for external integrations."""
-from typing import List
 
 from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import authenticated_rest_api_view
 from zerver.lib.email_notifications import convert_html_to_markdown
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import WildValue, check_string, to_wild_value
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import UserProfile
 
@@ -59,7 +58,7 @@ def property_name(property: str, index: int) -> str:
     return name
 
 
-def parse_freshdesk_event(event_string: str) -> List[str]:
+def parse_freshdesk_event(event_string: str) -> list[str]:
     """These are always of the form "{ticket_action:created}" or
     "{status:{from:4,to:6}}". Note the lack of string quoting: this isn't
     valid JSON so we have to parse it ourselves.
@@ -81,7 +80,7 @@ def parse_freshdesk_event(event_string: str) -> List[str]:
         ]
 
 
-def format_freshdesk_note_message(ticket: WildValue, event_info: List[str]) -> str:
+def format_freshdesk_note_message(ticket: WildValue, event_info: list[str]) -> str:
     """There are public (visible to customers) and private note types."""
     note_type = event_info[1]
     content = NOTE_TEMPLATE.format(
@@ -95,7 +94,7 @@ def format_freshdesk_note_message(ticket: WildValue, event_info: List[str]) -> s
     return content
 
 
-def format_freshdesk_property_change_message(ticket: WildValue, event_info: List[str]) -> str:
+def format_freshdesk_property_change_message(ticket: WildValue, event_info: list[str]) -> str:
     """Freshdesk will only tell us the first event to match our webhook
     configuration, so if we change multiple properties, we only get the before
     and after data for the first one.
@@ -131,15 +130,16 @@ def format_freshdesk_ticket_creation_message(ticket: WildValue) -> str:
 
 
 @authenticated_rest_api_view(webhook_client_name="Freshdesk")
-@has_request_variables
+@typed_endpoint
 def api_freshdesk_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: WildValue = REQ(argument_type="body", converter=to_wild_value),
+    *,
+    payload: JsonBodyPayload[WildValue],
 ) -> HttpResponse:
     ticket = payload["freshdesk_webhook"]
 
-    subject = (
+    topic_name = (
         f"#{ticket['ticket_id'].tame(check_string)}: {ticket['ticket_subject'].tame(check_string)}"
     )
     event_info = parse_freshdesk_event(ticket["triggered_event"].tame(check_string))
@@ -154,5 +154,5 @@ def api_freshdesk_webhook(
         # Not an event we know handle; do nothing.
         return json_success(request)
 
-    check_send_webhook_message(request, user_profile, subject, content)
+    check_send_webhook_message(request, user_profile, topic_name, content)
     return json_success(request)

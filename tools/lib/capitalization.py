@@ -1,5 +1,6 @@
 import re
-from typing import List, Match, Tuple
+from io import StringIO
+from re import Match
 
 from bs4 import BeautifulSoup
 
@@ -10,42 +11,53 @@ from bs4 import BeautifulSoup
 # this list without any modification.
 IGNORED_PHRASES = [
     # Proper nouns and acronyms
+    r"AI",
     r"API",
     r"APNS",
     r"Botserver",
     r"Cookie Bot",
     r"DevAuthBackend",
+    r"DSN",
+    r"Esc",
     r"GCM",
     r"GitHub",
+    r"GitLab",
     r"Gravatar",
-    r"Help Center",
     r"HTTP",
     r"ID",
     r"IDs",
+    r"Inbox",
     r"IP",
     r"JSON",
-    r"Kerberos",
+    r"Jitsi",
+    r"Jotform",
+    r"LinkedIn",
     r"LDAP",
     r"Markdown",
+    r"OAuth",
     r"OTP",
     r"Pivotal",
-    r"PM",
-    r"PMs",
+    r"Recent conversations",
+    r"DM",
+    r"DMs",
     r"Slack",
     r"Google",
     r"Terms of Service",
+    r"TikTok",
     r"Tuesday",
     r"URL",
     r"UUID",
-    r"Webathena",
     r"WordPress",
-    r"Zephyr",
+    r"YouTube",
     r"Zoom",
     r"Zulip",
     r"Zulip Server",
     r"Zulip Account Security",
     r"Zulip Security",
+    r"Zulip Cloud",
     r"Zulip Cloud Standard",
+    r"Zulip Cloud Plus",
+    r"Zulip Desktop",
     r"BigBlueButton",
     # Code things
     r"\.zuliprc",
@@ -57,58 +69,89 @@ IGNORED_PHRASES = [
     r"I understand",
     r"I'm",
     r"I've",
+    r"Topics I participate in",
+    r"Topics I send a message to",
+    r"Topics I start",
     # Specific short words
     r"beta",
     r"and",
     r"bot",
     r"e\.g\.",
+    r"email",
     r"enabled",
     r"signups",
+    # Pasted text filename
+    r"PastedText",
     # Placeholders
     r"keyword",
     r"streamname",
     r"user@example\.com",
+    r"example\.com",
+    r"acme",
     # Fragments of larger strings
-    (r"your subscriptions on your Streams page"),
+    r"is …",
+    r"your subscriptions on your Channels page",
     r"Add global time<br />Everyone sees global times in their own time zone\.",
     r"user",
     r"an unknown operating system",
     r"Go to Settings",
+    r"find accounts for another email address",
     # SPECIAL CASES
     # Because topics usually are lower-case, this would look weird if it were capitalized
-    r"more topics",
+    r"show all topics",
     # Used alone in a parenthetical where capitalized looks worse.
     r"^deprecated$",
     # We want the similar text in the Private Messages section to have the same capitalization.
     r"more conversations",
-    r"back to streams",
+    r"back to channels",
     # Capital 'i' looks weird in reminders popover
     r"in 1 hour",
     r"in 20 minutes",
     r"in 3 hours",
-    # these are used as topics
-    r"^new streams$",
-    r"^stream events$",
+    # these are used as channel or topic names
+    r"^new channels$",
+    r"^channel events$",
+    r"^general$",
+    r"^sandbox$",
+    r"^experiments$",
+    r"^greetings$",
+    r"^moving messages$",
+    r"^start a conversation$",
+    r"^welcome to Zulip!$",
+    r"^general chat$",
     # These are used as example short names (e.g. an uncapitalized context):
     r"^marketing$",
     r"^cookie$",
     # Used to refer custom time limits
     r"\bN\b",
+    r"minute",
+    r"minutes",
     # Capital c feels obtrusive in clear status option
     r"clear",
-    r"group private messages with \{recipient\}",
-    r"private messages with \{recipient\}",
-    r"private messages with yourself",
+    r"group direct messages with \{recipient\}",
+    r"direct messages with \{recipient\}",
+    r"direct messages with yourself",
     r"GIF",
     # Emoji name placeholder
     r"leafy green vegetable",
     # Subdomain placeholder
-    r"your-organization-url",
+    r"your-organization",
     # Used in invite modal
     r"or",
+    # Units
+    r"MB",
+    r"GB",
+    # Used in GIPHY integration setting. GIFs Rating.
+    r"rated Y",
+    r"rated G",
+    r"rated PG",
+    r"rated PG13",
+    r"rated R",
     # Used in GIPHY popover.
     r"GIFs",
     r"GIPHY",
+    # Used for Tenor attributions
+    r"Search Tenor",
     # Used in our case studies
     r"Technical University of Munich",
     r"University of California San Diego",
@@ -119,6 +162,8 @@ IGNORED_PHRASES = [
     r"to add a new line",
     # Used in showing Notification Bot read receipts message
     "Notification Bot",
+    # Used in strings around welcome bot custom messages
+    r"Welcome Bot",
     # Used in presence_enabled setting label
     r"invisible mode off",
     # Typeahead suggestions for "Pronouns" custom field type.
@@ -128,21 +173,53 @@ IGNORED_PHRASES = [
     # Used in message-move-time-limit setting label
     r"does not apply to moderators and administrators",
     # Used in message-delete-time-limit setting label
-    r"does not apply to administrators",
+    r"does not apply to users who can delete any message",
+    # Used as indicator with names for guest users.
+    r"guest",
+    # Used as indicator with names for archived streams.
+    r"archived",
+    # Used in pills for deactivated users.
+    r"deactivated",
+    # Used in pills for resolved topics.
+    r"resolved",
+    # Used in pills for unresolved topics.
+    r"unresolved",
+    # This is a reference to a setting/secret and should be lowercase.
+    r"zulip_org_id",
+    # These are custom time unit options for modal dropdowns
+    r"minutes",
+    r"hours",
+    r"days",
+    r"weeks",
+    # Used in "Who can subscribe to this channel" label.
+    r"everyone except guests can subscribe to any public channel",
+    # Used in branch-filtering label in the integration-url-modal.
+    r"comma-separated list",
+    # Used in info_overlay.
+    r"then",
+    r"Joe Smith",
+    r"bold",
+    r"channel name",
+    r"is busy working",
+    r"italic",
+    r"strikethrough",
+    r"support team",
+    r"topic name",
 ]
 
 # Sort regexes in descending order of their lengths. As a result, the
 # longer phrases will be ignored first.
-IGNORED_PHRASES.sort(key=lambda regex: len(regex), reverse=True)
+IGNORED_PHRASES.sort(key=len, reverse=True)
 
 # Compile regexes to improve performance. This also extracts the
 # text using BeautifulSoup and then removes extra whitespaces from
 # it. This step enables us to add HTML in our regexes directly.
 COMPILED_IGNORED_PHRASES = [
-    re.compile(" ".join(BeautifulSoup(regex, "lxml").text.split())) for regex in IGNORED_PHRASES
+    re.compile(r" ".join(BeautifulSoup(StringIO(regex), "lxml").text.split()))
+    for regex in IGNORED_PHRASES
 ]
 
-SPLIT_BOUNDARY = "?.!"  # Used to split string into sentences.
+SPLIT_BOUNDARY = r"?.!"  # Used to split string into sentences.
 SPLIT_BOUNDARY_REGEX = re.compile(rf"[{SPLIT_BOUNDARY}]")
 
 # Regexes which check capitalization in sentences.
@@ -198,7 +275,7 @@ def get_safe_text(text: str) -> str:
     This returns text which is rendered by BeautifulSoup and is in the
     form that can be split easily and has all IGNORED_PHRASES processed.
     """
-    soup = BeautifulSoup(text, "lxml")
+    soup = BeautifulSoup(StringIO(text), "lxml")
     text = " ".join(soup.text.split())  # Remove extra whitespaces.
     for phrase_regex in COMPILED_IGNORED_PHRASES:
         text = phrase_regex.sub(replace_with_safe_phrase, text)
@@ -211,14 +288,21 @@ def is_capitalized(safe_text: str) -> bool:
     return not any(DISALLOWED_REGEX.search(sentence.strip()) for sentence in sentences)
 
 
-def check_banned_words(text: str) -> List[str]:
+def check_banned_words(text: str) -> list[str]:
     lower_cased_text = text.lower()
     errors = []
     for word, reason in BANNED_WORDS.items():
         if word in lower_cased_text:
             # Hack: Should move this into BANNED_WORDS framework; for
             # now, just hand-code the skips:
-            if "realm_name" in lower_cased_text:
+            if (
+                "realm_name" in lower_cased_text
+                or "realm_uri" in lower_cased_text
+                or "realm_url" in lower_cased_text
+                or "remote_realm_host" in lower_cased_text
+                or "realm_message" in lower_cased_text
+                or "realm_move" in lower_cased_text
+            ):
                 continue
             kwargs = dict(word=word, text=text, reason=reason)
             msg = "{word} found in '{text}'. {reason}".format(**kwargs)
@@ -227,7 +311,7 @@ def check_banned_words(text: str) -> List[str]:
     return errors
 
 
-def check_capitalization(strings: List[str]) -> Tuple[List[str], List[str], List[str]]:
+def check_capitalization(strings: list[str]) -> tuple[list[str], list[str], list[str]]:
     errors = []
     ignored = []
     banned_word_errors = []

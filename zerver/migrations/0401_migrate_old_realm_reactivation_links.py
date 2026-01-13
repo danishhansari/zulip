@@ -1,5 +1,5 @@
 from django.db import migrations
-from django.db.backends.postgresql.schema import BaseDatabaseSchemaEditor
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 from django.db.migrations.state import StateApps
 
 
@@ -32,7 +32,7 @@ def fix_old_realm_reactivation_confirmations(
         return
 
     # .content_type of these old Confirmation will be changed to this.
-    realm_reactivation_status_content_type, created = ContentType.objects.get_or_create(
+    realm_reactivation_status_content_type, _created = ContentType.objects.get_or_create(
         model="realmreactivationstatus", app_label="zerver"
     )
 
